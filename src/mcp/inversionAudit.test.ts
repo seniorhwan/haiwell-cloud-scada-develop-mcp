@@ -486,3 +486,176 @@ test('Inversion #12: OPC UA security mismatch, event trigger validation, transpi
   const skillMd = generateAgentSkillMarkdown('http://localhost:3000/mcp');
   assert.match(skillMd, /47 strictly validated tools/);
 });
+
+test('Production MCP #13: Tool annotations, SHA-256 catalog hash, scoped profiles, idempotencyKey, and expectedRevision concurrency guard', async () => {
+  const {
+    computeToolCatalogHash,
+    getToolsForProfile,
+    serializeToolCatalog,
+  } = await import('./toolRegistry');
+
+  // Tool annotations accurately distinguish readOnly vs destructive tools
+  const catalog = serializeToolCatalog('all');
+  const inspectTool = catalog.find((t) => t.name === 'haiwell_project_inspect')!;
+  const deleteTool = catalog.find((t) => t.name === 'haiwell_entity_delete')!;
+  assert.equal(inspectTool.annotations.readOnlyHint, true);
+  assert.equal(inspectTool.annotations.destructiveHint, false);
+  assert.equal(deleteTool.annotations.readOnlyHint, false);
+  assert.equal(deleteTool.annotations.destructiveHint, true);
+
+  // Scoped profiles keep context-window tool count lean (14 tools for core)
+  assert.equal(getToolsForProfile('core').length, 14);
+  assert.ok(getToolsForProfile('hmi').length < 30);
+  assert.equal(getToolsForProfile('all').length, 47);
+
+  // Deterministic SHA-256 rug-pull hash
+  const hashA = computeToolCatalogHash('all');
+  const hashB = computeToolCatalogHash('all');
+  assert.equal(hashA, hashB);
+  assert.match(hashA, /^[a-f0-9]{64}$/);
+
+  // IdempotencyKey prevents duplicate mutations on agent retry storms
+  const store = makeStore();
+  const rev0 = store.getProject('prj_chiller_plant_01').revision;
+  const first = await invokeHaiwellTool(
+    'haiwell_tag_read_write',
+    {
+      operation: 'WRITE',
+      tagName: 'Chiller_Setpoint_C',
+      value: 8.2,
+      idempotencyKey: 'retry-req-001',
+      expectedRevision: rev0,
+    },
+    store
+  );
+  assert.equal(first.ok, true);
+  assert.equal(first.idempotentReplay, undefined);
+  const rev1 = store.getProject('prj_chiller_plant_01').revision;
+  assert.ok(rev1 > rev0);
+
+  // Replay with same idempotencyKey returns cached result WITHOUT bumping revision again
+  const replay = await invokeHaiwellTool(
+    'haiwell_tag_read_write',
+    {
+      operation: 'WRITE',
+      tagName: 'Chiller_Setpoint_C',
+      value: 8.2,
+      idempotencyKey: 'retry-req-001',
+      expectedRevision: rev0,
+    },
+    store
+  );
+  assert.equal(replay.ok, true);
+  assert.equal(replay.idempotentReplay, true);
+  assert.equal(store.getProject('prj_chiller_plant_01').revision, rev1);
+
+  // Stale expectedRevision without matching idempotencyKey is rejected with REVISION_CONFLICT
+  const conflict = await invokeHaiwellTool(
+    'haiwell_tag_read_write',
+    {
+      operation: 'WRITE',
+      tagName: 'Chiller_Setpoint_C',
+      value: 9.0,
+      expectedRevision: rev0,
+    },
+    store
+  );
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.error?.code, 'REVISION_CONFLICT');
+});
+
+test('Production MCP #14: HTTP Bearer auth, Origin DNS-rebinding guard, scoped ?profile=core, structuredContent, and rate limiting', async () => {
+  const { createApp } = await import('../../server');
+  const store = makeStore();
+  const app = createApp(store, {
+    authToken: 'super-secret-agent-token',
+    allowedOrigins: ['https://trusted-ide.local'],
+    rateLimitPerMin: 25,
+  });
+
+  const server = await new Promise<import('node:http').Server>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+
+  try {
+    const addr = server.address() as import('node:net').AddressInfo;
+    const base = `http://127.0.0.1:${addr.port}`;
+
+    // Health remains accessible without auth and includes X-Request-Id
+    const health = await fetch(`${base}/api/health`);
+    assert.equal(health.status, 200);
+    assert.ok(health.headers.get('x-request-id'));
+
+    // Unauthenticated /mcp returns 401 JSON
+    const unauth = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    assert.equal(unauth.status, 401);
+
+    // Spoofed Origin header returns 403 ORIGIN_FORBIDDEN (DNS rebinding guard)
+    const badOrigin = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: 'https://evil-rebinding.attacker',
+        Authorization: 'Bearer super-secret-agent-token',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    assert.equal(badOrigin.status, 403);
+
+    // Authorized /mcp?profile=core exposes 14 tools with MCP annotations
+    const mcpHeaders = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      Origin: 'https://trusted-ide.local',
+      Authorization: 'Bearer super-secret-agent-token',
+    };
+    const coreList = await fetch(`${base}/mcp?profile=core`, {
+      method: 'POST',
+      headers: mcpHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    });
+    assert.equal(coreList.status, 200);
+    const listBody = (await coreList.json()) as { result: { tools: { name: string; annotations?: { readOnlyHint?: boolean } }[] } };
+    assert.equal(listBody.result.tools.length, 14);
+    const inspectMeta = listBody.result.tools.find((t) => t.name === 'haiwell_project_inspect');
+    assert.equal(inspectMeta?.annotations?.readOnlyHint, true);
+
+    // tools/call returns BOTH text content AND structuredContent
+    const callRes = await fetch(`${base}/mcp?profile=core`, {
+      method: 'POST',
+      headers: mcpHeaders,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'haiwell_project_inspect', arguments: {} },
+      }),
+    });
+    assert.equal(callRes.status, 200);
+    const callJson = (await callRes.json()) as { result: { structuredContent?: { ok: boolean; tool: string }; content: unknown[] } };
+    assert.equal(callJson.result.structuredContent?.ok, true);
+    assert.equal(callJson.result.structuredContent?.tool, 'haiwell_project_inspect');
+
+    // Burst past token bucket triggers actionable 429 RATE_LIMITED with Retry-After header
+    let got429 = false;
+    for (let i = 0; i < 30; i++) {
+      const r = await fetch(`${base}/api/rpc`, {
+        method: 'POST',
+        headers: mcpHeaders,
+        body: JSON.stringify({ tool: 'haiwell_project_inspect', arguments: {} }),
+      });
+      if (r.status === 429) {
+        assert.ok(r.headers.get('retry-after'));
+        got429 = true;
+        break;
+      }
+    }
+    assert.equal(got429, true, 'Expected token-bucket rate limiter to return HTTP 429');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});

@@ -13,6 +13,7 @@
  * - GET  /api/health              -> Lightweight health probe
  */
 
+import crypto from 'node:crypto';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,9 +31,12 @@ import {
 } from './src/mcp/resourcesAndPrompts';
 import {
   buildProjectExportBundle,
+  computeToolCatalogHash,
+  getToolsForProfile,
   HAIWELL_TOOLS,
   invokeHaiwellTool,
   normalizeAgentArgs,
+  resolveToolProfile,
   serializeToolCatalog,
 } from './src/mcp/toolRegistry';
 
@@ -48,21 +52,117 @@ function getBaseUrl(req: express.Request): string {
   return `${proto}://${host}`;
 }
 
-export function createApp(store: HaiwellProjectStore = defaultProjectStore) {
+export interface ServerSecurityOptions {
+  authToken?: string;
+  allowedOrigins?: string[];
+  rateLimitPerMin?: number;
+}
+
+function timingSafeBearerMatch(headerVal: string | undefined, expectedToken: string): boolean {
+  if (!headerVal || !headerVal.startsWith('Bearer ')) return false;
+  const provided = Buffer.from(headerVal.slice(7).trim(), 'utf8');
+  const expected = Buffer.from(expectedToken, 'utf8');
+  if (provided.length !== expected.length) return false;
+  return crypto.timingSafeEqual(provided, expected);
+}
+
+export function createApp(
+  store: HaiwellProjectStore = defaultProjectStore,
+  securityOpts: ServerSecurityOptions = {}
+) {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '2mb' }));
 
-  // CORS for headless agent clients & local IDE connectors
+  const authToken = securityOpts.authToken ?? process.env.HAIWELL_MCP_AUTH_TOKEN?.trim() ?? '';
+  const allowedOrigins = (
+    securityOpts.allowedOrigins ??
+    (process.env.HAIWELL_MCP_ALLOWED_ORIGINS
+      ? process.env.HAIWELL_MCP_ALLOWED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
+      : [])
+  ).map((o) => o.toLowerCase());
+  const rateLimitPerMin =
+    securityOpts.rateLimitPerMin ?? Number(process.env.HAIWELL_MCP_RATE_LIMIT_PER_MIN ?? 600);
+
+  // Per-IP Token Bucket rate limiter (prevents runaway agent retry loops)
+  const buckets = new Map<string, { tokens: number; lastRefill: number }>();
+  const consumeRateToken = (ip: string): { allowed: boolean; retryAfterSec: number } => {
+    if (!Number.isFinite(rateLimitPerMin) || rateLimitPerMin <= 0) return { allowed: true, retryAfterSec: 0 };
+    const now = Date.now();
+    const capacity = Math.max(20, Math.min(rateLimitPerMin, 240));
+    const refillPerMs = rateLimitPerMin / 60000;
+    const entry = buckets.get(ip) ?? { tokens: capacity, lastRefill: now };
+    const elapsed = Math.max(0, now - entry.lastRefill);
+    entry.tokens = Math.min(capacity, entry.tokens + elapsed * refillPerMs);
+    entry.lastRefill = now;
+    if (entry.tokens < 1) {
+      buckets.set(ip, entry);
+      return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((1 - entry.tokens) / (refillPerMs * 1000))) };
+    }
+    entry.tokens -= 1;
+    buckets.set(ip, entry);
+    if (buckets.size > 2000) {
+      const oldest = buckets.keys().next().value;
+      if (oldest) buckets.delete(oldest);
+    }
+    return { allowed: true, retryAfterSec: 0 };
+  };
+
+  // Request correlation ID + CORS + Origin DNS-rebinding protection
   app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const reqId = (req.headers['x-request-id'] as string | undefined)?.trim() || crypto.randomUUID();
+    res.setHeader('X-Request-Id', reqId);
+
+    const origin = (req.headers.origin as string | undefined)?.toLowerCase();
+    if (origin && allowedOrigins.length > 0 && !allowedOrigins.includes('*') && !allowedOrigins.includes(origin)) {
+      res.status(403).json({
+        ok: false,
+        error: {
+          code: 'ORIGIN_FORBIDDEN',
+          message: `Origin "${req.headers.origin}" is rejected by DNS-rebinding policy (HAIWELL_MCP_ALLOWED_ORIGINS).`,
+        },
+      });
+      return;
+    }
+
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigins.length > 0 && origin ? req.headers.origin! : '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version, Authorization');
-    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id, Mcp-Protocol-Version, X-Execution-Time-Ms');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version, Authorization, X-Request-Id');
+    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id, Mcp-Protocol-Version, X-Execution-Time-Ms, X-Request-Id, Retry-After');
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
     }
+
+    // Enforce Bearer auth on execution/export endpoints when HAIWELL_MCP_AUTH_TOKEN is configured
+    const requiresAuth = req.path === '/mcp' || req.path === '/api/rpc' || req.path.startsWith('/api/projects/');
+    if (authToken && requiresAuth && !timingSafeBearerMatch(req.headers.authorization, authToken)) {
+      res.setHeader('WWW-Authenticate', 'Bearer realm="haiwell-cloud-scada-mcp"');
+      res.status(401).json({
+        ok: false,
+        error: { code: 'UNAUTHORIZED', message: 'Valid Authorization: Bearer <token> header required.' },
+      });
+      return;
+    }
+
+    // Apply token-bucket rate limiting on execution endpoints
+    if (req.path === '/mcp' || req.path === '/api/rpc') {
+      const clientKey = req.ip || req.socket.remoteAddress || 'local';
+      const rl = consumeRateToken(clientKey);
+      if (!rl.allowed) {
+        res.setHeader('Retry-After', String(rl.retryAfterSec));
+        res.status(429).json({
+          ok: false,
+          error: {
+            code: 'RATE_LIMITED',
+            message: `Agent rate limit exceeded (${rateLimitPerMin}/min). Retry after ${rl.retryAfterSec}s.`,
+            retryAfterSec: rl.retryAfterSec,
+          },
+        });
+        return;
+      }
+    }
+
     next();
   });
 
@@ -119,13 +219,26 @@ export function createApp(store: HaiwellProjectStore = defaultProjectStore) {
   // =========================================================================
   app.get('/', (req, res) => {
     const baseUrl = getBaseUrl(req);
+    const profile = resolveToolProfile(typeof req.query.profile === 'string' ? req.query.profile : undefined);
     res.json({
       service: 'haiwell-cloud-scada-mcp',
-      version: '2.0.0',
+      version: '2.1.0',
       mode: 'headless-machine-readable-only',
       protocol: 'MCP 2025-03-26',
+      profile,
+      catalogSha256: computeToolCatalogHash(profile),
+      availableProfiles: ['all', 'core', 'hmi', 'plc', 'iiot'],
+      security: {
+        bearerAuthEnabled: Boolean(authToken),
+        originAllowlistEnabled: allowedOrigins.length > 0,
+        rateLimitPerMin,
+        toolAnnotations: true,
+        structuredContent: true,
+        idempotencyAndOptimisticLocking: true,
+      },
       transports: {
         streamableHttp: `POST ${baseUrl}/mcp`,
+        scopedProfiles: `POST ${baseUrl}/mcp?profile=core|hmi|plc|iiot|all`,
         stdio: 'npx tsx src/mcp/stdio.ts',
       },
       endpoints: {
@@ -145,7 +258,8 @@ export function createApp(store: HaiwellProjectStore = defaultProjectStore) {
       },
       counts: {
         domains: HAIWELL_CAPABILITY_MATRIX.length,
-        tools: HAIWELL_TOOLS.length,
+        tools: getToolsForProfile(profile).length,
+        totalToolsAllProfiles: HAIWELL_TOOLS.length,
         staticResources: HAIWELL_RESOURCES.length,
         resourceTemplates: HAIWELL_RESOURCE_TEMPLATES.length,
         prompts: HAIWELL_PROMPTS.length,
@@ -203,7 +317,10 @@ export function createApp(store: HaiwellProjectStore = defaultProjectStore) {
     };
     const normalizedBody = Array.isArray(req.body) ? req.body.map(normalizeRpcMessage) : normalizeRpcMessage(req.body);
 
-    const server = createHaiwellMcpServer(store);
+    const profile = resolveToolProfile(
+      typeof req.query.profile === 'string' ? req.query.profile : process.env.HAIWELL_MCP_PROFILE
+    );
+    const server = createHaiwellMcpServer(store, profile);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -273,12 +390,15 @@ export function createApp(store: HaiwellProjectStore = defaultProjectStore) {
 
   app.get('/api/manifest', (req, res) => {
     const baseUrl = getBaseUrl(req);
-    const tools = serializeToolCatalog();
+    const profile = resolveToolProfile(typeof req.query.profile === 'string' ? req.query.profile : undefined);
+    const tools = serializeToolCatalog(profile);
     res.json({
-      schemaVersion: '2.0.0',
+      schemaVersion: '2.1.0',
+      profile,
+      catalogSha256: computeToolCatalogHash(profile),
       server: {
         name: 'haiwell-cloud-scada-mcp',
-        version: '2.0.0',
+        version: '2.1.0',
         mode: 'headless',
         mcpEndpoint: `${baseUrl}/mcp`,
         rpcEndpoint: `${baseUrl}/api/rpc`,
@@ -453,9 +573,16 @@ export function createApp(store: HaiwellProjectStore = defaultProjectStore) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   const app = createApp(defaultProjectStore);
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(
       `[haiwell-cloud-scada-mcp] headless server listening on http://0.0.0.0:${PORT} (${HAIWELL_TOOLS.length} tools, ZERO UI)`
     );
   });
+  const shutdown = (signal: string) => {
+    console.log(`[haiwell-cloud-scada-mcp] received ${signal}, shutting down gracefully...`);
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }

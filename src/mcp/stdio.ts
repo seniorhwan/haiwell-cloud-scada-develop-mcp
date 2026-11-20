@@ -8,10 +8,12 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createHaiwellMcpServer } from './createMcpServer';
 import { HAIWELL_PROMPTS, HAIWELL_RESOURCES } from './resourcesAndPrompts';
-import { HAIWELL_TOOLS, normalizeAgentArgs } from './toolRegistry';
+import { getToolsForProfile, normalizeAgentArgs, resolveToolProfile } from './toolRegistry';
+import { defaultProjectStore } from './projectStore';
 
 async function main() {
-  const server = createHaiwellMcpServer();
+  const profile = resolveToolProfile(process.env.HAIWELL_MCP_PROFILE);
+  const server = createHaiwellMcpServer(defaultProjectStore, profile);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
@@ -29,7 +31,7 @@ async function main() {
   }
 
   console.error(
-    `[haiwell-cloud-scada-mcp] stdio transport ready (${HAIWELL_TOOLS.length} tools, ${HAIWELL_RESOURCES.length} resources, ${HAIWELL_PROMPTS.length} prompts)`
+    `[haiwell-cloud-scada-mcp] stdio transport ready (profile=${profile}, ${getToolsForProfile(profile).length} tools, ${HAIWELL_RESOURCES.length} resources, ${HAIWELL_PROMPTS.length} prompts)`
   );
 }
 

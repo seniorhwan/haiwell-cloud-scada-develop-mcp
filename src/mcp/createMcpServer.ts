@@ -12,13 +12,38 @@ import {
   HAIWELL_RESOURCES,
   readHaiwellResource,
 } from './resourcesAndPrompts';
-import { HAIWELL_TOOLS, invokeHaiwellTool } from './toolRegistry';
+import {
+  getToolAnnotations,
+  getToolsForProfile,
+  invokeHaiwellTool,
+  type ToolProfile,
+} from './toolRegistry';
 
-export function createHaiwellMcpServer(store: HaiwellProjectStore = defaultProjectStore): McpServer {
+const TOOL_OUTPUT_ENVELOPE_SCHEMA = {
+  ok: z.boolean(),
+  tool: z.string(),
+  domain: z.string().optional(),
+  safetyTier: z.string().optional(),
+  executionMs: z.number(),
+  idempotentReplay: z.boolean().optional(),
+  data: z.unknown().optional(),
+  error: z
+    .object({
+      code: z.string(),
+      message: z.string(),
+      issues: z.unknown().optional(),
+    })
+    .optional(),
+};
+
+export function createHaiwellMcpServer(
+  store: HaiwellProjectStore = defaultProjectStore,
+  profile: ToolProfile = 'all'
+): McpServer {
   const server = new McpServer(
     {
       name: 'haiwell-cloud-scada-mcp',
-      version: '2.0.0',
+      version: '2.1.0',
     },
     {
       capabilities: {
@@ -27,23 +52,30 @@ export function createHaiwellMcpServer(store: HaiwellProjectStore = defaultProje
         prompts: {},
       },
       instructions:
-        'Zero-UI headless industrial automation MCP server for Haiwell Cloud SCADA Develop. Always snapshot before bulk edits, validate multi-vendor PLC addresses and word-spans, dry-run physical control writes, validate IEC 61131-3 logic, test E-Stop via haiwell_simulation_step, and verify deploymentReady=true via haiwell_project_audit_safety before export.',
+        'Zero-UI headless industrial automation MCP server for Haiwell Cloud SCADA Develop. Always snapshot before bulk edits, validate multi-vendor PLC addresses and word-spans, dry-run physical control writes, validate IEC 61131-3 logic, compile HMI spatially via P&ID/solver tools, test E-Stop via haiwell_simulation_step, and verify deploymentReady=true via haiwell_project_audit_safety before export.',
     }
   );
 
-  // Register all Haiwell Cloud SCADA tools
-  for (const tool of HAIWELL_TOOLS) {
+  // Register Haiwell Cloud SCADA tools (scoped by profile to control agent context budgets)
+  for (const tool of getToolsForProfile(profile)) {
     server.registerTool(
       tool.name,
       {
         title: tool.haiwellFeature,
         description: `[${tool.domain} | ${tool.safetyTier}] ${tool.description}`,
-        inputSchema: tool.inputSchema.shape,
+        inputSchema: {
+          ...tool.inputSchema.shape,
+          idempotencyKey: z.string().max(128).optional(),
+          expectedRevision: z.number().int().min(0).optional(),
+        },
+        outputSchema: TOOL_OUTPUT_ENVELOPE_SCHEMA,
+        annotations: getToolAnnotations(tool),
       },
       async (args: Record<string, unknown>) => {
         const result = await invokeHaiwellTool(tool.name, args, store);
         return {
           isError: !result.ok,
+          structuredContent: result,
           content: [
             {
               type: 'text' as const,

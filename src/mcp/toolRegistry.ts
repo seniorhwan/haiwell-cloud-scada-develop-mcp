@@ -8,6 +8,7 @@
  * and headless FAT simulation.
  */
 
+import crypto from 'node:crypto';
 import { z } from 'zod';
 import { HAIWELL_REGISTER_MAP } from './haiwellRegisters';
 import {
@@ -3407,31 +3408,132 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 ];
 
-export function serializeToolCatalog() {
-  return HAIWELL_TOOLS.map((tool) => ({
+export interface McpToolAnnotations {
+  title: string;
+  readOnlyHint: boolean;
+  destructiveHint: boolean;
+  idempotentHint: boolean;
+  openWorldHint: boolean;
+}
+
+export function getToolAnnotations(tool: HaiwellToolDefinition): McpToolAnnotations {
+  const isRead = tool.safetyTier === 'read';
+  const isDestructive =
+    tool.name === 'haiwell_entity_delete' ||
+    tool.safetyTier === 'control_guarded' ||
+    tool.name === 'haiwell_mqtt_exchange' ||
+    tool.name === 'haiwell_opcua_browse_read_write';
+  const isIdempotent =
+    isRead ||
+    /(_upsert|_configure|_bind|_define|_save|_map|_policy|_manage|_solve)$/.test(tool.name);
+  const isOpenWorld =
+    tool.name === 'haiwell_mqtt_exchange' ||
+    tool.name === 'haiwell_webhook_configure' ||
+    tool.name === 'haiwell_cloud_transparent_tunnel';
+
+  return {
+    title: tool.haiwellFeature,
+    readOnlyHint: isRead,
+    destructiveHint: isDestructive,
+    idempotentHint: isIdempotent,
+    openWorldHint: isOpenWorld,
+  };
+}
+
+export type ToolProfile = 'all' | 'core' | 'hmi' | 'plc' | 'iiot';
+
+const CORE_PROFILE_TOOLS = new Set([
+  'haiwell_project_create',
+  'haiwell_project_inspect',
+  'haiwell_project_snapshot_rollback',
+  'haiwell_project_audit_safety',
+  'haiwell_project_export',
+  'haiwell_device_add',
+  'haiwell_tag_upsert_batch',
+  'haiwell_tag_read_write',
+  'haiwell_iec61131_validate',
+  'haiwell_iec61131_pou_save',
+  'haiwell_hmi_pid_compile',
+  'haiwell_hmi_spatial_verify',
+  'haiwell_alarm_configure',
+  'haiwell_simulation_step',
+]);
+
+const PROFILE_DOMAINS: Record<Exclude<ToolProfile, 'all' | 'core'>, Set<HaiwellDomain>> = {
+  hmi: new Set(['project', 'tags', 'hmi']),
+  plc: new Set(['project', 'devices', 'tags', 'iec61131', 'simulation']),
+  iiot: new Set(['project', 'tags', 'mqtt', 'opcua', 'datalink', 'alarms', 'security']),
+};
+
+export function resolveToolProfile(raw?: string): ToolProfile {
+  const norm = (raw ?? 'all').trim().toLowerCase();
+  if (norm === 'core' || norm === 'hmi' || norm === 'plc' || norm === 'iiot') return norm;
+  return 'all';
+}
+
+export function getToolsForProfile(profile: ToolProfile = 'all'): HaiwellToolDefinition[] {
+  if (profile === 'all') return HAIWELL_TOOLS;
+  if (profile === 'core') return HAIWELL_TOOLS.filter((t) => CORE_PROFILE_TOOLS.has(t.name));
+  const domains = PROFILE_DOMAINS[profile];
+  return HAIWELL_TOOLS.filter((t) => domains.has(t.domain));
+}
+
+export function serializeToolCatalog(profile: ToolProfile = 'all') {
+  return getToolsForProfile(profile).map((tool) => ({
     name: tool.name,
     domain: tool.domain,
     haiwellFeature: tool.haiwellFeature,
     safetyTier: tool.safetyTier,
     description: tool.description,
+    annotations: getToolAnnotations(tool),
     inputSchema: z.toJSONSchema(tool.inputSchema),
     sampleInput: tool.sampleInput,
   }));
+}
+
+/**
+ * Deterministic SHA-256 fingerprint of tool definitions (names, descriptions,
+ * annotations, JSON schemas) so enterprise MCP clients/gateways can pin definitions
+ * and detect mid-session "rug-pull" tool-poisoning mutations.
+ */
+export function computeToolCatalogHash(profile: ToolProfile = 'all'): string {
+  const canonical = serializeToolCatalog(profile).map((t) => ({
+    name: t.name,
+    description: t.description,
+    annotations: t.annotations,
+    inputSchema: t.inputSchema,
+  }));
+  return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+}
+
+export interface InvokeToolResult {
+  [key: string]: unknown;
+  ok: boolean;
+  tool: string;
+  domain?: HaiwellDomain;
+  safetyTier?: ToolSafetyTier;
+  executionMs: number;
+  idempotentReplay?: boolean;
+  data?: unknown;
+  error?: { code: string; message: string; issues?: unknown };
+}
+
+const idempotencyCaches = new WeakMap<HaiwellProjectStore, Map<string, InvokeToolResult>>();
+
+function getIdempotencyCache(store: HaiwellProjectStore): Map<string, InvokeToolResult> {
+  let cache = idempotencyCaches.get(store);
+  if (!cache) {
+    cache = new Map<string, InvokeToolResult>();
+    idempotencyCaches.set(store, cache);
+  }
+  return cache;
 }
 
 export async function invokeHaiwellTool(
   toolName: string,
   rawArgs: unknown,
   store: HaiwellProjectStore
-): Promise<{
-  ok: boolean;
-  tool: string;
-  domain?: HaiwellDomain;
-  safetyTier?: ToolSafetyTier;
-  executionMs: number;
-  data?: unknown;
-  error?: { code: string; message: string; issues?: unknown };
-}> {
+): Promise<InvokeToolResult> {
   const start = performance.now();
   const tool = HAIWELL_TOOLS.find((t) => t.name === toolName);
   if (!tool) {
@@ -3447,6 +3549,29 @@ export async function invokeHaiwellTool(
   }
 
   const normalizedArgs = normalizeAgentArgs(rawArgs);
+
+  // Extract optional cross-cutting enterprise control headers from arguments before Zod parsing
+  const idempotencyKey =
+    typeof normalizedArgs.idempotencyKey === 'string' && normalizedArgs.idempotencyKey.trim().length > 0
+      ? normalizedArgs.idempotencyKey.trim()
+      : undefined;
+  const expectedRevision =
+    typeof normalizedArgs.expectedRevision === 'number' && Number.isInteger(normalizedArgs.expectedRevision)
+      ? normalizedArgs.expectedRevision
+      : undefined;
+
+  if (idempotencyKey) {
+    const cacheKey = `${tool.name}:${idempotencyKey}`;
+    const cached = getIdempotencyCache(store).get(cacheKey);
+    if (cached) {
+      return {
+        ...cached,
+        executionMs: Number((performance.now() - start).toFixed(3)),
+        idempotentReplay: true,
+      };
+    }
+  }
+
   const parsed = tool.inputSchema.safeParse(normalizedArgs);
   if (!parsed.success) {
     return {
@@ -3467,9 +3592,35 @@ export async function invokeHaiwellTool(
     };
   }
 
+  // Optimistic concurrency guard: reject stale writes when expectedRevision != current project.revision
+  if (expectedRevision !== undefined && tool.safetyTier !== 'read') {
+    const targetProjectId =
+      typeof (parsed.data as Record<string, unknown>).projectId === 'string'
+        ? ((parsed.data as Record<string, unknown>).projectId as string)
+        : DEFAULT_PROJECT_ID;
+    try {
+      const current = store.getProject(targetProjectId);
+      if (current.revision !== expectedRevision) {
+        return {
+          ok: false,
+          tool: tool.name,
+          domain: tool.domain,
+          safetyTier: tool.safetyTier,
+          executionMs: Number((performance.now() - start).toFixed(3)),
+          error: {
+            code: 'REVISION_CONFLICT',
+            message: `Optimistic concurrency conflict on project "${targetProjectId}": expected revision ${expectedRevision}, actual revision is ${current.revision}. Re-read via haiwell_project_inspect before retrying.`,
+          },
+        };
+      }
+    } catch {
+      // Let handler report project-not-found cleanly if project doesn't exist yet
+    }
+  }
+
   try {
     const data = await tool.handler(parsed.data, store);
-    return {
+    const result: InvokeToolResult = {
       ok: true,
       tool: tool.name,
       domain: tool.domain,
@@ -3477,6 +3628,16 @@ export async function invokeHaiwellTool(
       executionMs: Number((performance.now() - start).toFixed(3)),
       data,
     };
+    if (idempotencyKey) {
+      const cache = getIdempotencyCache(store);
+      const cacheKey = `${tool.name}:${idempotencyKey}`;
+      cache.set(cacheKey, result);
+      if (cache.size > 500) {
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey) cache.delete(oldestKey);
+      }
+    }
+    return result;
   } catch (err) {
     return {
       ok: false,
