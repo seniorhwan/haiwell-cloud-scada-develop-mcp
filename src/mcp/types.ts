@@ -189,6 +189,18 @@ export interface HmiWidget {
   props?: Record<string, string | number | boolean>;
 }
 
+export interface HmiPipeRoute {
+  id: string;
+  fromWidgetId: string;
+  toWidgetId: string;
+  fromPort: 'left' | 'right' | 'top' | 'bottom';
+  toPort: 'left' | 'right' | 'top' | 'bottom';
+  fluid: 'CHILLED_WATER' | 'HOT_WATER' | 'STEAM' | 'AIR' | 'CHEMICAL' | 'PROCESS' | 'RETURN';
+  label?: string;
+  flowTagName?: string;
+  waypoints: { x: number; y: number }[];
+}
+
 export interface HmiScreen {
   id: string;
   name: string;
@@ -200,6 +212,7 @@ export interface HmiScreen {
   autoScaleWeb: boolean;
   isPopup?: boolean;
   widgets: HmiWidget[];
+  pipes?: HmiPipeRoute[];
   createdAt: string;
 }
 

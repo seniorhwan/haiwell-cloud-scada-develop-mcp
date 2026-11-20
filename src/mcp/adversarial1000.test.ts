@@ -1174,16 +1174,22 @@ test('9. Live headless HTTP & MCP Streamable HTTP wire protocol handles 120+ mal
     assert.equal(((await batchRes.json()) as { error: { code: string } }).error.code, 'BATCH_TOO_LARGE');
     mark();
 
-    // 9J: Fuzz EVERY SINGLE TOOL (all 42 tools) with invalid/empty/corrupt arguments (84 checks)
+    // 9J: Fuzz EVERY SINGLE TOOL (all 47 tools) with invalid/empty/corrupt arguments (94 checks)
     for (const tool of HAIWELL_TOOLS) {
-      // Case 1: completely wrong type (number instead of expected fields)
-      const r1 = await invokeHaiwellTool(tool.name, { projectId: 12345, id: false, tags: 'not-an-array', action: 'INVALID_ENUM_XYZ' }, store);
+      // Case 1: completely wrong type (number/invalid enum instead of expected fields)
+      const r1 = await invokeHaiwellTool(
+        tool.name,
+        { projectId: 12345, id: false, tags: 'not-an-array', action: 'INVALID_ENUM_XYZ', category: 'INVALID_CAT' },
+        store
+      );
       if (tool.name !== 'haiwell_project_inspect') {
         assert.equal(r1.ok, false, `Expected tool ${tool.name} to fail on corrupt arguments`);
       }
       // Case 2: nonexistent projectId on project-scoped tools
       const r2 = await invokeHaiwellTool(tool.name, { projectId: 'prj_does_not_exist_999' }, store);
-      assert.equal(r2.ok, false, `Expected tool ${tool.name} to fail on missing project / required args`);
+      if (tool.name !== 'haiwell_hmi_toolbox_catalog') {
+        assert.equal(r2.ok, false, `Expected tool ${tool.name} to fail on missing project / required args`);
+      }
       mark(2);
     }
 

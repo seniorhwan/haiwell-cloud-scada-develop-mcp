@@ -29,6 +29,13 @@ import {
   validateHmiScreen,
 } from './hmiGenerator';
 import {
+  auditScreenSpatially,
+  compileDesktopAutomationBridge,
+  compilePidScreen,
+  HAIWELL_HMI_TOOLBOX,
+  solveAndRepairScreenLayout,
+} from './hmiSpatialEngine';
+import {
   buildMqttPayload,
   generateOpcUaNodeSet2Xml,
   mapTagTypeToOpcUa,
@@ -1801,6 +1808,199 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         dimensions: { width: screen.width, height: screen.height },
         svg: renderScreenToSvg(screen, project.tags),
       };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_hmi_toolbox_catalog',
+    domain: 'hmi',
+    haiwellFeature: 'Haiwell Component Toolbox Catalog & Property-Grid Schema',
+    safetyTier: 'read',
+    description:
+      'Return the complete machine-readable Haiwell Cloud SCADA Develop HMI component toolbox (display, control, P&ID equipment with port geometry, min touch dimensions, allowed PLC data types, and Windows Property Grid field names).',
+    inputSchema: z.object({
+      category: z
+        .enum(['ALL', 'DISPLAY', 'CONTROL', 'PID_EQUIPMENT', 'CHART_HISTORIAN', 'ALARM_RECIPE', 'NAVIGATION'])
+        .default('ALL'),
+    }),
+    sampleInput: { category: 'PID_EQUIPMENT' },
+    handler: (input) => {
+      const items =
+        input.category === 'ALL'
+          ? HAIWELL_HMI_TOOLBOX
+          : HAIWELL_HMI_TOOLBOX.filter((c) => c.category === input.category);
+      return { count: items.length, gridSnapPx: 8, minTouchPx: 48, components: items };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_hmi_pid_compile',
+    domain: 'hmi',
+    haiwellFeature: 'Semantic P&ID Process Flow Graph -> Collision-Free HMI Compiler',
+    safetyTier: 'design',
+    description:
+      'Compile a declarative P&ID process flow graph (equipment nodes + directed fluid pipes, including recirculation return loops) into an 8px-snapped, collision-free HMI screen with exact 0px port-connected orthogonal pipelines, auto-attached telemetry callouts, ASCII occupancy map, and SVG blueprint—eliminating pixel guesswork and drag-and-drop errors.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      screenId: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+      name: z.string().min(2).max(100),
+      width: z.number().int().min(480).max(3840).default(1280),
+      height: z.number().int().min(320).max(2160).default(800),
+      layoutStandard: z
+        .enum(['ISA_101_HIGH_PERFORMANCE', 'STANDARD_INDUSTRIAL', 'MOBILE_UNIFIED'])
+        .default('ISA_101_HIGH_PERFORMANCE'),
+      includeAlarmBanner: z.boolean().default(true),
+      includeNavBar: z.boolean().default(true),
+      nodes: z
+        .array(
+          z.object({
+            id: z.string().regex(/^[a-zA-Z0-9_-]{2,48}$/),
+            type: z.enum(['TANK', 'PUMP', 'VALVE', 'NUMERIC_DISPLAY', 'NUMERIC_INPUT', 'BIT_BUTTON', 'BIT_LAMP', 'GAUGE', 'BAR_GRAPH']),
+            label: z.string().min(1).max(80),
+            tagName: z.string().optional(),
+            writeEnabled: z.boolean().default(false),
+            unit: z.string().optional(),
+            min: z.number().optional(),
+            max: z.number().optional(),
+            calloutTagName: z.string().optional(),
+            calloutLabel: z.string().optional(),
+            calloutUnit: z.string().optional(),
+          })
+        )
+        .min(1),
+      edges: z
+        .array(
+          z.object({
+            id: z.string().optional(),
+            from: z.string().min(1),
+            to: z.string().min(1),
+            fluid: z.enum(['CHILLED_WATER', 'HOT_WATER', 'STEAM', 'AIR', 'CHEMICAL', 'PROCESS', 'RETURN']).default('PROCESS'),
+            label: z.string().optional(),
+            flowTagName: z.string().optional(),
+          })
+        )
+        .default([]),
+      returnSvg: z.boolean().default(false),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      screenId: 'scr_chiller_pid',
+      name: 'Chiller Loop P&ID (Auto-Compiled)',
+      nodes: [
+        { id: 'tank_buffer', type: 'TANK', label: 'Buffer Tank', calloutTagName: 'Return_Temp_C', calloutLabel: 'Return Temp' },
+        { id: 'pump_primary', type: 'PUMP', label: 'Primary Pump 1', tagName: 'Pump1_Run_Cmd', writeEnabled: true },
+        { id: 'valve_bypass', type: 'VALVE', label: 'Bypass Valve', tagName: 'Valve_Position_Pct', writeEnabled: true, calloutTagName: 'Supply_Temp_C', calloutLabel: 'Supply Temp' },
+      ],
+      edges: [
+        { from: 'tank_buffer', to: 'pump_primary', fluid: 'CHILLED_WATER', label: 'Suction' },
+        { from: 'pump_primary', to: 'valve_bypass', fluid: 'CHILLED_WATER', label: 'Supply Header' },
+        { from: 'valve_bypass', to: 'tank_buffer', fluid: 'RETURN', label: 'Return Loop' },
+      ],
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const compiled = compilePidScreen(input, project.tags, {
+        knownScreenIds: new Set([...project.screens.map((s) => s.id), input.screenId]),
+        targetHardware: project.targetHardware,
+      });
+      const idx = project.screens.findIndex((s) => s.id === compiled.screen.id);
+      if (idx >= 0) project.screens[idx] = compiled.screen;
+      else project.screens.push(compiled.screen);
+      store.saveProject(project);
+      return {
+        compiled: true,
+        screen: compiled.screen,
+        portAttachmentProof: compiled.portAttachmentProof,
+        spatialAudit: compiled.spatialAudit,
+        ...(input.returnSvg ? { svg: compiled.svg } : {}),
+      };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_hmi_layout_solve',
+    domain: 'hmi',
+    haiwellFeature: 'Deterministic 8px-Grid Alignment, Touch-Target & Collision Auto-Repair Solver',
+    safetyTier: 'design',
+    description:
+      'Automatically repair ANY overlapping, out-of-bounds, off-grid, or undersized (<48px touch) widgets on an existing Haiwell HMI screen via deterministic minimum-displacement packing and re-anchor P&ID pipes.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      screenId: z.string().min(1),
+    }),
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, screenId: 'scr_chiller_overview' },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const idx = project.screens.findIndex((s) => s.id === input.screenId);
+      if (idx < 0) throw new Error(`Screen "${input.screenId}" not found.`);
+      const result = solveAndRepairScreenLayout(project.screens[idx], project.targetHardware);
+      project.screens[idx] = result.screen;
+      store.saveProject(project);
+      const audit = auditScreenSpatially(result.screen, project.tags, {
+        knownScreenIds: new Set(project.screens.map((s) => s.id)),
+        targetHardware: project.targetHardware,
+      });
+      return {
+        repaired: true,
+        movedWidgets: result.movedWidgets,
+        resizedForTouch: result.resizedForTouch,
+        remainingCollisions: result.remainingCollisions,
+        remainingOutOfBounds: result.remainingOutOfBounds,
+        spatialAudit: audit,
+      };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_hmi_spatial_verify',
+    domain: 'hmi',
+    haiwellFeature: 'Closed-Loop Spatial Proof & 2D ASCII Occupancy Map Verifier',
+    safetyTier: 'read',
+    description:
+      'Run closed-loop spatial verification on any Haiwell HMI screen: proves 0px overlaps, checks >=44px touch targets, computes pairwise clearance and screen density %, verifies 0px pipe-to-port attachment, and returns a 48x18 ASCII occupancy map (plus optional SVG) so text-only and multimodal agents can visually inspect layout quality.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      screenId: z.string().default('scr_chiller_overview'),
+      includeSvg: z.boolean().default(false),
+    }),
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, screenId: 'scr_chiller_overview' },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const screen = project.screens.find((s) => s.id === input.screenId);
+      if (!screen) throw new Error(`Screen "${input.screenId}" not found.`);
+      const audit = auditScreenSpatially(screen, project.tags, {
+        knownScreenIds: new Set(project.screens.map((s) => s.id)),
+        targetHardware: project.targetHardware,
+      });
+      return {
+        ...audit,
+        ...(input.includeSvg ? { svg: renderScreenToSvg(screen, project.tags) } : {}),
+      };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_hmi_desktop_bridge_export',
+    domain: 'hmi',
+    haiwellFeature: 'Zero-Error Native Screen Manifest & Windows UIA (pywinauto) Property-Grid Bridge',
+    safetyTier: 'design',
+    description:
+      'Export a validated HMI screen for zero-error deployment into Haiwell Cloud SCADA Develop desktop software via BOTH (1) a native structured screen import manifest AND (2) a closed-loop Windows UI Automation (pywinauto) Python script that drops components by Toolbox Name and injects mathematically proven Left/Top/Width/Height/Variable values into the Property Grid with UIA read-back verification (eliminating pixel drag-and-drop errors).',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      screenId: z.string().default('scr_chiller_overview'),
+      windowTitleRegex: z.string().default('.*Haiwell Cloud SCADA Develop.*'),
+    }),
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, screenId: 'scr_chiller_overview' },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const screen = project.screens.find((s) => s.id === input.screenId);
+      if (!screen) throw new Error(`Screen "${input.screenId}" not found.`);
+      return compileDesktopAutomationBridge(screen, project.tags, {
+        windowTitleRegex: input.windowTitleRegex,
+        knownScreenIds: new Set(project.screens.map((s) => s.id)),
+        targetHardware: project.targetHardware,
+      });
     },
   }),
 

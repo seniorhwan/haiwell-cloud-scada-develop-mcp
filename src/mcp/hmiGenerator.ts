@@ -303,10 +303,39 @@ function escapeXml(str: string): string {
     .replace(/'/g, '&apos;');
 }
 
+const PIPE_FLUID_COLOR: Record<string, string> = {
+  CHILLED_WATER: '#0284C7',
+  HOT_WATER: '#DC2626',
+  STEAM: '#D97706',
+  AIR: '#0D9488',
+  CHEMICAL: '#7C3AED',
+  PROCESS: '#334155',
+  RETURN: '#475569',
+};
+
 export function renderScreenToSvg(
   screen: HmiScreen,
   tags: Record<string, TagDefinition>
 ): string {
+  const pipeElements = (screen.pipes ?? []).map((p) => {
+    const pts = p.waypoints.map((pt) => `${pt.x},${pt.y}`).join(' ');
+    const stroke = PIPE_FLUID_COLOR[p.fluid] ?? '#334155';
+    const mid = p.waypoints[Math.floor(p.waypoints.length / 2)] ?? p.waypoints[0];
+    const flowTag = p.flowTagName ? tags[p.flowTagName] : undefined;
+    const labelText = p.label ?? (flowTag ? `${p.flowTagName}: ${flowTag.currentValue}${flowTag.unit ? ' ' + flowTag.unit : ''}` : '');
+    return [
+      `  <g id="${escapeXml(p.id)}" data-type="PIPELINE" data-from="${escapeXml(p.fromWidgetId)}" data-to="${escapeXml(p.toWidgetId)}" data-fluid="${escapeXml(p.fluid)}">`,
+      `    <polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linejoin="round" marker-end="url(#pid-arrow)" />`,
+      ...(labelText && mid
+        ? [
+            `    <rect x="${mid.x - 42}" y="${mid.y - 16}" width="84" height="16" rx="2" fill="#FFFFFF" fill-opacity="0.92" stroke="#CBD5E1" stroke-width="0.75" />`,
+            `    <text x="${mid.x}" y="${mid.y - 5}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="#0F172A">${escapeXml(labelText)}</text>`,
+          ]
+        : []),
+      `  </g>`,
+    ].join('\n');
+  });
+
   const elements = screen.widgets.map((w) => {
     const tag = w.tagName ? tags[w.tagName] : undefined;
     const valueText = tag !== undefined ? String(tag.currentValue) : '--';
@@ -329,8 +358,14 @@ export function renderScreenToSvg(
 
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${screen.width} ${screen.height}" width="${screen.width}" height="${screen.height}">`,
+    `  <defs>`,
+    `    <marker id="pid-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">`,
+    `      <path d="M 0 1 L 10 5 L 0 9 z" fill="#334155" />`,
+    `    </marker>`,
+    `  </defs>`,
     `  <title>${escapeXml(screen.name)}</title>`,
     `  <rect width="100%" height="100%" fill="${escapeXml(screen.backgroundColor)}" />`,
+    ...pipeElements,
     ...elements,
     `</svg>`,
   ].join('\n');
