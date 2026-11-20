@@ -29,9 +29,88 @@ import type {
   TagDefinition,
 } from './types';
 
+export const HAIWELL_GRAPHICS_LIBRARY_CATEGORIES = [
+  'Favorite·Common',
+  'Functional components',
+  'Switch',
+  'Lamp',
+  'Valve',
+  'Tank',
+  'Motor·Blade',
+  'Advanced controls',
+  'Instrument·Cursor',
+  'Traceless·Pipe',
+  'Trace·Pipe',
+  'Shape·Panel',
+  'Environment·Nature',
+  'Sign·Symbol',
+  'Safety·Sign',
+  'Daily·Other',
+] as const;
+
+export type HaiwellGraphicsLibraryCategory = (typeof HAIWELL_GRAPHICS_LIBRARY_CATEGORIES)[number];
+
+/**
+ * Verified Haiwell Cloud Scada 3.50.1.19 "Graphics library" panel catalog.
+ * Note: Categories not individually enumerated here contain built-in vector/bitmap packs
+ * selectable by category click + item name inside Haiwell's Graphics library panel.
+ */
+export const HAIWELL_GRAPHICS_LIBRARY_CATALOG: Record<HaiwellGraphicsLibraryCategory, string[]> = {
+  'Favorite·Common': ['Reactor 25', 'Blade 6', 'Instrument 3', 'Cursor 3', 'Panel 2', 'Panel 3', 'Arrow 1'],
+  'Functional components': [
+    'Bit lamp',
+    'Bit switch',
+    'Word lamp',
+    'Word switch',
+    'Multistate switch',
+    'Numeric input/display',
+    'Text input/display',
+    'Real time data input/display',
+    'Function button',
+    'Picture operation',
+  ],
+  Switch: ['Toggle switch', 'Push button', 'Selector switch'],
+  Lamp: ['Pilot lamp', 'Indicator light'],
+  Valve: ['Control valve', 'Solenoid valve', 'Gate valve'],
+  Tank: ['Reactor 25', 'Storage tank', 'Silo'],
+  'Motor·Blade': ['Blade 6', 'Motor', 'Pump'],
+  'Advanced controls': [
+    'Conveyor belt 1',
+    'Conveyor belt 2',
+    'Information scan code',
+    'Drop down box(pop-up)',
+    'Drop down box(pull down)',
+    'Date',
+    'Time',
+    'Tendency chart',
+    'XY tendency chart',
+    'XY trend',
+  ],
+  'Instrument·Cursor': [
+    'Instrument 1',
+    'Instrument 2',
+    'Instrument 3',
+    'Instrument 4',
+    'Instrument 5',
+    'Instrument 6',
+    'Cursor 1',
+    'Cursor 2',
+    'Cursor 3',
+    'Cursor 4',
+  ],
+  'Traceless·Pipe': ['Static straight pipe', 'Static elbow pipe', 'Static tee pipe'],
+  'Trace·Pipe': ['Animated flow pipe', 'Animated elbow pipe', 'Animated tee pipe'],
+  'Shape·Panel': ['Panel 2', 'Panel 3'],
+  'Environment·Nature': ['Ambient / nature graphics'],
+  'Sign·Symbol': ['Arrow 1', 'Process sign / symbol'],
+  'Safety·Sign': ['Warning / safety signs'],
+  'Daily·Other': ['Miscellaneous graphics'],
+};
+
 export interface ToolboxComponentSpec {
   type: HmiWidgetType;
   category: 'DISPLAY' | 'CONTROL' | 'PID_EQUIPMENT' | 'CHART_HISTORIAN' | 'ALARM_RECIPE' | 'NAVIGATION';
+  graphicsLibraryCategory: HaiwellGraphicsLibraryCategory;
   haiwellToolboxName: string;
   haiwellClassName: string;
   defaultSize: { width: number; height: number };
@@ -51,7 +130,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'NUMERIC_DISPLAY',
     category: 'DISPLAY',
-    haiwellToolboxName: 'Numeric Display',
+    graphicsLibraryCategory: 'Functional components',
+    haiwellToolboxName: 'Numeric input/display',
     haiwellClassName: 'HwNumericDisplay',
     defaultSize: { width: 168, height: 64 },
     minSize: { width: 96, height: 48 },
@@ -62,7 +142,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'NUMERIC_INPUT',
     category: 'CONTROL',
-    haiwellToolboxName: 'Numeric Input',
+    graphicsLibraryCategory: 'Functional components',
+    haiwellToolboxName: 'Numeric input/display',
     haiwellClassName: 'HwNumericInput',
     defaultSize: { width: 168, height: 64 },
     minSize: { width: 96, height: 48 },
@@ -73,7 +154,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'BIT_BUTTON',
     category: 'CONTROL',
-    haiwellToolboxName: 'Bit Button',
+    graphicsLibraryCategory: 'Functional components',
+    haiwellToolboxName: 'Bit switch',
     haiwellClassName: 'HwBitButton',
     defaultSize: { width: 136, height: 56 },
     minSize: { width: 64, height: 48 },
@@ -84,7 +166,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'BIT_LAMP',
     category: 'DISPLAY',
-    haiwellToolboxName: 'Bit Lamp',
+    graphicsLibraryCategory: 'Functional components',
+    haiwellToolboxName: 'Bit lamp',
     haiwellClassName: 'HwBitLamp',
     defaultSize: { width: 120, height: 56 },
     minSize: { width: 48, height: 48 },
@@ -95,7 +178,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'MULTI_STATE_INDICATOR',
     category: 'DISPLAY',
-    haiwellToolboxName: 'Word Lamp',
+    graphicsLibraryCategory: 'Functional components',
+    haiwellToolboxName: 'Word lamp',
     haiwellClassName: 'HwWordLamp',
     defaultSize: { width: 152, height: 56 },
     minSize: { width: 80, height: 48 },
@@ -106,7 +190,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'BAR_GRAPH',
     category: 'DISPLAY',
-    haiwellToolboxName: 'Bar Graph',
+    graphicsLibraryCategory: 'Instrument·Cursor',
+    haiwellToolboxName: 'Cursor 3',
     haiwellClassName: 'HwBarGraph',
     defaultSize: { width: 224, height: 72 },
     minSize: { width: 112, height: 48 },
@@ -117,7 +202,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'GAUGE',
     category: 'DISPLAY',
-    haiwellToolboxName: 'Meter / Gauge',
+    graphicsLibraryCategory: 'Instrument·Cursor',
+    haiwellToolboxName: 'Instrument 3',
     haiwellClassName: 'HwMeterGauge',
     defaultSize: { width: 160, height: 144 },
     minSize: { width: 112, height: 112 },
@@ -128,7 +214,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'TANK',
     category: 'PID_EQUIPMENT',
-    haiwellToolboxName: 'Process Tank (Library)',
+    graphicsLibraryCategory: 'Tank',
+    haiwellToolboxName: 'Reactor 25',
     haiwellClassName: 'HwPidTank',
     defaultSize: { width: 144, height: 128 },
     minSize: { width: 96, height: 88 },
@@ -140,7 +227,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'PUMP',
     category: 'PID_EQUIPMENT',
-    haiwellToolboxName: 'Centrifugal Pump (Library)',
+    graphicsLibraryCategory: 'Motor·Blade',
+    haiwellToolboxName: 'Blade 6',
     haiwellClassName: 'HwPidPump',
     defaultSize: { width: 136, height: 88 },
     minSize: { width: 88, height: 64 },
@@ -152,7 +240,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'VALVE',
     category: 'PID_EQUIPMENT',
-    haiwellToolboxName: 'Control Valve (Library)',
+    graphicsLibraryCategory: 'Valve',
+    haiwellToolboxName: 'Control valve',
     haiwellClassName: 'HwPidValve',
     defaultSize: { width: 136, height: 88 },
     minSize: { width: 88, height: 64 },
@@ -164,7 +253,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'PIPELINE',
     category: 'PID_EQUIPMENT',
-    haiwellToolboxName: 'Flow Pipe (Vector)',
+    graphicsLibraryCategory: 'Trace·Pipe',
+    haiwellToolboxName: 'Animated flow pipe',
     haiwellClassName: 'HwFlowPipe',
     defaultSize: { width: 160, height: 16 },
     minSize: { width: 24, height: 8 },
@@ -175,7 +265,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'TREND_CHART',
     category: 'CHART_HISTORIAN',
-    haiwellToolboxName: 'Real-Time / Historical Trend',
+    graphicsLibraryCategory: 'Advanced controls',
+    haiwellToolboxName: 'Tendency chart',
     haiwellClassName: 'HwTrendChart',
     defaultSize: { width: 400, height: 192 },
     minSize: { width: 240, height: 120 },
@@ -186,6 +277,7 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'ALARM_BANNER',
     category: 'ALARM_RECIPE',
+    graphicsLibraryCategory: 'Advanced controls',
     haiwellToolboxName: 'Alarm Banner / Bar',
     haiwellClassName: 'HwAlarmBar',
     defaultSize: { width: 1240, height: 48 },
@@ -197,7 +289,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'RECIPE_SELECTOR',
     category: 'ALARM_RECIPE',
-    haiwellToolboxName: 'Recipe View / Selector',
+    graphicsLibraryCategory: 'Advanced controls',
+    haiwellToolboxName: 'Drop down box(pop-up)',
     haiwellClassName: 'HwRecipeView',
     defaultSize: { width: 280, height: 144 },
     minSize: { width: 160, height: 80 },
@@ -208,6 +301,7 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'CAMERA_VIEW',
     category: 'DISPLAY',
+    graphicsLibraryCategory: 'Advanced controls',
     haiwellToolboxName: 'IP Camera (RTSP/ONVIF)',
     haiwellClassName: 'HwCameraView',
     defaultSize: { width: 320, height: 200 },
@@ -219,6 +313,7 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'DATA_TABLE',
     category: 'CHART_HISTORIAN',
+    graphicsLibraryCategory: 'Advanced controls',
     haiwellToolboxName: 'Historical Data Table',
     haiwellClassName: 'HwDataTable',
     defaultSize: { width: 400, height: 192 },
@@ -230,7 +325,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'NAV_BAR',
     category: 'NAVIGATION',
-    haiwellToolboxName: 'Function Key / Screen Jump',
+    graphicsLibraryCategory: 'Functional components',
+    haiwellToolboxName: 'Function button',
     haiwellClassName: 'HwNavBar',
     defaultSize: { width: 1240, height: 48 },
     minSize: { width: 240, height: 44 },
@@ -241,7 +337,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'LABEL',
     category: 'DISPLAY',
-    haiwellToolboxName: 'Static Text Label',
+    graphicsLibraryCategory: 'Functional components',
+    haiwellToolboxName: 'Text input/display',
     haiwellClassName: 'HwLabel',
     defaultSize: { width: 160, height: 32 },
     minSize: { width: 48, height: 24 },
@@ -252,13 +349,14 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
   {
     type: 'FACEPLATE_INSTANCE',
     category: 'CONTROL',
-    haiwellToolboxName: 'Custom Faceplate / Group',
+    graphicsLibraryCategory: 'Shape·Panel',
+    haiwellToolboxName: 'Panel 2',
     haiwellClassName: 'HwFaceplateGroup',
     defaultSize: { width: 240, height: 120 },
     minSize: { width: 96, height: 64 },
     interactive: true,
     allowedTagTypes: ['BOOL', 'INT16', 'FLOAT32'],
-    propertyGridMap: { x: 'Left', y: 'Top', width: 'Width', height: 'Height', faceplateId: 'TemplateId', label: 'InstanceName' },
+    propertyGridMap: { x: 'Left', y: 'Top', width: 'Width', height: 'Height', faceplateId: 'TemplateId', label: 'InstanceTitle' },
   },
 ];
 
@@ -904,6 +1002,7 @@ export interface DesktopBridgePlan {
     step: number;
     widgetId: string;
     action: 'DROP_BY_TOOLBOX_NAME_THEN_SET_PROPERTY_GRID';
+    graphicsLibraryCategory: string;
     toolboxItemName: string;
     propertyWrites: Record<string, string | number | boolean>;
     postConditionAssertions: Record<string, string | number | boolean>;
@@ -961,6 +1060,7 @@ export function compileDesktopAutomationBridge(
     return {
       id: w.id,
       haiwellClassName: spec?.haiwellClassName ?? 'HwGenericControl',
+      graphicsLibraryCategory: spec?.graphicsLibraryCategory ?? 'Functional components',
       haiwellToolboxName: spec?.haiwellToolboxName ?? w.type,
       properties: props,
     };
@@ -970,6 +1070,7 @@ export function compileDesktopAutomationBridge(
     step: idx + 1,
     widgetId: comp.id,
     action: 'DROP_BY_TOOLBOX_NAME_THEN_SET_PROPERTY_GRID' as const,
+    graphicsLibraryCategory: comp.graphicsLibraryCategory,
     toolboxItemName: comp.haiwellToolboxName,
     propertyWrites: comp.properties,
     postConditionAssertions: {
@@ -990,7 +1091,7 @@ export function compileDesktopAutomationBridge(
     toolboxAutoId: options.uiaMap?.toolboxAutoId ?? '',
     canvasAutoId: options.uiaMap?.canvasAutoId ?? '',
     propertyGridAutoId: options.uiaMap?.propertyGridAutoId ?? '',
-    toolboxTitle: options.uiaMap?.toolboxTitle ?? 'Toolbox',
+    toolboxTitle: options.uiaMap?.toolboxTitle ?? 'Graphics library',
     propertyGridTitle: options.uiaMap?.propertyGridTitle ?? 'Property',
   };
   const calibrationRequired =
@@ -1068,13 +1169,21 @@ export function compileDesktopAutomationBridge(
     `    app = Application(backend="uia").connect(title_re=uia["windowTitleRegex"])`,
     `    win = app.window(title_re=uia["windowTitleRegex"])`,
     `    win.set_focus()`,
-    `    toolbox = resolve_pane(win, uia.get("toolboxAutoId", ""), uia.get("toolboxTitle", "Toolbox"), "Toolbox")`,
+    `    toolbox = resolve_pane(win, uia.get("toolboxAutoId", ""), uia.get("toolboxTitle", "Graphics library"), "Graphics library")`,
     `    canvas = resolve_pane(win, uia.get("canvasAutoId", ""), "${screen.name}", "Display Canvas")`,
     `    prop_grid = resolve_pane(win, uia.get("propertyGridAutoId", ""), uia.get("propertyGridTitle", "Property"), "Property Grid")`,
     `    canvas_rect = canvas.rectangle()`,
     `    drop_pt = (canvas_rect.mid_point().x, canvas_rect.mid_point().y)`,
     ``,
+    `    active_cat = None`,
     `    for step in STEPS:`,
+    `        cat = step.get("graphicsLibraryCategory")`,
+    `        if cat and cat != active_cat:`,
+    `            cat_link = toolbox.child_window(title_re=f"(?i).*{re.escape(cat)}.*")`,
+    `            if cat_link.exists(timeout=1.5):`,
+    `                cat_link.click_input()`,
+    `                time.sleep(0.15)`,
+    `                active_cat = cat`,
     `        item = toolbox.child_window(title_re=f"(?i).*{re.escape(step['toolboxItemName'])}.*")`,
     `        item.drag_mouse_input(dst=drop_pt)`,
     `        time.sleep(0.12)`,
@@ -1188,7 +1297,7 @@ export function generateDesktopUiaCalibrator(options: {
     `                detected["projectBrowserAutoId"] = auto_id`,
     `            if not detected["propertyGridAutoId"] and ("property" in lower and ctype in ("Table", "Tree", "Pane", "Custom")):`,
     `                detected["propertyGridAutoId"] = auto_id`,
-    `            if not detected["toolboxAutoId"] and ("toolbox" in lower or "component" in lower or "shape" in lower):`,
+    `            if not detected["toolboxAutoId"] and ("graphics library" in lower or "toolbox" in lower or "component" in lower or "shape" in lower):`,
     `                detected["toolboxAutoId"] = auto_id`,
     `            if not detected["canvasAutoId"] and ("canvas" in lower or "display" in lower and ctype in ("Pane", "Document", "Custom")):`,
     `                detected["canvasAutoId"] = auto_id`,

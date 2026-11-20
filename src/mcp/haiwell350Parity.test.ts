@@ -734,4 +734,42 @@ test('v2.4.0: haiwell_open_project_bridge_export compiles full 5-section open-.h
   assert.match(data.pywinautoScript, /Event selection/);
 });
 
+test('v2.5.0: Graphics library exposes all 16 real Haiwell 3.50.1.19 categories, exact item names, and clicks category before dragging', async () => {
+  const store = new HaiwellProjectStore();
+  const catRes = await invokeHaiwellTool('haiwell_hmi_toolbox_catalog', { category: 'ALL' }, store);
+  assert.equal(catRes.ok, true);
+  const catData = catRes.data as {
+    graphicsLibraryPanelTitle: string;
+    graphicsLibraryCategories: Record<string, string[]>;
+    components: { type: string; graphicsLibraryCategory: string; haiwellToolboxName: string }[];
+  };
+  assert.equal(catData.graphicsLibraryPanelTitle, 'Graphics library');
+  assert.equal(Object.keys(catData.graphicsLibraryCategories).length, 16);
+  assert.ok(catData.graphicsLibraryCategories['Functional components'].includes('Bit switch'));
+  assert.ok(catData.graphicsLibraryCategories['Functional components'].includes('Numeric input/display'));
+  assert.ok(catData.graphicsLibraryCategories['Advanced controls'].includes('Tendency chart'));
+  assert.ok(catData.graphicsLibraryCategories['Advanced controls'].includes('Conveyor belt 1'));
+  assert.ok(catData.graphicsLibraryCategories['Instrument·Cursor'].includes('Instrument 3'));
+  assert.ok(catData.graphicsLibraryCategories['Instrument·Cursor'].includes('Cursor 3'));
+
+  const bitBtn = catData.components.find((c) => c.type === 'BIT_BUTTON')!;
+  assert.equal(bitBtn.graphicsLibraryCategory, 'Functional components');
+  assert.equal(bitBtn.haiwellToolboxName, 'Bit switch');
+
+  const bridge = await invokeHaiwellTool(
+    'haiwell_hmi_desktop_bridge_export',
+    { projectId: 'prj_chiller_plant_01', screenId: 'scr_chiller_overview' },
+    store
+  );
+  assert.equal(bridge.ok, true);
+  const bData = bridge.data as {
+    uiaExecutionSteps: { graphicsLibraryCategory: string; toolboxItemName: string }[];
+    pywinautoScript: string;
+  };
+  assert.ok(bData.uiaExecutionSteps.every((s) => typeof s.graphicsLibraryCategory === 'string' && s.graphicsLibraryCategory.length > 0));
+  assert.match(bData.pywinautoScript, /Graphics library/);
+  assert.match(bData.pywinautoScript, /graphicsLibraryCategory/);
+});
+
+
 

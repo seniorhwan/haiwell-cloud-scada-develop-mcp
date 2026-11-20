@@ -222,7 +222,7 @@ export function createApp(
     const profile = resolveToolProfile(typeof req.query.profile === 'string' ? req.query.profile : undefined);
     res.json({
       service: 'haiwell-cloud-scada-mcp',
-      version: '2.4.0',
+      version: '2.5.0',
       mode: 'headless-machine-readable-only',
       protocol: 'MCP 2025-03-26',
       profile,
@@ -393,12 +393,12 @@ export function createApp(
     const profile = resolveToolProfile(typeof req.query.profile === 'string' ? req.query.profile : undefined);
     const tools = serializeToolCatalog(profile);
     res.json({
-      schemaVersion: '2.4.0',
+      schemaVersion: '2.5.0',
       profile,
       catalogSha256: computeToolCatalogHash(profile),
       server: {
         name: 'haiwell-cloud-scada-mcp',
-        version: '2.4.0',
+        version: '2.5.0',
         mode: 'headless',
         mcpEndpoint: `${baseUrl}/mcp`,
         rpcEndpoint: `${baseUrl}/api/rpc`,

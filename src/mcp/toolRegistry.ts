@@ -37,6 +37,7 @@ import {
   compileFullOpenProjectBridge,
   compilePidScreen,
   generateDesktopUiaCalibrator,
+  HAIWELL_GRAPHICS_LIBRARY_CATALOG,
   HAIWELL_HMI_TOOLBOX,
   REAL_HAIWELL_350_TREE_NODES,
   solveAndRepairScreenLayout,
@@ -2384,7 +2385,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         input.category === 'ALL'
           ? HAIWELL_HMI_TOOLBOX
           : HAIWELL_HMI_TOOLBOX.filter((c) => c.category === input.category);
-      return { count: items.length, gridSnapPx: 8, minTouchPx: 48, components: items };
+      return {
+        count: items.length,
+        gridSnapPx: 8,
+        minTouchPx: 48,
+        graphicsLibraryPanelTitle: 'Graphics library',
+        graphicsLibraryCategories: HAIWELL_GRAPHICS_LIBRARY_CATALOG,
+        components: items,
+      };
     },
   }),
 
