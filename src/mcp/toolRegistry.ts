@@ -34,7 +34,9 @@ import {
   auditScreenSpatially,
   compileDesktopAutomationBridge,
   compilePidScreen,
+  generateDesktopUiaCalibrator,
   HAIWELL_HMI_TOOLBOX,
+  REAL_HAIWELL_350_TREE_NODES,
   solveAndRepairScreenLayout,
 } from './hmiSpatialEngine';
 import {
@@ -252,21 +254,53 @@ export function buildProjectExportBundle(project: HaiwellProject) {
     ].join(',')
   );
 
+  const haiwellVarHeader =
+    'VariableName,VariableType,DeviceName,RegisterAddress,DataType,ReadWrite,Unit,MinValue,MaxValue,Description';
+  const haiwellVarRows = Object.values(project.tags).map((t) => {
+    const devName = t.deviceId
+      ? project.devices.find((d) => d.id === t.deviceId)?.name ?? t.deviceId
+      : '';
+    return [
+      escapeCsvCell(t.name, true),
+      escapeCsvCell(t.scope === 'PLC' ? 'Device' : t.scope === 'INTERNAL' ? 'Internal' : t.scope),
+      escapeCsvCell(devName, true),
+      escapeCsvCell(t.address ?? '', true),
+      escapeCsvCell(t.dataType),
+      escapeCsvCell(t.access),
+      escapeCsvCell(t.unit ?? '', true),
+      escapeCsvCell(t.safeMin ?? ''),
+      escapeCsvCell(t.safeMax ?? ''),
+      escapeCsvCell(t.description ?? '', true),
+    ].join(',');
+  });
+
   return {
-    format: 'haiwell-cloud-scada-bundle/v2',
+    format: 'haiwell-cloud-scada-bundle/v2.2',
     exportedAt: new Date().toISOString(),
     projectMeta: {
       id: project.id,
       name: project.name,
+      hwdevFileName: project.hwdevFileName,
       version: project.version,
       revision: project.revision,
       targetHardware: project.targetHardware,
       resolution: project.resolution,
       defaultLanguage: project.defaultLanguage,
       cloudEnabled: project.cloudEnabled,
+      networkProjectEnabled: project.networkProjectEnabled,
+      networkProjectPort: project.networkProjectPort,
+      targetDownloadIp: project.targetDownloadIp,
+      startupScreenId: project.startupScreenId,
     },
     artifacts: {
+      'project.hwdev.manifest.json': {
+        schema: 'haiwell.cloud.scada.3.50.hwdev-manifest/v1',
+        hwdevFileName: project.hwdevFileName,
+        projectBrowserNodesCovered: [...REAL_HAIWELL_350_TREE_NODES],
+        project,
+      },
       'project.hwsp.json': project,
+      'haiwell_variables_import.csv': [haiwellVarHeader, ...haiwellVarRows].join('\n'),
       'tags.csv': [tagCsvHeader, ...tagCsvRows].join('\n'),
       'opcua/nodeset2.xml': generateOpcUaNodeSet2Xml(project),
       'mqtt/bindings.json': project.mqtt,
@@ -487,6 +521,57 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
       if (!hasOwnTag(project, col.tagName)) pushDangling('operations', `report:${rp.id}`, col.tagName);
     }
   }
+  for (const dg of project.dataGroups ?? []) {
+    for (const tn of dg.tagNames) {
+      if (!hasOwnTag(project, tn)) pushDangling('datalink', `data_group:${dg.id}`, tn);
+    }
+    if (dg.triggerTag && !hasOwnTag(project, dg.triggerTag)) {
+      pushDangling('datalink', `data_group:${dg.id}`, dg.triggerTag);
+    }
+  }
+  if (project.rfid?.uidTargetTag && !hasOwnTag(project, project.rfid.uidTargetTag)) {
+    pushDangling('security', 'rfid:uidTargetTag', project.rfid.uidTargetTag);
+  }
+  if (project.rfid?.cardPresentTag && !hasOwnTag(project, project.rfid.cardPresentTag)) {
+    pushDangling('security', 'rfid:cardPresentTag', project.rfid.cardPresentTag);
+  }
+  for (const per of project.peripherals ?? []) {
+    if (per.targetTagName && !hasOwnTag(project, per.targetTagName)) {
+      pushDangling('operations', `peripheral:${per.id}`, per.targetTagName);
+    }
+  }
+  for (const mt of project.cloudMonitor?.monitoredTags ?? []) {
+    const tag = getOwnTag(project, mt.tagName);
+    if (!tag) {
+      pushDangling('datalink', 'cloud_monitor', mt.tagName);
+    } else if (mt.allowRemoteWrite && (tag.access === 'RO' || tag.safetyClass === 'SIL3')) {
+      findings.push({
+        code: 'AUD-CLOUD-INTERLOCK',
+        severity: 'CRITICAL',
+        domain: 'security',
+        target: `cloud_monitor:${mt.tagName}`,
+        message: `Cloud platform data monitor allows remote write to ${tag.access === 'RO' ? 'read-only' : 'SIL3'} tag "${mt.tagName}".`,
+        remediation: 'Disable allowRemoteWrite on RO/SIL3 tags in haiwell_cloud_monitor_configure.',
+      });
+    }
+  }
+  for (const aud of project.audioClips ?? []) {
+    if (aud.triggerTag && !hasOwnTag(project, aud.triggerTag)) {
+      pushDangling('operations', `audio:${aud.id}`, aud.triggerTag);
+    }
+  }
+  for (const srv of project.dataReportingServers ?? []) {
+    if (srv.enabled && !srv.tlsRequired && (srv.protocol === 'HTTP_REST' || srv.protocol === 'MQTT')) {
+      findings.push({
+        code: 'AUD-REPORTING-TLS',
+        severity: 'HIGH',
+        domain: 'datalink',
+        target: `data_reporting_server:${srv.id}`,
+        message: `Data reporting server "${srv.id}" pushes plant data over unencrypted ${srv.protocol}.`,
+        remediation: 'Enable tlsRequired=true and use https:// or mqtts://.',
+      });
+    }
+  }
 
   const critical = findings.filter((f) => f.severity === 'CRITICAL').length;
   const high = findings.filter((f) => f.severity === 'HIGH').length;
@@ -569,25 +654,42 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Project Workspace & Target Hardware Setup',
     safetyTier: 'design',
     description:
-      'Create a new Haiwell Cloud SCADA Develop project targeting PC SCADA, Cloud HMI (C7/C10/B7/B10/A8), Cloud Box (CBOX), or IPC with resolution, language, and security defaults.',
+      'Create a new Haiwell Cloud Scada 3.50.x (.hwdev) project targeting PC SCADA, Cloud HMI (C7/C10/B7/B7H/B10/A8), Cloud Box (CBOX), or IPC with resolution, network project port (8888), language, and security defaults.',
     inputSchema: z.object({
       id: z.string().regex(/^[a-z0-9_-]{3,48}$/, 'Use lowercase alphanumeric, dash, or underscore (3-48 chars)'),
       name: z.string().min(2).max(120),
       targetHardware: z
-        .enum(['PC_SCADA', 'CLOUD_HMI_C7', 'CLOUD_HMI_C10', 'CLOUD_HMI_B7', 'CLOUD_HMI_B10', 'CLOUD_HMI_A8', 'CLOUD_BOX_CBOX', 'IPC_SCADA'])
+        .enum([
+          'PC_SCADA',
+          'CLOUD_HMI_C7',
+          'CLOUD_HMI_C10',
+          'CLOUD_HMI_B7',
+          'CLOUD_HMI_B7H',
+          'CLOUD_HMI_B10',
+          'CLOUD_HMI_A8',
+          'CLOUD_BOX_CBOX',
+          'IPC_SCADA',
+        ])
         .default('PC_SCADA'),
       width: z.number().int().min(320).max(3840).default(1280),
       height: z.number().int().min(240).max(2160).default(800),
       defaultLanguage: z.string().min(2).max(12).default('en-US'),
       cloudEnabled: z.boolean().default(true),
+      networkProjectEnabled: z.boolean().default(true),
+      networkProjectPort: z.number().int().min(1024).max(65535).default(8888),
+      targetDownloadIp: z.string().max(64).optional(),
+      startupScreenId: z.string().max(64).optional(),
+      hwdevFileName: z.string().max(120).optional(),
       overwrite: z.boolean().default(false),
     }),
     sampleInput: {
       id: 'prj_pump_station_02',
       name: 'Municipal Booster Pump Station',
-      targetHardware: 'CLOUD_HMI_C10',
+      targetHardware: 'CLOUD_HMI_B7H',
       width: 1024,
       height: 600,
+      networkProjectEnabled: true,
+      networkProjectPort: 8888,
     },
     handler: (input, store) => {
       if (!input.overwrite && store.listProjects().some((p) => p.id === input.id)) {
@@ -596,6 +698,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         );
       }
       const now = new Date().toISOString();
+      const hwdevFile = input.hwdevFileName
+        ? input.hwdevFileName.endsWith('.hwdev')
+          ? input.hwdevFileName
+          : `${input.hwdevFileName}.hwdev`
+        : `${input.id}.hwdev`;
       const project: HaiwellProject = {
         id: input.id,
         name: input.name,
@@ -605,6 +712,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         resolution: { width: input.width, height: input.height },
         defaultLanguage: input.defaultLanguage,
         cloudEnabled: input.cloudEnabled,
+        networkProjectEnabled: input.networkProjectEnabled,
+        networkProjectPort: input.networkProjectPort,
+        targetDownloadIp: input.targetDownloadIp,
+        startupScreenId: input.startupScreenId,
+        hwdevFileName: hwdevFile,
         createdAt: now,
         updatedAt: now,
         devices: [],
@@ -642,10 +754,54 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         },
         recipes: [],
         trends: [],
+        dataGroups: [],
         dataLinks: [],
+        dataReportingServers: [],
+        cloudMonitor: {
+          enabled: input.cloudEnabled,
+          platform: 'HAIWELL_CLOUD',
+          machineCode: '',
+          networkProjectPort: input.networkProjectPort,
+          webScadaEnabled: input.cloudEnabled,
+          mobileAppEnabled: input.cloudEnabled,
+          remoteAlarmPushEnabled: input.cloudEnabled,
+          monitoredTags: [],
+        },
         schedules: [],
         reports: [],
+        operationRecordPolicy: {
+          enabled: true,
+          recordLogins: true,
+          recordVariableWrites: true,
+          recordScreenChanges: true,
+          recordRecipeTransfers: true,
+          recordAlarmAcks: true,
+          retentionDays: 180,
+          maxRecords: 100000,
+          storageTarget: 'LOCAL_SQLITE',
+        },
+        fonts: [
+          {
+            id: 'font_ms_sans',
+            familyName: 'Microsoft Sans Serif',
+            defaultSizePt: 12,
+            weight: 'NORMAL',
+            charset: 'LATIN_EXT',
+            embedInHmiPackage: true,
+          },
+        ],
+        rfid: {
+          enabled: false,
+          transport: 'USB_HID',
+          portOrHost: 'USB0',
+          autoLoginEnabled: false,
+          autoLogoutOnRemoveSec: 30,
+          cards: [],
+        },
+        shapeLibrary: [],
+        peripherals: [],
         cameras: [],
+        audioClips: [],
         translations: { [input.defaultLanguage]: {} },
         security: {
           sslBits: 128,
@@ -671,14 +827,17 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         action: 'PROJECT_CREATE',
         target: project.id,
         outcome: 'ALLOWED',
-        detail: `Created Haiwell project (${project.targetHardware} ${project.resolution.width}x${project.resolution.height}).`,
+        detail: `Created Haiwell project ${project.hwdevFileName} (${project.targetHardware} ${project.resolution.width}x${project.resolution.height}, netPort=${project.networkProjectPort}).`,
       });
       return {
         projectId: project.id,
+        hwdevFileName: project.hwdevFileName,
         revision: project.revision,
         name: project.name,
         targetHardware: project.targetHardware,
         resolution: project.resolution,
+        networkProjectEnabled: project.networkProjectEnabled,
+        networkProjectPort: project.networkProjectPort,
       };
     },
   }),
@@ -701,11 +860,16 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         project: {
           id: p.id,
           name: p.name,
+          hwdevFileName: p.hwdevFileName,
           version: p.version,
           revision: p.revision,
           targetHardware: p.targetHardware,
           resolution: p.resolution,
           cloudEnabled: p.cloudEnabled,
+          networkProjectEnabled: p.networkProjectEnabled,
+          networkProjectPort: p.networkProjectPort,
+          targetDownloadIp: p.targetDownloadIp,
+          startupScreenId: p.startupScreenId,
           updatedAt: p.updatedAt,
         },
         tree: {
@@ -724,10 +888,24 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           opcua: { role: p.opcua.role, endpointUrl: p.opcua.endpointUrl, securityPolicy: p.opcua.securityPolicy, nodeCount: p.opcua.nodes.length },
           recipes: p.recipes.map((r) => ({ id: r.id, name: r.name, recordCount: r.records.length })),
           trends: p.trends.map((t) => ({ id: t.id, name: t.name, sampleIntervalMs: t.sampleIntervalMs, tagCount: t.tagNames.length })),
+          dataGroups: (p.dataGroups ?? []).map((dg) => ({ id: dg.id, name: dg.name, tagCount: dg.tagNames.length, collectMode: dg.collectMode })),
           dataLinks: p.dataLinks.map((d) => ({ id: d.id, engine: d.engine, tableName: d.tableName })),
+          dataReportingServers: (p.dataReportingServers ?? []).map((s) => ({ id: s.id, name: s.name, protocol: s.protocol, dataGroupCount: s.dataGroupIds.length, enabled: s.enabled })),
+          cloudMonitor: {
+            enabled: p.cloudMonitor?.enabled ?? false,
+            platform: p.cloudMonitor?.platform ?? 'HAIWELL_CLOUD',
+            machineCode: p.cloudMonitor?.machineCode ?? '',
+            monitoredTagCount: p.cloudMonitor?.monitoredTags.length ?? 0,
+          },
           schedules: p.schedules.map((s) => ({ id: s.id, cron: s.cron, actionType: s.actionType, enabled: s.enabled })),
           reports: p.reports.map((r) => ({ id: r.id, name: r.name, format: r.format })),
+          operationRecordPolicy: p.operationRecordPolicy,
+          fonts: (p.fonts ?? []).map((f) => ({ id: f.id, familyName: f.familyName, defaultSizePt: f.defaultSizePt, charset: f.charset })),
+          rfid: { enabled: p.rfid?.enabled ?? false, transport: p.rfid?.transport ?? 'USB_HID', cardCount: p.rfid?.cards.length ?? 0 },
+          shapeLibrary: (p.shapeLibrary ?? []).map((sh) => ({ id: sh.id, name: sh.name, category: sh.category, format: sh.format })),
+          peripherals: (p.peripherals ?? []).map((per) => ({ id: per.id, name: per.name, kind: per.kind, connection: per.connection })),
           cameras: p.cameras.map((c) => ({ id: c.id, protocol: c.protocol, screenId: c.screenId })),
+          audioClips: (p.audioClips ?? []).map((a) => ({ id: a.id, name: a.name, sourceType: a.sourceType, enabled: a.enabled })),
           languages: Object.keys(p.translations),
           security: { sslBits: p.security.sslBits, abKeyEnabled: p.security.abKeyEnabled, groupCount: p.security.userGroups.length },
         },
@@ -788,10 +966,16 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         'opcua_node',
         'recipe_group',
         'trend',
+        'data_group',
         'datalink',
+        'data_reporting_server',
         'schedule',
         'report',
+        'font',
+        'shape',
+        'peripheral',
         'camera',
+        'audio',
       ]),
       entityId: z.string().min(1),
       parentScreenId: z.string().optional(),
@@ -866,6 +1050,26 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           }));
           project.scripts = project.scripts.filter(
             (sc) => sc.triggerTag !== input.entityId && !sc.referencedTags.includes(input.entityId)
+          );
+          project.dataGroups = (project.dataGroups ?? [])
+            .map((dg) => ({
+              ...dg,
+              tagNames: dg.tagNames.filter((t) => t !== input.entityId),
+              triggerTag: dg.triggerTag === input.entityId ? undefined : dg.triggerTag,
+            }))
+            .filter((dg) => dg.tagNames.length > 0);
+          if (project.rfid?.uidTargetTag === input.entityId) project.rfid.uidTargetTag = undefined;
+          if (project.rfid?.cardPresentTag === input.entityId) project.rfid.cardPresentTag = undefined;
+          project.peripherals = (project.peripherals ?? []).map((per) =>
+            per.targetTagName === input.entityId ? { ...per, targetTagName: undefined } : per
+          );
+          if (project.cloudMonitor) {
+            project.cloudMonitor.monitoredTags = project.cloudMonitor.monitoredTags.filter(
+              (m) => m.tagName !== input.entityId
+            );
+          }
+          project.audioClips = (project.audioClips ?? []).map((aud) =>
+            aud.triggerTag === input.entityId ? { ...aud, triggerTag: undefined } : aud
           );
         }
         store.saveProject(project);
@@ -977,10 +1181,16 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         }
         case 'recipe_group': project.recipes = removeById(project.recipes); break;
         case 'trend': project.trends = removeById(project.trends); break;
+        case 'data_group': project.dataGroups = removeById(project.dataGroups); break;
         case 'datalink': project.dataLinks = removeById(project.dataLinks); break;
+        case 'data_reporting_server': project.dataReportingServers = removeById(project.dataReportingServers); break;
         case 'schedule': project.schedules = removeById(project.schedules); break;
         case 'report': project.reports = removeById(project.reports); break;
+        case 'font': project.fonts = removeById(project.fonts); break;
+        case 'shape': project.shapeLibrary = removeById(project.shapeLibrary); break;
+        case 'peripheral': project.peripherals = removeById(project.peripherals); break;
         case 'camera': project.cameras = removeById(project.cameras); break;
+        case 'audio': project.audioClips = removeById(project.audioClips); break;
       }
       store.saveProject(project);
       return { deleted: true, entityType: 'entityType' in input ? input.entityType : 'unknown', entityId: input.entityId, revision: project.revision };
@@ -1011,15 +1221,34 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       includeArtifacts: z
-        .array(z.enum(['project_json', 'tags_csv', 'opcua_xml', 'mqtt_json', 'hmi_svg', 'pous', 'scripts']))
+        .array(
+          z.enum([
+            'hwdev_manifest',
+            'project_json',
+            'haiwell_variables_csv',
+            'tags_csv',
+            'opcua_xml',
+            'mqtt_json',
+            'hmi_svg',
+            'pous',
+            'scripts',
+          ])
+        )
         .optional(),
     }),
-    sampleInput: { projectId: DEFAULT_PROJECT_ID, includeArtifacts: ['tags_csv', 'opcua_xml', 'mqtt_json'] },
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      includeArtifacts: ['haiwell_variables_csv', 'opcua_xml', 'mqtt_json'],
+    },
     handler: (input, store) => {
       const bundle = buildProjectExportBundle(store.getProject(input.projectId));
       if (!input.includeArtifacts || input.includeArtifacts.length === 0) return bundle;
       const selected: Record<string, unknown> = {};
+      if (input.includeArtifacts.includes('hwdev_manifest'))
+        selected['project.hwdev.manifest.json'] = bundle.artifacts['project.hwdev.manifest.json'];
       if (input.includeArtifacts.includes('project_json')) selected['project.hwsp.json'] = bundle.artifacts['project.hwsp.json'];
+      if (input.includeArtifacts.includes('haiwell_variables_csv'))
+        selected['haiwell_variables_import.csv'] = bundle.artifacts['haiwell_variables_import.csv'];
       if (input.includeArtifacts.includes('tags_csv')) selected['tags.csv'] = bundle.artifacts['tags.csv'];
       if (input.includeArtifacts.includes('opcua_xml')) selected['opcua/nodeset2.xml'] = bundle.artifacts['opcua/nodeset2.xml'];
       if (input.includeArtifacts.includes('mqtt_json')) selected['mqtt/bindings.json'] = bundle.artifacts['mqtt/bindings.json'];
@@ -2179,14 +2408,26 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_hmi_desktop_bridge_export',
     domain: 'hmi',
-    haiwellFeature: 'Zero-Error Native Screen Manifest & Windows UIA (pywinauto) Property-Grid Bridge',
+    haiwellFeature: 'Calibrated Haiwell Cloud Scada 3.50.x Windows UIA (pywinauto) Property-Grid Bridge',
     safetyTier: 'design',
     description:
-      'Export a validated HMI screen for zero-error deployment into Haiwell Cloud SCADA Develop desktop software via BOTH (1) a native structured screen import manifest AND (2) a closed-loop Windows UI Automation (pywinauto) Python script that drops components by Toolbox Name and injects mathematically proven Left/Top/Width/Height/Variable values into the Property Grid with UIA read-back verification (eliminating pixel drag-and-drop errors).',
+      'Export a validated HMI screen for Haiwell Cloud Scada 3.50.x (*.hwdev, .NET WinForms) via BOTH (1) a structured screen manifest AND (2) a calibrated Windows UI Automation (pywinauto) script matching the real "Haiwell Cloud Scada[3.50.x]" window title, loading verified AutomationIds from haiwell_uia_map.json, injecting Left/Top/Width/Height/Variable into the Property Grid with UIA read-back verification, saving .hwdev (Ctrl+S), and triggering Offline Simulation (F6).',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       screenId: z.string().default('scr_chiller_overview'),
-      windowTitleRegex: z.string().default('.*Haiwell Cloud SCADA Develop.*'),
+      windowTitleRegex: z.string().default('(?i).*Haiwell Cloud Scada.*'),
+      uiaMap: z
+        .object({
+          windowTitleRegex: z.string().optional(),
+          projectBrowserAutoId: z.string().optional(),
+          toolboxAutoId: z.string().optional(),
+          canvasAutoId: z.string().optional(),
+          propertyGridAutoId: z.string().optional(),
+          toolboxTitle: z.string().optional(),
+          propertyGridTitle: z.string().optional(),
+          haiwellVersion: z.string().optional(),
+        })
+        .optional(),
     }),
     sampleInput: { projectId: DEFAULT_PROJECT_ID, screenId: 'scr_chiller_overview' },
     handler: (input, store) => {
@@ -2195,9 +2436,51 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (!screen) throw new Error(`Screen "${input.screenId}" not found.`);
       return compileDesktopAutomationBridge(screen, project.tags, {
         windowTitleRegex: input.windowTitleRegex,
+        uiaMap: input.uiaMap,
         knownScreenIds: new Set(project.screens.map((s) => s.id)),
         targetHardware: project.targetHardware,
       });
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_desktop_uia_calibrate',
+    domain: 'hmi',
+    haiwellFeature: 'Live Windows UIA Calibrator for Haiwell Cloud Scada 3.50.x (.NET WinForms)',
+    safetyTier: 'read',
+    description:
+      'Generate calibrate_haiwell_uia.py to inspect a live Haiwell Cloud Scada 3.50.x desktop window (all 22 Project browser nodes, Display canvas, Toolbox, Property Grid) and output haiwell_uia_map.json, OR validate a captured UIA map before running desktop automation.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      action: z.enum(['GENERATE_SCRIPT', 'VALIDATE_MAP']).default('GENERATE_SCRIPT'),
+      windowTitleRegex: z.string().default('(?i).*Haiwell Cloud Scada.*'),
+      capturedMap: z
+        .object({
+          windowTitleRegex: z.string().optional(),
+          projectBrowserAutoId: z.string().optional(),
+          toolboxAutoId: z.string().optional(),
+          canvasAutoId: z.string().optional(),
+          propertyGridAutoId: z.string().optional(),
+          toolboxTitle: z.string().optional(),
+          propertyGridTitle: z.string().optional(),
+          haiwellVersion: z.string().optional(),
+        })
+        .optional(),
+    }),
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'GENERATE_SCRIPT', windowTitleRegex: '(?i).*Haiwell Cloud Scada.*' },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      if (input.action === 'VALIDATE_MAP' && !input.capturedMap) {
+        throw new Error('VALIDATE_MAP requires capturedMap object from haiwell_uia_map.json.');
+      }
+      return {
+        projectId: project.id,
+        hwdevFileName: project.hwdevFileName,
+        ...generateDesktopUiaCalibrator({
+          windowTitleRegex: input.windowTitleRegex,
+          capturedMap: input.capturedMap,
+        }),
+      };
     },
   }),
 
@@ -3404,6 +3687,577 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const result = runSimulationSteps(targetProject, input);
       if (input.persistState) store.saveProject(liveProject);
       return { isolatedClone: !input.persistState, ...result };
+    },
+  }),
+
+  // =========================================================================
+  // 16. HAIWELL CLOUD SCADA 3.50.x FULL PROJECT BROWSER PARITY TOOLS
+  //     (Data group, Operation record, Font manager, RFID, Shape library,
+  //      Peripheral, Data reporting server, Cloud platform data monitor, Audio)
+  // =========================================================================
+  defineTool({
+    name: 'haiwell_datagroup_configure',
+    domain: 'datalink',
+    haiwellFeature: 'Data Group (Batch Variable Collection for Logging & Data Reporting)',
+    safetyTier: 'design',
+    description:
+      'Create or update a Haiwell Cloud Scada Data group that batches validated Variables for cyclic, change-driven, or trigger-driven collection, history tables, and Data reporting server push.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+      name: z.string().min(2).max(100),
+      description: z.string().max(240).optional(),
+      tagNames: z.array(z.string().min(1)).min(1),
+      collectMode: z.enum(['CYCLIC', 'TAG_TRIGGER', 'ON_CHANGE']).default('CYCLIC'),
+      intervalMs: z.number().int().min(100).max(86400000).default(10000),
+      triggerTag: z.string().optional(),
+      enabled: z.boolean().default(true),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      id: 'dg_energy_kpi',
+      name: 'Energy KPI Data Group',
+      tagNames: ['Supply_Temp_C', 'Return_Temp_C'],
+      collectMode: 'CYCLIC',
+      intervalMs: 5000,
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const uniqueTags = [...new Set(input.tagNames)];
+      const missing = uniqueTags.filter((tn) => !hasOwnTag(project, tn));
+      if (missing.length > 0) {
+        throw new Error(`Unknown Variable(s) in Data group: ${missing.join(', ')}`);
+      }
+      if (input.collectMode === 'TAG_TRIGGER') {
+        if (!input.triggerTag || !hasOwnTag(project, input.triggerTag)) {
+          throw new Error(`TAG_TRIGGER Data group requires an existing triggerTag.`);
+        }
+      }
+      const cfg = {
+        id: input.id,
+        name: input.name,
+        description: input.description,
+        tagNames: uniqueTags,
+        collectMode: input.collectMode,
+        intervalMs: input.intervalMs,
+        triggerTag: input.triggerTag,
+        enabled: input.enabled,
+      };
+      project.dataGroups = project.dataGroups ?? [];
+      const idx = project.dataGroups.findIndex((d) => d.id === cfg.id);
+      if (idx >= 0) project.dataGroups[idx] = cfg;
+      else project.dataGroups.push(cfg);
+      store.saveProject(project);
+      return { saved: true, dataGroup: cfg, totalDataGroups: project.dataGroups.length };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_operation_record_configure',
+    domain: 'security',
+    haiwellFeature: 'Operation Record (Operator Audit Trail Policy, Query & CSV Export)',
+    safetyTier: 'design',
+    description:
+      'Configure Haiwell Cloud Scada Operation record policy (which operator actions are captured, retention days, storage target) OR query/export recorded operator audit entries with action/actor filtering.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      action: z.enum(['CONFIGURE', 'QUERY', 'EXPORT_CSV']).default('CONFIGURE'),
+      policy: z
+        .object({
+          enabled: z.boolean().default(true),
+          recordLogins: z.boolean().default(true),
+          recordVariableWrites: z.boolean().default(true),
+          recordScreenChanges: z.boolean().default(true),
+          recordRecipeTransfers: z.boolean().default(true),
+          recordAlarmAcks: z.boolean().default(true),
+          retentionDays: z.number().int().min(1).max(3650).default(180),
+          maxRecords: z.number().int().min(100).max(5000000).default(100000),
+          storageTarget: z.enum(['LOCAL_SQLITE', 'SD_CARD', 'USB_STORAGE']).default('LOCAL_SQLITE'),
+        })
+        .optional(),
+      filterActor: z.string().optional(),
+      filterAction: z.string().optional(),
+      limit: z.number().int().min(1).max(500).default(50),
+    }),
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'QUERY', limit: 20 },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      if (input.action === 'CONFIGURE') {
+        if (!input.policy) throw new Error('CONFIGURE requires policy object.');
+        project.operationRecordPolicy = { ...input.policy };
+        project.security.auditTrailEnabled = input.policy.enabled;
+        store.saveProject(project);
+        return { updated: true, operationRecordPolicy: project.operationRecordPolicy };
+      }
+      let rows = [...project.auditLog];
+      if (input.filterActor) {
+        const needle = input.filterActor.toLowerCase();
+        rows = rows.filter((r) => r.actor.toLowerCase().includes(needle));
+      }
+      if (input.filterAction) {
+        const needle = input.filterAction.toLowerCase();
+        rows = rows.filter((r) => r.action.toLowerCase().includes(needle));
+      }
+      const sliced = rows.slice(-input.limit);
+      if (input.action === 'EXPORT_CSV') {
+        const header = 'id,timestamp,actor,action,target,outcome,detail';
+        const csvRows = sliced.map((r) =>
+          [
+            escapeCsvCell(r.id, true),
+            escapeCsvCell(r.timestamp),
+            escapeCsvCell(r.actor, true),
+            escapeCsvCell(r.action, true),
+            escapeCsvCell(r.target, true),
+            escapeCsvCell(r.outcome),
+            escapeCsvCell(r.detail, true),
+          ].join(',')
+        );
+        return { count: sliced.length, csv: [header, ...csvRows].join('\n') };
+      }
+      return { policy: project.operationRecordPolicy, totalMatches: rows.length, records: sliced };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_font_manager',
+    domain: 'hmi',
+    haiwellFeature: 'Font Manager (Embedded HMI Panel Fonts & Charset Packaging)',
+    safetyTier: 'design',
+    description:
+      'Register or list fonts in Haiwell Cloud Scada Font manager (e.g. Microsoft Sans Serif, Noto Sans CJK) with point size, charset, and HMI package embedding so B7H/C10 panels render text without clipping or glyph fallback.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      action: z.enum(['UPSERT', 'LIST']).default('UPSERT'),
+      font: z
+        .object({
+          id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+          familyName: z.string().min(2).max(80),
+          defaultSizePt: z.number().int().min(8).max(72).default(12),
+          weight: z.enum(['NORMAL', 'BOLD']).default('NORMAL'),
+          charset: z.enum(['ASCII', 'LATIN_EXT', 'CJK_SIMPLIFIED', 'UNICODE_FULL']).default('LATIN_EXT'),
+          embedInHmiPackage: z.boolean().default(true),
+          fallbackFamily: z.string().max(80).optional(),
+        })
+        .optional(),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      action: 'UPSERT',
+      font: {
+        id: 'font_cjk_ui',
+        familyName: 'Noto Sans SC',
+        defaultSizePt: 14,
+        charset: 'CJK_SIMPLIFIED',
+        embedInHmiPackage: true,
+      },
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      project.fonts = project.fonts ?? [];
+      if (input.action === 'LIST') {
+        return { projectId: project.id, fonts: project.fonts };
+      }
+      if (!input.font) throw new Error('UPSERT requires font definition.');
+      const idx = project.fonts.findIndex((f) => f.id === input.font!.id);
+      if (idx >= 0) project.fonts[idx] = input.font;
+      else project.fonts.push(input.font);
+      store.saveProject(project);
+      return { saved: true, font: input.font, totalFonts: project.fonts.length };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_rfid_configure',
+    domain: 'security',
+    haiwellFeature: 'RFID Card Reader & Operator Badge Auto-Login',
+    safetyTier: 'design',
+    description:
+      'Configure Haiwell Cloud Scada RFID module: USB/Serial/TCP card reader binding, UID STRING Variable & card-present BOOL Variable checks, badge-to-User-Security-Group mapping, and auto-logout timeout.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      enabled: z.boolean().default(true),
+      transport: z.enum(['USB_HID', 'SERIAL_COM', 'TCP_READER']).default('USB_HID'),
+      portOrHost: z.string().min(2).max(120).default('USB0'),
+      baudRate: z.number().int().min(1200).max(115200).optional(),
+      uidTargetTag: z.string().optional(),
+      cardPresentTag: z.string().optional(),
+      autoLoginEnabled: z.boolean().default(true),
+      autoLogoutOnRemoveSec: z.number().int().min(0).max(3600).default(30),
+      cards: z
+        .array(
+          z.object({
+            cardUid: z.string().regex(/^[A-Fa-f0-9:-]{4,32}$/, 'Card UID must be hex/colon/dash (4-32 chars)'),
+            userName: z.string().min(1).max(64),
+            userGroup: z.string().min(1).max(64),
+            enabled: z.boolean().default(true),
+          })
+        )
+        .default([]),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      enabled: true,
+      transport: 'USB_HID',
+      portOrHost: 'USB0',
+      autoLoginEnabled: true,
+      cards: [{ cardUid: '04A2B91C', userName: 'LineLead_01', userGroup: 'Operators', enabled: true }],
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      if (input.uidTargetTag) {
+        const t = getOwnTag(project, input.uidTargetTag);
+        if (!t) throw new Error(`RFID uidTargetTag "${input.uidTargetTag}" does not exist.`);
+        if (t.dataType !== 'STRING' && t.dataType !== 'UINT32' && t.dataType !== 'INT32') {
+          throw new Error(`RFID uidTargetTag "${input.uidTargetTag}" must be STRING, UINT32, or INT32.`);
+        }
+      }
+      if (input.cardPresentTag) {
+        const t = getOwnTag(project, input.cardPresentTag);
+        if (!t) throw new Error(`RFID cardPresentTag "${input.cardPresentTag}" does not exist.`);
+        if (t.dataType !== 'BOOL') {
+          throw new Error(`RFID cardPresentTag "${input.cardPresentTag}" must be BOOL.`);
+        }
+      }
+      const knownGroups = new Set(project.security.userGroups.map((g) => g.groupName));
+      for (const card of input.cards) {
+        if (!knownGroups.has(card.userGroup)) {
+          throw new Error(
+            `RFID card "${card.cardUid}" references unknown User security group "${card.userGroup}". Known groups: ${[...knownGroups].join(', ')}`
+          );
+        }
+      }
+      project.rfid = {
+        enabled: input.enabled,
+        transport: input.transport,
+        portOrHost: input.portOrHost,
+        baudRate: input.baudRate,
+        uidTargetTag: input.uidTargetTag,
+        cardPresentTag: input.cardPresentTag,
+        autoLoginEnabled: input.autoLoginEnabled,
+        autoLogoutOnRemoveSec: input.autoLogoutOnRemoveSec,
+        cards: input.cards,
+      };
+      store.saveProject(project);
+      return { configured: true, rfid: project.rfid };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_shape_library_manage',
+    domain: 'hmi',
+    haiwellFeature: 'Shape Library (Custom Vector/SVG & Multi-State Equipment Graphics)',
+    safetyTier: 'design',
+    description:
+      'Register or list custom industrial equipment shapes in Haiwell Cloud Scada Shape library (pumps, valves, conveyors, switchgear, sensors) with strict SVG XSS sanitization (<script> and event handlers rejected).',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      action: z.enum(['UPSERT', 'LIST']).default('UPSERT'),
+      shape: z
+        .object({
+          id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+          name: z.string().min(2).max(100),
+          category: z.enum(['PUMP', 'VALVE', 'TANK', 'MOTOR', 'CONVEYOR', 'SWITCHGEAR', 'SENSOR', 'CUSTOM']),
+          format: z.enum(['SVG', 'PNG_REF', 'MULTI_STATE_VECTOR']).default('SVG'),
+          width: z.number().int().min(16).max(1024).default(96),
+          height: z.number().int().min(16).max(1024).default(96),
+          stateCount: z.number().int().min(1).max(32).default(2),
+          svgMarkup: z.string().max(50000).optional(),
+          assetPath: z.string().max(260).optional(),
+        })
+        .optional(),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      action: 'UPSERT',
+      shape: {
+        id: 'shp_breaker_iec',
+        name: 'IEC Circuit Breaker',
+        category: 'SWITCHGEAR',
+        format: 'SVG',
+        width: 64,
+        height: 64,
+        stateCount: 3,
+        svgMarkup: '<svg viewBox="0 0 64 64"><rect x="12" y="12" width="40" height="40" fill="none" stroke="#334155" stroke-width="4"/></svg>',
+      },
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      project.shapeLibrary = project.shapeLibrary ?? [];
+      if (input.action === 'LIST') {
+        return { projectId: project.id, shapes: project.shapeLibrary };
+      }
+      if (!input.shape) throw new Error('UPSERT requires shape object.');
+      if (input.shape.svgMarkup) {
+        if (/<script\b|javascript:|on[a-z]+\s*=/i.test(input.shape.svgMarkup)) {
+          throw new Error('SVG_SECURITY_REJECTED: Shape svgMarkup contains forbidden <script>, javascript:, or inline event handler.');
+        }
+      }
+      const idx = project.shapeLibrary.findIndex((s) => s.id === input.shape!.id);
+      if (idx >= 0) project.shapeLibrary[idx] = input.shape;
+      else project.shapeLibrary.push(input.shape);
+      store.saveProject(project);
+      return { saved: true, shape: input.shape, totalShapes: project.shapeLibrary.length };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_peripheral_configure',
+    domain: 'operations',
+    haiwellFeature: 'Peripheral Devices (Printers, Barcode/QR Scanners, USB/SD Storage, 4G Modem)',
+    safetyTier: 'design',
+    description:
+      'Configure Haiwell Cloud Scada Peripheral hardware (ESC-POS/network thermal printers, USB/RS232 barcode/QR scanners bound to STRING Variables, USB/SD storage auto-backup, and 4G/serial modems).',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+      name: z.string().min(2).max(100),
+      kind: z.enum(['PRINTER', 'BARCODE_SCANNER', 'USB_STORAGE', 'SD_CARD', 'MODEM_4G', 'SERIAL_PORT']),
+      connection: z.enum(['USB', 'SERIAL_RS232', 'SERIAL_RS485', 'ETHERNET', 'INTERNAL_SLOT']),
+      portOrAddress: z.string().min(1).max(120),
+      baudRate: z.number().int().min(1200).max(115200).optional(),
+      targetTagName: z.string().optional(),
+      driverModel: z.string().max(80).optional(),
+      autoBackupEnabled: z.boolean().optional(),
+      enabled: z.boolean().default(true),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      id: 'per_label_printer',
+      name: 'Packing Line Zebra Printer',
+      kind: 'PRINTER',
+      connection: 'ETHERNET',
+      portOrAddress: '192.168.1.210:9100',
+      driverModel: 'ZPL-II',
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      if (input.targetTagName) {
+        const tag = getOwnTag(project, input.targetTagName);
+        if (!tag) throw new Error(`Peripheral targetTagName "${input.targetTagName}" does not exist.`);
+        if (input.kind === 'BARCODE_SCANNER' && tag.dataType !== 'STRING') {
+          throw new Error(`BARCODE_SCANNER targetTagName "${input.targetTagName}" must be STRING.`);
+        }
+      }
+      const per = {
+        id: input.id,
+        name: input.name,
+        kind: input.kind,
+        connection: input.connection,
+        portOrAddress: input.portOrAddress,
+        baudRate: input.baudRate,
+        targetTagName: input.targetTagName,
+        driverModel: input.driverModel,
+        autoBackupEnabled: input.autoBackupEnabled,
+        enabled: input.enabled,
+      };
+      project.peripherals = project.peripherals ?? [];
+      const idx = project.peripherals.findIndex((p) => p.id === per.id);
+      if (idx >= 0) project.peripherals[idx] = per;
+      else project.peripherals.push(per);
+      store.saveProject(project);
+      return { saved: true, peripheral: per, totalPeripherals: project.peripherals.length };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_data_reporting_server_configure',
+    domain: 'datalink',
+    haiwellFeature: 'Data Reporting Server (Data Group Push to MES/ERP/Cloud with Offline Buffer)',
+    safetyTier: 'design',
+    description:
+      'Configure Haiwell Cloud Scada Data reporting server to push one or more Data groups over HTTP REST, MQTT, SQL, or Custom TCP with SSRF host validation, TLS enforcement, and SQLite offline store-and-forward buffering.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+      name: z.string().min(2).max(100),
+      protocol: z.enum(['HTTP_REST', 'MQTT', 'SQL_DIRECT', 'CUSTOM_TCP']),
+      endpointUrl: z.string().min(6).max(300),
+      dataGroupIds: z.array(z.string().min(1)).min(1),
+      reportMode: z.enum(['CYCLIC', 'ON_CHANGE', 'EVENT_TRIGGER']).default('CYCLIC'),
+      intervalMs: z.number().int().min(500).max(86400000).default(30000),
+      tlsRequired: z.boolean().default(true),
+      offlineBufferEnabled: z.boolean().default(true),
+      offlineBufferMaxRecords: z.number().int().min(100).max(1000000).default(50000),
+      retryIntervalSec: z.number().int().min(5).max(3600).default(30),
+      authMode: z.enum(['NONE', 'BEARER', 'BASIC', 'API_KEY']).default('BEARER'),
+      enabled: z.boolean().default(true),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      id: 'drs_mes_cloud',
+      name: 'MES Telemetry Reporting Server',
+      protocol: 'HTTP_REST',
+      endpointUrl: 'https://mes.example.com/api/v1/ingest',
+      dataGroupIds: ['dg_chiller_telemetry'],
+      tlsRequired: true,
+      offlineBufferEnabled: true,
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const knownGroups = new Set((project.dataGroups ?? []).map((dg) => dg.id));
+      const missingGroups = input.dataGroupIds.filter((id) => !knownGroups.has(id));
+      if (missingGroups.length > 0) {
+        throw new Error(`Unknown Data group ID(s): ${missingGroups.join(', ')}. Create them via haiwell_datagroup_configure first.`);
+      }
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(input.endpointUrl);
+      } catch {
+        throw new Error(`Invalid endpointUrl "${input.endpointUrl}".`);
+      }
+      if (isBlockedSsrfHost(parsedUrl.hostname)) {
+        throw new Error(`SSRF_BLOCKED: Data reporting server host "${parsedUrl.hostname}" is blocked (loopback/metadata).`);
+      }
+      if (input.tlsRequired && input.protocol === 'HTTP_REST' && parsedUrl.protocol !== 'https:') {
+        throw new Error('HTTP_REST Data reporting server with tlsRequired=true must use https://.');
+      }
+      if (input.tlsRequired && input.protocol === 'MQTT' && parsedUrl.protocol !== 'mqtts:') {
+        throw new Error('MQTT Data reporting server with tlsRequired=true must use mqtts://.');
+      }
+      const cfg = {
+        id: input.id,
+        name: input.name,
+        protocol: input.protocol,
+        endpointUrl: input.endpointUrl,
+        dataGroupIds: [...new Set(input.dataGroupIds)],
+        reportMode: input.reportMode,
+        intervalMs: input.intervalMs,
+        tlsRequired: input.tlsRequired,
+        offlineBufferEnabled: input.offlineBufferEnabled,
+        offlineBufferMaxRecords: input.offlineBufferMaxRecords,
+        retryIntervalSec: input.retryIntervalSec,
+        authMode: input.authMode,
+        enabled: input.enabled,
+      };
+      project.dataReportingServers = project.dataReportingServers ?? [];
+      const idx = project.dataReportingServers.findIndex((s) => s.id === cfg.id);
+      if (idx >= 0) project.dataReportingServers[idx] = cfg;
+      else project.dataReportingServers.push(cfg);
+      store.saveProject(project);
+      return { saved: true, dataReportingServer: cfg };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_cloud_monitor_configure',
+    domain: 'datalink',
+    haiwellFeature: 'Cloud Platform Data Monitor (Haiwell Cloud / HaiwellLink Remote Web & App)',
+    safetyTier: 'design',
+    description:
+      'Configure Haiwell Cloud Scada Cloud platform data monitor: machine code, network project port (8888), Web/Mobile SCADA remote access, and exposed read/write Variables with RO and SIL3 remote-write safety guardrails.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      enabled: z.boolean().default(true),
+      platform: z.enum(['HAIWELL_CLOUD', 'HAIWELL_PRIVATE_CLOUD', 'HAIWELL_LINK_LAN']).default('HAIWELL_CLOUD'),
+      machineCode: z.string().min(4).max(64),
+      networkProjectPort: z.number().int().min(1024).max(65535).default(8888),
+      webScadaEnabled: z.boolean().default(true),
+      mobileAppEnabled: z.boolean().default(true),
+      remoteAlarmPushEnabled: z.boolean().default(true),
+      monitoredTags: z
+        .array(
+          z.object({
+            tagName: z.string().min(1),
+            allowRemoteWrite: z.boolean().default(false),
+            groupLabel: z.string().max(64).optional(),
+          })
+        )
+        .default([]),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      enabled: true,
+      platform: 'HAIWELL_CLOUD',
+      machineCode: 'HW-B7H-8849201',
+      networkProjectPort: 8888,
+      monitoredTags: [{ tagName: 'Supply_Temp_C', allowRemoteWrite: false, groupLabel: 'Chiller' }],
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      for (const m of input.monitoredTags) {
+        const tag = getOwnTag(project, m.tagName);
+        if (!tag) throw new Error(`Unknown monitored Variable "${m.tagName}".`);
+        if (m.allowRemoteWrite && tag.access === 'RO') {
+          throw new Error(`SAFETY_BLOCKED: Cannot enable cloud remote write on read-only Variable "${m.tagName}".`);
+        }
+        if (m.allowRemoteWrite && tag.safetyClass === 'SIL3') {
+          throw new Error(`SAFETY_BLOCKED: Cannot expose SIL3 safety Variable "${m.tagName}" for remote cloud writes.`);
+        }
+      }
+      project.cloudEnabled = input.enabled;
+      project.networkProjectPort = input.networkProjectPort;
+      project.cloudMonitor = {
+        enabled: input.enabled,
+        platform: input.platform,
+        machineCode: input.machineCode,
+        networkProjectPort: input.networkProjectPort,
+        webScadaEnabled: input.webScadaEnabled,
+        mobileAppEnabled: input.mobileAppEnabled,
+        remoteAlarmPushEnabled: input.remoteAlarmPushEnabled,
+        monitoredTags: input.monitoredTags,
+      };
+      store.saveProject(project);
+      return { configured: true, cloudMonitor: project.cloudMonitor };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_audio_configure',
+    domain: 'operations',
+    haiwellFeature: 'Audio Manager (WAV/MP3 Clips & Voice TTS Alarm Playback)',
+    safetyTier: 'design',
+    description:
+      'Configure Haiwell Cloud Scada Audio module: register WAV/MP3 files or Voice TTS announcements bound to BOOL trigger Variables or ISA-18.2 alarm priorities with volume and repeat count.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+      name: z.string().min(2).max(100),
+      sourceType: z.enum(['WAV_FILE', 'MP3_FILE', 'VOICE_TTS']),
+      filePathOrTtsText: z.string().min(1).max(300),
+      volumePercent: z.number().int().min(0).max(100).default(85),
+      repeatCount: z.number().int().min(1).max(20).default(2),
+      triggerTag: z.string().optional(),
+      alarmPriority: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]).optional(),
+      enabled: z.boolean().default(true),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      id: 'aud_estop_voice',
+      name: 'Emergency Stop Voice Alert',
+      sourceType: 'VOICE_TTS',
+      filePathOrTtsText: 'Attention: Emergency stop activated on chiller line.',
+      volumePercent: 100,
+      repeatCount: 3,
+      alarmPriority: 1,
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      if (input.triggerTag && !hasOwnTag(project, input.triggerTag)) {
+        throw new Error(`Audio triggerTag "${input.triggerTag}" does not exist.`);
+      }
+      if (input.sourceType === 'WAV_FILE' && !/\.wav$/i.test(input.filePathOrTtsText)) {
+        throw new Error(`WAV_FILE audio clip must end with .wav.`);
+      }
+      if (input.sourceType === 'MP3_FILE' && !/\.mp3$/i.test(input.filePathOrTtsText)) {
+        throw new Error(`MP3_FILE audio clip must end with .mp3.`);
+      }
+      const clip = {
+        id: input.id,
+        name: input.name,
+        sourceType: input.sourceType,
+        filePathOrTtsText: input.filePathOrTtsText,
+        volumePercent: input.volumePercent,
+        repeatCount: input.repeatCount,
+        triggerTag: input.triggerTag,
+        alarmPriority: input.alarmPriority,
+        enabled: input.enabled,
+      };
+      project.audioClips = project.audioClips ?? [];
+      const idx = project.audioClips.findIndex((a) => a.id === clip.id);
+      if (idx >= 0) project.audioClips[idx] = clip;
+      else project.audioClips.push(clip);
+      store.saveProject(project);
+      return { saved: true, audioClip: clip, totalAudioClips: project.audioClips.length };
     },
   }),
 ];

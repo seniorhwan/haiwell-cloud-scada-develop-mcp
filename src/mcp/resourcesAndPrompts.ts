@@ -49,7 +49,7 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
   },
   {
     id: 'hmi',
-    title: 'Zero-Error Spatial HMI Compiler, P&ID Router & Desktop UIA Bridge',
+    title: 'Zero-Error Spatial HMI, Font Manager, Shape Library & Calibrated UIA Bridge',
     haiwellModules: [
       'Component Toolbox & Port-Geometry Catalog',
       'Semantic P&ID Process Graph & Orthogonal Pipeline Compiler',
@@ -57,7 +57,9 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
       'Deterministic 8px-Grid & Collision Auto-Repair Solver',
       'Closed-Loop Spatial Proof & 2D ASCII Occupancy Map',
       'Reusable Parameterized Faceplates',
-      'Native Screen Manifest + Windows UIA Property-Grid Bridge',
+      'Font Manager (Embedded Panel Fonts & CJK Packaging)',
+      'Shape Library (Custom Vector/SVG Equipment Graphics)',
+      'Calibrated Haiwell Cloud Scada 3.50.x (.hwdev) WinForms UIA Bridge',
     ],
     tools: [
       'haiwell_hmi_toolbox_catalog',
@@ -68,14 +70,17 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
       'haiwell_hmi_faceplate_manage',
       'haiwell_hmi_spatial_verify',
       'haiwell_hmi_screen_render_svg',
+      'haiwell_font_manager',
+      'haiwell_shape_library_manage',
+      'haiwell_desktop_uia_calibrate',
       'haiwell_hmi_desktop_bridge_export',
     ],
     standards: ['ANSI/ISA-101.01', 'ISA-5.1 P&ID'],
   },
   {
     id: 'scripts',
-    title: 'Haiwell JavaScript Engine & Declarative Event Triggers',
-    haiwellModules: ['Lexer-Hardened JS Sandbox Analyzer', 'Startup/Shutdown/Cyclic/Tag-Change Scripts', 'Declarative Rising/Falling/Threshold Event Triggers'],
+    title: 'Haiwell JavaScript Tasks & Declarative Event Triggers',
+    haiwellModules: ['Lexer-Hardened JS Sandbox Analyzer', 'Startup/Shutdown/Cyclic/Tag-Change Tasks', 'Declarative Rising/Falling/Threshold Event Triggers'],
     tools: ['haiwell_script_validate', 'haiwell_script_upsert', 'haiwell_event_trigger_configure'],
     standards: ['ECMAScript Sandbox'],
   },
@@ -109,30 +114,60 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
   },
   {
     id: 'trends',
-    title: 'Real-Time & Historical Trend Historian',
-    haiwellModules: ['Sampling Groups', 'Deadband Compression', 'Local/Cloud/SQL Retention', 'Structured Sample Capture/Query'],
+    title: 'Real-Time & Historical Record Historian',
+    haiwellModules: ['History Record Sampling Groups', 'Deadband Compression', 'Local/Cloud/SQL Retention', 'Structured Sample Capture/Query'],
     tools: ['haiwell_trend_configure'],
     standards: ['Historian RBE'],
   },
   {
     id: 'datalink',
-    title: 'Haiwell Data-Link Databases & Outbound Webhooks',
-    haiwellModules: ['MySQL / SQL Server / PostgreSQL / SQLite', 'Parameterized SQL & Reserved-Word Guards', 'HTTPS ERP/MES/WeCom/DingTalk Webhooks'],
-    tools: ['haiwell_datalink_configure', 'haiwell_webhook_configure'],
-    standards: ['OWASP Parameterized SQL', 'TLS HTTPS'],
+    title: 'Data Group, Data-Link SQL, Data Reporting Server & Cloud Monitor',
+    haiwellModules: [
+      'Data Group Batch Variable Collection',
+      'MySQL / SQL Server / PostgreSQL / SQLite Data-Link',
+      'Data Reporting Server (HTTP/MQTT/SQL/TCP + Offline SQLite Buffer)',
+      'Cloud Platform Data Monitor (Haiwell Cloud / HaiwellLink)',
+      'HTTPS ERP/MES/WeCom/DingTalk Webhooks',
+    ],
+    tools: [
+      'haiwell_datagroup_configure',
+      'haiwell_datalink_configure',
+      'haiwell_data_reporting_server_configure',
+      'haiwell_cloud_monitor_configure',
+      'haiwell_webhook_configure',
+    ],
+    standards: ['OWASP Parameterized SQL', 'TLS HTTPS', 'SSRF Hardening'],
   },
   {
     id: 'operations',
-    title: 'Schedules, Reports, IP Cameras & Multi-Language',
-    haiwellModules: ['Validated CRON Shift Scheduler', 'CSV/XLSX/JSON/HTML Compliance Reports', 'RTSP/ONVIF/EZVIZ Cameras', 'Multi-Language i18n'],
-    tools: ['haiwell_schedule_configure', 'haiwell_report_configure', 'haiwell_camera_bind', 'haiwell_i18n_manage'],
+    title: 'Schedules, Reports, Peripherals, IP Cameras, Audio & Language Center',
+    haiwellModules: [
+      'Validated CRON Shift Scheduler',
+      'CSV/XLSX/JSON/HTML Compliance Reports',
+      'Peripheral Hardware (Printers, Barcode/QR Scanners, USB/SD, 4G Modem)',
+      'RTSP/ONVIF/EZVIZ Cameras',
+      'Audio Manager (WAV/MP3 & Voice TTS Alarm Playback)',
+      'Project Language Center (Multi-Language i18n)',
+    ],
+    tools: [
+      'haiwell_schedule_configure',
+      'haiwell_report_configure',
+      'haiwell_peripheral_configure',
+      'haiwell_camera_bind',
+      'haiwell_audio_configure',
+      'haiwell_i18n_manage',
+    ],
     standards: ['POSIX CRON', 'ONVIF / RTSP', 'BCP 47'],
   },
   {
     id: 'security',
-    title: 'RBAC User Groups, SSL & Haiwell A/B Key Policy',
-    haiwellModules: ['Privilege Levels 0-15', '128/256-bit SSL', 'Haiwell A/B Key Cloud Auth', 'Immutable Control Audit Log'],
-    tools: ['haiwell_security_policy'],
+    title: 'User Security, Operation Record, RFID & Haiwell A/B Key Policy',
+    haiwellModules: [
+      'User Security RBAC (Privilege Levels 0-15, 128/256-bit SSL, A/B Key)',
+      'Operation Record (Audit Trail Policy, Filtered Query & CSV Export)',
+      'RFID Card Reader & Operator Badge Auto-Login',
+    ],
+    tools: ['haiwell_security_policy', 'haiwell_operation_record_configure', 'haiwell_rfid_configure'],
     standards: ['IEC 62443-3-3'],
   },
   {
@@ -436,7 +471,7 @@ transports: [streamable-http, stdio]
 2. **Validate multi-vendor PLC addresses**: call \`haiwell_device_validate_address\` with the device protocol (Haiwell, Modbus, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, BACnet) before creating tags. Never overlap 32-bit/64-bit multi-word register spans.
 3. **Dry-run control writes**: invoke \`haiwell_tag_read_write\` or \`haiwell_tag_batch_io\` with \`dryRun: true\` before committing live writes.
 4. **Gate PLC logic on IEC 61131-3 validation**: resolve all \`ERROR\` diagnostics from \`haiwell_iec61131_validate\` before \`haiwell_iec61131_pou_save\`.
-5. **Compile HMI spatially (never blind drag-and-drop)**: use \`haiwell_hmi_pid_compile\` / \`haiwell_hmi_screen_generate\`, verify with \`haiwell_hmi_spatial_verify\`, auto-repair with \`haiwell_hmi_layout_solve\`, and export native/UIA plans with \`haiwell_hmi_desktop_bridge_export\`.
+5. **Compile HMI spatially (never blind drag-and-drop)**: use \`haiwell_hmi_pid_compile\` / \`haiwell_hmi_screen_generate\`, verify with \`haiwell_hmi_spatial_verify\`, auto-repair with \`haiwell_hmi_layout_solve\`, calibrate live WinForms selectors once via \`haiwell_desktop_uia_calibrate\`, and export calibrated UIA plans with \`haiwell_hmi_desktop_bridge_export\` (plus native \`haiwell_variables_import.csv\` via \`haiwell_project_export\`).
 6. **Run FAT simulation + safety audit**: run \`haiwell_simulation_step\` (E-Stop trip test) and \`haiwell_project_audit_safety\` (\`deploymentReady: true\`) before \`haiwell_project_export\`.
 
 ## Complete Tool Index (${HAIWELL_TOOLS.length} Tools across 15 Domains)

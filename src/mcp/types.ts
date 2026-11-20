@@ -9,6 +9,7 @@ export type HaiwellTargetHardware =
   | 'CLOUD_HMI_C7'
   | 'CLOUD_HMI_C10'
   | 'CLOUD_HMI_B7'
+  | 'CLOUD_HMI_B7H'
   | 'CLOUD_HMI_B10'
   | 'CLOUD_HMI_A8'
   | 'CLOUD_BOX_CBOX'
@@ -444,6 +445,122 @@ export interface AuditLogEntry {
   detail: string;
 }
 
+export interface DataGroupConfig {
+  id: string;
+  name: string;
+  description?: string;
+  tagNames: string[];
+  collectMode: 'CYCLIC' | 'TAG_TRIGGER' | 'ON_CHANGE';
+  intervalMs: number;
+  triggerTag?: string;
+  enabled: boolean;
+}
+
+export interface OperationRecordPolicy {
+  enabled: boolean;
+  recordLogins: boolean;
+  recordVariableWrites: boolean;
+  recordScreenChanges: boolean;
+  recordRecipeTransfers: boolean;
+  recordAlarmAcks: boolean;
+  retentionDays: number;
+  maxRecords: number;
+  storageTarget: 'LOCAL_SQLITE' | 'SD_CARD' | 'USB_STORAGE';
+}
+
+export interface FontAsset {
+  id: string;
+  familyName: string;
+  defaultSizePt: number;
+  weight: 'NORMAL' | 'BOLD';
+  charset: 'ASCII' | 'LATIN_EXT' | 'CJK_SIMPLIFIED' | 'UNICODE_FULL';
+  embedInHmiPackage: boolean;
+  fallbackFamily?: string;
+}
+
+export interface RfidCardBinding {
+  cardUid: string;
+  userName: string;
+  userGroup: string;
+  enabled: boolean;
+}
+
+export interface RfidConfig {
+  enabled: boolean;
+  transport: 'USB_HID' | 'SERIAL_COM' | 'TCP_READER';
+  portOrHost: string;
+  baudRate?: number;
+  uidTargetTag?: string;
+  cardPresentTag?: string;
+  autoLoginEnabled: boolean;
+  autoLogoutOnRemoveSec: number;
+  cards: RfidCardBinding[];
+}
+
+export interface ShapeLibraryAsset {
+  id: string;
+  name: string;
+  category: 'PUMP' | 'VALVE' | 'TANK' | 'MOTOR' | 'CONVEYOR' | 'SWITCHGEAR' | 'SENSOR' | 'CUSTOM';
+  format: 'SVG' | 'PNG_REF' | 'MULTI_STATE_VECTOR';
+  width: number;
+  height: number;
+  stateCount: number;
+  svgMarkup?: string;
+  assetPath?: string;
+}
+
+export interface PeripheralConfig {
+  id: string;
+  name: string;
+  kind: 'PRINTER' | 'BARCODE_SCANNER' | 'USB_STORAGE' | 'SD_CARD' | 'MODEM_4G' | 'SERIAL_PORT';
+  connection: 'USB' | 'SERIAL_RS232' | 'SERIAL_RS485' | 'ETHERNET' | 'INTERNAL_SLOT';
+  portOrAddress: string;
+  baudRate?: number;
+  targetTagName?: string;
+  driverModel?: string;
+  autoBackupEnabled?: boolean;
+  enabled: boolean;
+}
+
+export interface DataReportingServerConfig {
+  id: string;
+  name: string;
+  protocol: 'HTTP_REST' | 'MQTT' | 'SQL_DIRECT' | 'CUSTOM_TCP';
+  endpointUrl: string;
+  dataGroupIds: string[];
+  reportMode: 'CYCLIC' | 'ON_CHANGE' | 'EVENT_TRIGGER';
+  intervalMs: number;
+  tlsRequired: boolean;
+  offlineBufferEnabled: boolean;
+  offlineBufferMaxRecords: number;
+  retryIntervalSec: number;
+  authMode: 'NONE' | 'BEARER' | 'BASIC' | 'API_KEY';
+  enabled: boolean;
+}
+
+export interface CloudPlatformMonitorConfig {
+  enabled: boolean;
+  platform: 'HAIWELL_CLOUD' | 'HAIWELL_PRIVATE_CLOUD' | 'HAIWELL_LINK_LAN';
+  machineCode: string;
+  networkProjectPort: number;
+  webScadaEnabled: boolean;
+  mobileAppEnabled: boolean;
+  remoteAlarmPushEnabled: boolean;
+  monitoredTags: { tagName: string; allowRemoteWrite: boolean; groupLabel?: string }[];
+}
+
+export interface AudioAsset {
+  id: string;
+  name: string;
+  sourceType: 'WAV_FILE' | 'MP3_FILE' | 'VOICE_TTS';
+  filePathOrTtsText: string;
+  volumePercent: number;
+  repeatCount: number;
+  triggerTag?: string;
+  alarmPriority?: 1 | 2 | 3 | 4;
+  enabled: boolean;
+}
+
 export interface HaiwellProject {
   id: string;
   name: string;
@@ -453,6 +570,11 @@ export interface HaiwellProject {
   resolution: { width: number; height: number };
   defaultLanguage: string;
   cloudEnabled: boolean;
+  networkProjectEnabled: boolean;
+  networkProjectPort: number;
+  targetDownloadIp?: string;
+  startupScreenId?: string;
+  hwdevFileName: string;
   createdAt: string;
   updatedAt: string;
   devices: DeviceConfig[];
@@ -470,10 +592,19 @@ export interface HaiwellProject {
   opcua: OpcUaConfig;
   recipes: RecipeGroup[];
   trends: TrendGroup[];
+  dataGroups: DataGroupConfig[];
   dataLinks: DataLinkConfig[];
+  dataReportingServers: DataReportingServerConfig[];
+  cloudMonitor: CloudPlatformMonitorConfig;
   schedules: ScheduleTask[];
   reports: ReportTemplate[];
+  operationRecordPolicy: OperationRecordPolicy;
+  fonts: FontAsset[];
+  rfid: RfidConfig;
+  shapeLibrary: ShapeLibraryAsset[];
+  peripherals: PeripheralConfig[];
   cameras: CameraBinding[];
+  audioClips: AudioAsset[];
   translations: Record<string, Record<string, string>>;
   security: SecurityPolicy;
   auditLog: AuditLogEntry[];

@@ -168,6 +168,11 @@ function makeSeedProject(): HaiwellProject {
     resolution: { width: 1280, height: 800 },
     defaultLanguage: 'en-US',
     cloudEnabled: true,
+    networkProjectEnabled: true,
+    networkProjectPort: 8888,
+    targetDownloadIp: '192.168.1.100',
+    startupScreenId: 'scr_chiller_overview',
+    hwdevFileName: 'prj_chiller_plant_01.hwdev',
     createdAt: now,
     updatedAt: now,
     devices: [
@@ -370,6 +375,17 @@ function makeSeedProject(): HaiwellProject {
         ],
       },
     ],
+    dataGroups: [
+      {
+        id: 'dg_chiller_telemetry',
+        name: 'Chiller Telemetry Group',
+        description: 'Primary supply/return temperatures and valve feedback for MES reporting',
+        tagNames: ['Supply_Temp_C', 'Return_Temp_C', 'Valve_Position_Pct'],
+        collectMode: 'CYCLIC',
+        intervalMs: 10000,
+        enabled: true,
+      },
+    ],
     dataLinks: [
       {
         id: 'dl_mes_mysql',
@@ -388,6 +404,20 @@ function makeSeedProject(): HaiwellProject {
         parameterizedOnly: true,
       },
     ],
+    dataReportingServers: [],
+    cloudMonitor: {
+      enabled: true,
+      platform: 'HAIWELL_CLOUD',
+      machineCode: 'HW-CBOX-DEMO-0001',
+      networkProjectPort: 8888,
+      webScadaEnabled: true,
+      mobileAppEnabled: true,
+      remoteAlarmPushEnabled: true,
+      monitoredTags: [
+        { tagName: 'Supply_Temp_C', allowRemoteWrite: false, groupLabel: 'Chiller' },
+        { tagName: 'Return_Temp_C', allowRemoteWrite: false, groupLabel: 'Chiller' },
+      ],
+    },
     schedules: [
       {
         id: 'sch_night_eco',
@@ -411,7 +441,39 @@ function makeSeedProject(): HaiwellProject {
         ],
       },
     ],
+    operationRecordPolicy: {
+      enabled: true,
+      recordLogins: true,
+      recordVariableWrites: true,
+      recordScreenChanges: true,
+      recordRecipeTransfers: true,
+      recordAlarmAcks: true,
+      retentionDays: 180,
+      maxRecords: 100000,
+      storageTarget: 'LOCAL_SQLITE',
+    },
+    fonts: [
+      {
+        id: 'font_ms_sans',
+        familyName: 'Microsoft Sans Serif',
+        defaultSizePt: 12,
+        weight: 'NORMAL',
+        charset: 'LATIN_EXT',
+        embedInHmiPackage: true,
+      },
+    ],
+    rfid: {
+      enabled: false,
+      transport: 'USB_HID',
+      portOrHost: 'USB0',
+      autoLoginEnabled: false,
+      autoLogoutOnRemoveSec: 30,
+      cards: [],
+    },
+    shapeLibrary: [],
+    peripherals: [],
     cameras: [],
+    audioClips: [],
     translations: {
       'en-US': {
         'screen.overview.title': 'Chiller Plant Overview',
@@ -491,7 +553,49 @@ export class HaiwellProjectStore {
           projects?: HaiwellProject[];
         };
         if (Array.isArray(raw.projects) && raw.projects.length > 0) {
-          for (const p of raw.projects) this.projects.set(p.id, p);
+          for (const p of raw.projects) {
+            this.projects.set(p.id, {
+              ...p,
+              networkProjectEnabled: p.networkProjectEnabled ?? true,
+              networkProjectPort: p.networkProjectPort ?? 8888,
+              hwdevFileName: p.hwdevFileName ?? `${p.id}.hwdev`,
+              dataGroups: p.dataGroups ?? [],
+              dataReportingServers: p.dataReportingServers ?? [],
+              cloudMonitor: p.cloudMonitor ?? {
+                enabled: false,
+                platform: 'HAIWELL_CLOUD',
+                machineCode: '',
+                networkProjectPort: 8888,
+                webScadaEnabled: true,
+                mobileAppEnabled: true,
+                remoteAlarmPushEnabled: true,
+                monitoredTags: [],
+              },
+              operationRecordPolicy: p.operationRecordPolicy ?? {
+                enabled: true,
+                recordLogins: true,
+                recordVariableWrites: true,
+                recordScreenChanges: true,
+                recordRecipeTransfers: true,
+                recordAlarmAcks: true,
+                retentionDays: 180,
+                maxRecords: 100000,
+                storageTarget: 'LOCAL_SQLITE',
+              },
+              fonts: p.fonts ?? [],
+              rfid: p.rfid ?? {
+                enabled: false,
+                transport: 'USB_HID',
+                portOrHost: 'USB0',
+                autoLoginEnabled: false,
+                autoLogoutOnRemoveSec: 30,
+                cards: [],
+              },
+              shapeLibrary: p.shapeLibrary ?? [],
+              peripherals: p.peripherals ?? [],
+              audioClips: p.audioClips ?? [],
+            });
+          }
           return;
         }
       } catch {
@@ -628,6 +732,27 @@ export class HaiwellProjectStore {
     for (const pou of project.pous) {
       if (pou.boundTags.includes(tagName)) {
         deps.push(`pou:${pou.id}`);
+      }
+    }
+    for (const dg of project.dataGroups ?? []) {
+      if (dg.tagNames.includes(tagName) || dg.triggerTag === tagName) {
+        deps.push(`data_group:${dg.id}`);
+      }
+    }
+    if (project.rfid?.uidTargetTag === tagName || project.rfid?.cardPresentTag === tagName) {
+      deps.push('rfid:config');
+    }
+    for (const per of project.peripherals ?? []) {
+      if (per.targetTagName === tagName) {
+        deps.push(`peripheral:${per.id}`);
+      }
+    }
+    if (project.cloudMonitor?.monitoredTags.some((m) => m.tagName === tagName)) {
+      deps.push('cloud_monitor:config');
+    }
+    for (const aud of project.audioClips ?? []) {
+      if (aud.triggerTag === tagName) {
+        deps.push(`audio:${aud.id}`);
       }
     }
     return deps;

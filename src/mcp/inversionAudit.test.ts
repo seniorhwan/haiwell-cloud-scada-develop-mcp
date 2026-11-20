@@ -482,13 +482,15 @@ test('Inversion #12: OPC UA security mismatch, event trigger validation, transpi
     false
   );
 
-  // Skill markdown dynamically reports 47 tools (not stale 42)
+  // Skill markdown dynamically reports exact tool count (57 tools)
+  const { HAIWELL_TOOLS } = await import('./toolRegistry');
   const skillMd = generateAgentSkillMarkdown('http://localhost:3000/mcp');
-  assert.match(skillMd, /47 strictly validated tools/);
+  assert.match(skillMd, new RegExp(`${HAIWELL_TOOLS.length} strictly validated tools`));
 });
 
 test('Production MCP #13: Tool annotations, SHA-256 catalog hash, scoped profiles, idempotencyKey, and expectedRevision concurrency guard', async () => {
   const {
+    HAIWELL_TOOLS,
     computeToolCatalogHash,
     getToolsForProfile,
     serializeToolCatalog,
@@ -506,7 +508,7 @@ test('Production MCP #13: Tool annotations, SHA-256 catalog hash, scoped profile
   // Scoped profiles keep context-window tool count lean (14 tools for core)
   assert.equal(getToolsForProfile('core').length, 14);
   assert.ok(getToolsForProfile('hmi').length < 30);
-  assert.equal(getToolsForProfile('all').length, 47);
+  assert.equal(getToolsForProfile('all').length, HAIWELL_TOOLS.length);
 
   // Deterministic SHA-256 rug-pull hash
   const hashA = computeToolCatalogHash('all');
