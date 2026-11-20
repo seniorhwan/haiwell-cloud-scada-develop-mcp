@@ -83,6 +83,12 @@ export interface DeviceConfig {
   timeoutMs: number;
   retryCount: number;
   byteOrder: 'ABCD' | 'CDAB' | 'BADC' | 'DCBA';
+  addressOffset?: 'BASE_0' | 'BASE_1';
+  blockLength?: number;
+  normalSpeedMs?: number;
+  highSpeedMs?: number;
+  lowSpeedMs?: number;
+  batchWriteSupported?: boolean;
   enabled: boolean;
 }
 
@@ -123,6 +129,7 @@ export interface TagDefinition {
   safetyClass: SafetyClass;
   requiresInterlock: boolean;
   alwaysCollect?: boolean;
+  collectFrequency?: 'HIGH' | 'NORMAL' | 'LOW';
   currentValue: number | boolean | string;
   previousValue?: number | boolean | string;
   quality: 'GOOD' | 'BAD' | 'UNCERTAIN' | 'SIMULATED';
@@ -249,6 +256,9 @@ export interface EventTriggerRule {
   actionType: 'OPEN_SCREEN' | 'WRITE_TAG' | 'RUN_SCRIPT' | 'DOWNLOAD_RECIPE' | 'SEND_WEBHOOK';
   targetId: string;
   actionValue?: number | boolean | string;
+  eventExecution?: 'SERVER_BACKGROUND' | 'CLIENT_AND_SERVER' | 'CLIENT_ONLY';
+  executionMode?: 'RUN_ONCE' | 'CYCLIC';
+  intervalMs?: number;
   enabled: boolean;
 }
 

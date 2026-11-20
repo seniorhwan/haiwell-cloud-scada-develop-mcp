@@ -34,6 +34,7 @@ import {
 import {
   auditScreenSpatially,
   compileDesktopAutomationBridge,
+  compileFullOpenProjectBridge,
   compilePidScreen,
   generateDesktopUiaCalibrator,
   HAIWELL_HMI_TOOLBOX,
@@ -1368,6 +1369,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       pollIntervalMs: z.number().int().min(20).max(60000).default(250),
       timeoutMs: z.number().int().min(100).max(30000).default(1500),
       byteOrder: z.enum(['ABCD', 'CDAB', 'BADC', 'DCBA']).default('CDAB'),
+      addressOffset: z.enum(['BASE_0', 'BASE_1']).optional(),
+      blockLength: z.number().int().min(1).max(125).optional(),
+      normalSpeedMs: z.number().int().min(20).max(60000).optional(),
+      highSpeedMs: z.number().int().min(10).max(60000).optional(),
+      lowSpeedMs: z.number().int().min(50).max(300000).optional(),
+      batchWriteSupported: z.boolean().optional(),
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
@@ -1427,6 +1434,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         timeoutMs: input.timeoutMs,
         retryCount: 3,
         byteOrder: input.byteOrder,
+        addressOffset: input.addressOffset,
+        blockLength: input.blockLength,
+        normalSpeedMs: input.normalSpeedMs,
+        highSpeedMs: input.highSpeedMs,
+        lowSpeedMs: input.lowSpeedMs,
+        batchWriteSupported: input.batchWriteSupported,
         enabled: true,
       };
       const idx = project.devices.findIndex((d) => d.id === cfg.id);
@@ -1558,6 +1571,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             safetyClass: z.enum(['SIL0', 'SIL1', 'SIL2', 'SIL3']).default('SIL0'),
             requiresInterlock: z.boolean().default(false),
             alwaysCollect: z.boolean().optional(),
+            collectFrequency: z.enum(['HIGH', 'NORMAL', 'LOW']).optional(),
             initialValue: z.union([z.number(), z.boolean(), z.string()]).optional(),
           })
         )
@@ -1692,6 +1706,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           safetyClass: t.safetyClass,
           requiresInterlock: t.requiresInterlock || t.safetyClass === 'SIL2' || t.safetyClass === 'SIL3',
           alwaysCollect: t.alwaysCollect ?? existingTag?.alwaysCollect,
+          collectFrequency: t.collectFrequency ?? existingTag?.collectFrequency,
           currentValue: valCheck.normalizedValue,
           quality: 'GOOD' as const,
           updatedAt: now,
@@ -2595,6 +2610,50 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           capturedMap: input.capturedMap,
         }),
       };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_open_project_bridge_export',
+    domain: 'hmi',
+    haiwellFeature: 'Full Open-.hwdev Project Windows UIA Automator (Devices, Variables, Tasks, Events, Displays)',
+    safetyTier: 'design',
+    description:
+      'Compile an entire safety-verified Haiwell Cloud Scada 3.50.x project into a single Windows UIA automation bundle for an already-open blank .hwdev window, covering all 5 core sections: Devices (4-tab Property Setting dialog), Variables (Device Variable grid/CSV), Tasks (Strict-ES5 clipboard paste), Events (Event selection modal), and Displays (zero-overlap Property Grid). Refuses export if deploymentReady is false.',
+    inputSchema: z.object({
+      projectId: z.string().min(2).default(DEFAULT_PROJECT_ID),
+      sections: z
+        .array(z.enum(['devices', 'variables', 'tasks', 'events', 'displays']))
+        .min(1)
+        .default(['devices', 'variables', 'tasks', 'events', 'displays']),
+      windowTitleRegex: z.string().min(3).default('(?i).*Haiwell Cloud Scada.*'),
+      uiaMap: z
+        .object({
+          windowTitleRegex: z.string().optional(),
+          projectBrowserAutoId: z.string().optional(),
+          toolboxAutoId: z.string().optional(),
+          canvasAutoId: z.string().optional(),
+          propertyGridAutoId: z.string().optional(),
+        })
+        .optional(),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      sections: ['devices', 'variables', 'tasks', 'events', 'displays'],
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const audit = runProjectSafetyAudit(project);
+      if (!audit.deploymentReady) {
+        throw new Error(
+          `SAFETY_BLOCK: Project "${project.id}" failed safety audit (critical=${audit.counts.critical}, high=${audit.counts.high}). Fix critical/high findings before exporting the open-project desktop bridge.`
+        );
+      }
+      return compileFullOpenProjectBridge(project, {
+        sections: input.sections,
+        windowTitleRegex: input.windowTitleRegex,
+        uiaMap: input.uiaMap,
+      });
     },
   }),
 

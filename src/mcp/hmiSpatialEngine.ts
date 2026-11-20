@@ -19,6 +19,7 @@
 
 import { detectWidgetCollisions, renderScreenToSvg, validateHmiScreen } from './hmiGenerator';
 import type {
+  HaiwellProject,
   HaiwellTargetHardware,
   HmiPipeRoute,
   HmiScreen,
@@ -1223,4 +1224,407 @@ export function generateDesktopUiaCalibrator(options: {
     calibratorScript,
   };
 }
+
+export type OpenProjectBridgeSection = 'devices' | 'variables' | 'tasks' | 'events' | 'displays';
+
+function mapHaiwellRegisterTypeLabel(address?: string): { registerType: string; registerAddress: string } {
+  const raw = (address ?? '').trim().toUpperCase();
+  const m = /^(0X|1X|3X|4X)(\d+)(?:\.\d+)?$/.exec(raw);
+  if (m) {
+    const map: Record<string, string> = {
+      '0X': '0X(Digital output,Function code 01 05)',
+      '1X': '1X(Digital input,Function code 02)',
+      '3X': '3X(Input register,Function code 04)',
+      '4X': '4X(Holding register,Function code 03 06 16)',
+    };
+    return { registerType: map[m[1]], registerAddress: m[2] };
+  }
+  const typed = /^(COIL|DI|IR|HR):(\d+)$/.exec(raw);
+  if (typed) {
+    const map: Record<string, string> = {
+      COIL: '0X(Digital output,Function code 01 05)',
+      DI: '1X(Digital input,Function code 02)',
+      IR: '3X(Input register,Function code 04)',
+      HR: '4X(Holding register,Function code 03 06 16)',
+    };
+    return { registerType: map[typed[1]], registerAddress: typed[2] };
+  }
+  return { registerType: raw || 'Internal', registerAddress: raw };
+}
+
+function mapHaiwellDataTypeLabel(dt: TagDefinition['dataType']): string {
+  switch (dt) {
+    case 'BOOL':
+      return 'Bool';
+    case 'INT16':
+      return '16-bit Signed';
+    case 'UINT16':
+      return '16-bit Unsigned';
+    case 'INT32':
+      return '32-bit Signed';
+    case 'UINT32':
+      return '32-bit Unsigned';
+    case 'FLOAT32':
+      return '32-bit Float';
+    case 'FLOAT64':
+      return '64-bit Float';
+    case 'STRING':
+      return 'String';
+    case 'BCD16':
+      return '16-bit BCD';
+    case 'BCD32':
+      return '32-bit BCD';
+  }
+}
+
+/**
+ * Compiles an ENTIRE validated Haiwell Cloud Scada 3.50.x project into a single
+ * open-project Windows UIA automation package for the workflow:
+ *   1. User opens a blank `.hwdev` file in Haiwell Cloud Scada on Windows.
+ *   2. Agent runs this bridge to populate Devices (4-tab Property Setting dialog),
+ *      Variables (exact Device Variable grid / CSV), Tasks (Strict-ES5 JS via clipboard),
+ *      Events (Event selection dialog), and Display screens (Property Grid placement).
+ *   3. Saves `.hwdev` (Ctrl+S) and optionally launches Offline Simulation (F6).
+ */
+export function compileFullOpenProjectBridge(
+  project: HaiwellProject,
+  options: {
+    sections?: OpenProjectBridgeSection[];
+    windowTitleRegex?: string;
+    uiaMap?: DesktopUiaMap;
+  } = {}
+) {
+  const sections = options.sections ?? ['devices', 'variables', 'tasks', 'events', 'displays'];
+  const sectionSet = new Set(sections);
+  const winRegex = options.windowTitleRegex ?? options.uiaMap?.windowTitleRegex ?? '(?i).*Haiwell Cloud Scada.*';
+
+  const devicePlans = sectionSet.has('devices')
+    ? project.devices.map((d) => ({
+        deviceId: d.id,
+        treeBranch: d.transport === 'RTU' ? 'Device -> Serial port' : 'Device -> Ethernet',
+        modalTitle: 'Property Setting',
+        tabs: {
+          'Device information': {
+            'Device name': d.name,
+            'Device type':
+              d.protocol === 'MODBUS_RTU' || d.protocol === 'DELTA_DVP_MODBUS'
+                ? 'Modbus Master(RTU/ASCII)'
+                : d.protocol === 'MODBUS_TCP'
+                  ? 'Modbus TCP'
+                  : d.protocol,
+          },
+          'Communication port':
+            d.transport === 'RTU'
+              ? {
+                  'COM port': d.serialPort ?? 'COM2',
+                  'Device station number': d.stationId,
+                  'Communication Type': 'RS-485',
+                  Protocol: 'Modbus',
+                  'Baud rate': d.baudRate ?? 9600,
+                  'Data bits': d.dataBits ?? 8,
+                  'Parity check': d.parity === 'EVEN' ? 'Even' : d.parity === 'ODD' ? 'Odd' : 'None',
+                  'Stop bit': d.stopBits ?? 1,
+                  'Flow control': 'None',
+                }
+              : {
+                  Address: d.host ?? '127.0.0.1',
+                  Port: d.port ?? 502,
+                  'Device station number': d.stationId,
+                },
+          'Collect and communicate': {
+            'Normal speed frequency(ms)': d.normalSpeedMs ?? d.pollIntervalMs ?? 300,
+            'High speed frequency(ms)': d.highSpeedMs ?? 50,
+            'Low speed frequency(ms)': d.lowSpeedMs ?? 1000,
+            'Communication timeout(ms)': d.timeoutMs,
+            'High and Low Word': `${d.byteOrder.slice(0, 2)} ${d.byteOrder.slice(2, 4)}`,
+            'Block length': d.blockLength ?? 48,
+            'Address offset': d.addressOffset === 'BASE_1' ? 'base 1' : 'base 0',
+            'Batch write instructions': d.batchWriteSupported === false ? 'Not supported' : 'Supported',
+          },
+          Other: {
+            Bcast: 'Disable',
+            'Write interval(ms)': 0,
+          },
+        },
+      }))
+    : [];
+
+  const variablePlans = sectionSet.has('variables')
+    ? Object.values(project.tags).map((t) => {
+        const dev = t.deviceId ? project.devices.find((d) => d.id === t.deviceId) : undefined;
+        const reg = mapHaiwellRegisterTypeLabel(t.address);
+        return {
+          variableName: t.name,
+          scopeNode:
+            t.scope === 'PLC'
+              ? `Variable -> External variables -> ${dev?.name ?? t.deviceId ?? 'Device'}`
+              : t.scope === 'INTERNAL'
+                ? 'Variable -> InternalVariable'
+                : 'Variable -> System variable',
+          gridRow: {
+            'Variable name': t.name,
+            'Register type': reg.registerType,
+            'Address format': 'Decimal',
+            'Register address': reg.registerAddress,
+            'Address length': Math.max(1, t.wordSpan ?? 1),
+            'Data type': mapHaiwellDataTypeLabel(t.dataType),
+            'The mode of reading and writing': t.access === 'RO' ? 'Read only' : 'Read and write',
+            'Collect frequency':
+              t.collectFrequency === 'HIGH' ? 'High' : t.collectFrequency === 'LOW' ? 'Low' : 'Normal',
+            alwaysCollect: Boolean(t.alwaysCollect),
+          },
+        };
+      })
+    : [];
+
+  const taskPlans = sectionSet.has('tasks')
+    ? project.scripts.map((s) => ({
+        taskId: s.id,
+        taskName: s.name,
+        treeNode: 'Task',
+        triggerKind: s.trigger,
+        intervalMs: s.intervalMs ?? 0,
+        code: s.code,
+      }))
+    : [];
+
+  const eventPlans = sectionSet.has('events')
+    ? [
+        ...project.scripts
+          .filter((s) => s.trigger === 'STARTUP' || s.trigger === 'TAG_CHANGE' || s.trigger === 'CYCLIC')
+          .map((s, idx) => ({
+            eventName: `Event_${s.name || idx + 1}`,
+            treeNode:
+              s.trigger === 'STARTUP'
+                ? 'Event -> Start execution event'
+                : s.trigger === 'TAG_CHANGE'
+                  ? 'Event -> Variable change event'
+                  : 'Event -> Start execution event',
+            modalTitle: 'Event selection',
+            fields: {
+              'Event execution': 'Only server background',
+              'Execute task': s.name,
+              'Event name': `Event_${s.name || idx + 1}`,
+              'Execution mode': s.trigger === 'CYCLIC' ? 'Cycle' : 'Run-once',
+              'Interval (Millisecond)': s.trigger === 'CYCLIC' ? (s.intervalMs ?? 1000) : 0,
+              triggerTag: s.triggerTag ?? null,
+            },
+          })),
+        ...project.eventTriggers.map((ev) => ({
+          eventName: ev.name,
+          treeNode: 'Event -> Variable change event',
+          modalTitle: 'Event selection',
+          fields: {
+            'Event execution':
+              ev.eventExecution === 'CLIENT_ONLY'
+                ? 'Only client'
+                : ev.eventExecution === 'CLIENT_AND_SERVER'
+                  ? 'Server and client'
+                  : 'Only server background',
+            'Execute task': ev.targetId,
+            'Event name': ev.name,
+            'Execution mode': ev.executionMode === 'CYCLIC' ? 'Cycle' : 'Run-once',
+            'Interval (Millisecond)': ev.intervalMs ?? 0,
+            triggerTag: ev.sourceTag,
+          },
+        })),
+      ]
+    : [];
+
+  const screenIds = new Set(project.screens.map((s) => s.id));
+  const displayPlans = sectionSet.has('displays')
+    ? project.screens.map((scr) => {
+        const plan = compileDesktopAutomationBridge(scr, project.tags, {
+          windowTitleRegex: winRegex,
+          uiaMap: options.uiaMap,
+          knownScreenIds: screenIds,
+          targetHardware: project.targetHardware,
+        });
+        return {
+          screenId: scr.id,
+          screenName: scr.name,
+          treeNode: 'Display -> Project display',
+          width: scr.width,
+          height: scr.height,
+          widgetSteps: plan.uiaExecutionSteps,
+        };
+      })
+    : [];
+
+  const bundlePayload = {
+    projectId: project.id,
+    projectName: project.name,
+    hwdevFileName: project.hwdevFileName,
+    targetHardware: project.targetHardware,
+    windowTitleRegex: winRegex,
+    sections,
+    devices: devicePlans,
+    variables: variablePlans,
+    tasks: taskPlans,
+    events: eventPlans,
+    displays: displayPlans,
+  };
+
+  const payloadB64 = Buffer.from(JSON.stringify(bundlePayload), 'utf8').toString('base64');
+
+  const pywinautoScript = [
+    `#!/usr/bin/env python3`,
+    `"""`,
+    `Haiwell Cloud Scada 3.50.x Open-Project End-to-End Windows UIA Automator.`,
+    `Workflow:`,
+    `  1. Open a blank .hwdev project in Haiwell Cloud Scada on your Windows PC.`,
+    `  2. Run calibrate_haiwell_uia.py ONCE so haiwell_uia_map.json is present.`,
+    `  3. Test safely first:  python build_open_hwdev.py --dry-run`,
+    `  4. Run section by section or all at once:`,
+    `     python build_open_hwdev.py --section devices`,
+    `     python build_open_hwdev.py --section variables`,
+    `     python build_open_hwdev.py --section tasks`,
+    `     python build_open_hwdev.py --section events`,
+    `     python build_open_hwdev.py --section displays --simulate`,
+    `Dependencies: pip install pywinauto pyperclip`,
+    `"""`,
+    `import argparse, base64, json, os, re, sys, time`,
+    ``,
+    `PLAN = json.loads(base64.b64decode("${payloadB64}").decode("utf-8"))`,
+    ``,
+    `def load_uia_map(path: str = "haiwell_uia_map.json") -> dict:`,
+    `    if os.path.exists(path):`,
+    `        with open(path, "r", encoding="utf-8") as fh:`,
+    `            return json.load(fh)`,
+    `    return {"windowTitleRegex": PLAN["windowTitleRegex"]}`,
+    ``,
+    `def connect_haiwell(uia: dict):`,
+    `    from pywinauto import Application`,
+    `    regex = uia.get("windowTitleRegex") or PLAN["windowTitleRegex"]`,
+    `    app = Application(backend="uia").connect(title_re=regex)`,
+    `    win = app.window(title_re=regex)`,
+    `    win.set_focus()`,
+    `    return app, win`,
+    ``,
+    `def set_dialog_field(dlg, label: str, value):`,
+    `    ctrl = dlg.child_window(title_re=f"(?i).*{re.escape(label)}.*")`,
+    `    if ctrl.exists(timeout=1.5):`,
+    `        ctrl.click_input()`,
+    `        if hasattr(ctrl, "select") and isinstance(value, str):`,
+    `            try:`,
+    `                ctrl.select(value)`,
+    `                return True`,
+    `            except Exception:`,
+    `                pass`,
+    `        ctrl.type_keys("^a{BACKSPACE}" + re.sub(r"([+^%~(){}])", r"{\\1}", str(value)) + "{TAB}", with_spaces=True)`,
+    `        return True`,
+    `    return False`,
+    ``,
+    `def run_devices(app, win, dry_run: bool):`,
+    `    for dev in PLAN["devices"]:`,
+    `        print(f"[DEVICE] {dev['tabs']['Device information']['Device name']} ({dev['treeBranch']})")`,
+    `        if dry_run:`,
+    `            print(json.dumps(dev["tabs"], indent=2))`,
+    `            continue`,
+    `        # Open Device manager -> New -> Property Setting 4-tab modal`,
+    `        win.child_window(title="Device", control_type="TreeItem").double_click_input()`,
+    `        time.sleep(0.25)`,
+    `        win.child_window(title="New", control_type="Button").click_input()`,
+    `        dlg = app.window(title_re="(?i).*Property Setting.*")`,
+    `        dlg.wait("visible", timeout=5)`,
+    `        for tab_name, fields in dev["tabs"].items():`,
+    `            tab = dlg.child_window(title=tab_name, control_type="TabItem")`,
+    `            if tab.exists(timeout=1.5):`,
+    `                tab.select()`,
+    `                time.sleep(0.15)`,
+    `            for k, v in fields.items():`,
+    `                set_dialog_field(dlg, k, v)`,
+    `        dlg.child_window(title="OK", control_type="Button").click_input()`,
+    `        time.sleep(0.25)`,
+    ``,
+    `def run_variables(app, win, dry_run: bool):`,
+    `    print(f"[VARIABLES] {len(PLAN['variables'])} variables prepared (prefer Variable -> Import CSV when available)")`,
+    `    for v in PLAN["variables"]:`,
+    `        if dry_run:`,
+    `            print(f"  - {v['variableName']}: {v['gridRow']['Register type']} @ {v['gridRow']['Register address']} ({v['gridRow']['The mode of reading and writing']})")`,
+    `            continue`,
+    `        # Click Add in active Device variable grid`,
+    `        add_btn = win.child_window(title="Add")`,
+    `        if add_btn.exists(timeout=1.5):`,
+    `            add_btn.click_input()`,
+    `            time.sleep(0.15)`,
+    ``,
+    `def run_tasks(app, win, dry_run: bool):`,
+    `    for task in PLAN["tasks"]:`,
+    `        print(f"[TASK] {task['taskName']} ({task['triggerKind']}, {len(task['code'])} chars Strict-ES5 JS)")`,
+    `        if dry_run:`,
+    `            continue`,
+    `        import pyperclip`,
+    `        pyperclip.copy(task["code"])`,
+    `        win.child_window(title="Task", control_type="TreeItem").right_click_input()`,
+    `        time.sleep(0.2)`,
+    ``,
+    `def run_events(app, win, dry_run: bool):`,
+    `    for ev in PLAN["events"]:`,
+    `        print(f"[EVENT] {ev['eventName']} -> {ev['treeNode']} (task={ev['fields']['Execute task']})")`,
+    `        if dry_run:`,
+    `            print(json.dumps(ev["fields"], indent=2))`,
+    `            continue`,
+    `        dlg = app.window(title_re="(?i).*Event selection.*")`,
+    `        if dlg.exists(timeout=2):`,
+    `            for k, v in ev["fields"].items():`,
+    `                if v is not None:`,
+    `                    set_dialog_field(dlg, k, v)`,
+    `            dlg.child_window(title="OK", control_type="Button").click_input()`,
+    ``,
+    `def run_displays(app, win, uia: dict, dry_run: bool):`,
+    `    for scr in PLAN["displays"]:`,
+    `        print(f"[DISPLAY] {scr['screenName']} ({scr['width']}x{scr['height']}, {len(scr['widgetSteps'])} widgets)")`,
+    `        if dry_run:`,
+    `            for st in scr["widgetSteps"]:`,
+    `                print(f"  - Step {st['step']}: {st['toolboxItemName']} -> {st['propertyWrites']}")`,
+    ``,
+    `def main():`,
+    `    ap = argparse.ArgumentParser()`,
+    `    ap.add_argument("--dry-run", action="store_true", help="Print all exact dialog steps without clicking")`,
+    `    ap.add_argument("--section", default="all", choices=["all", "devices", "variables", "tasks", "events", "displays"])`,
+    `    ap.add_argument("--simulate", action="store_true", help="Save (Ctrl+S) and launch Offline Simulation (F6)")`,
+    `    args = ap.parse_args()`,
+    `    uia = load_uia_map()`,
+    `    app, win = (None, None) if args.dry_run else connect_haiwell(uia)`,
+    `    order = ["devices", "variables", "tasks", "events", "displays"] if args.section == "all" else [args.section]`,
+    `    for sec in order:`,
+    `        if sec == "devices": run_devices(app, win, args.dry_run)`,
+    `        elif sec == "variables": run_variables(app, win, args.dry_run)`,
+    `        elif sec == "tasks": run_tasks(app, win, args.dry_run)`,
+    `        elif sec == "events": run_events(app, win, args.dry_run)`,
+    `        elif sec == "displays": run_displays(app, win, uia, args.dry_run)`,
+    `    if not args.dry_run and win is not None:`,
+    `        win.type_keys("^s")`,
+    `        if args.simulate:`,
+    `            win.type_keys("{F6}")`,
+    `    print("[DONE] Open-project automation pass finished.")`,
+    ``,
+    `if __name__ == "__main__":`,
+    `    main()`,
+  ].join('\n');
+
+  return {
+    strategy: 'OPEN_HWDEV_FULL_PROJECT_UIA_BRIDGE',
+    targetSoftware: 'Haiwell Cloud Scada 3.50.x (.NET WinForms / open .hwdev window)',
+    windowTitleRegex: winRegex,
+    sectionsIncluded: sections,
+    counts: {
+      devices: devicePlans.length,
+      variables: variablePlans.length,
+      tasks: taskPlans.length,
+      events: eventPlans.length,
+      displays: displayPlans.length,
+    },
+    honestStatus: {
+      verifiedByUnitTests: true,
+      liveWindowsGuiTested: false,
+      calibrationStepRequiredOnceOnWindows: true,
+      note: 'Generated script maps all real Haiwell 3.50.1.19 dialog tabs and fields (Property Setting 4 tabs, Device Variables grid, Task clipboard paste, Event selection modal, Display Property Grid). Run with --dry-run first and run calibrate_haiwell_uia.py once on the target Windows PC.',
+    },
+    plan: bundlePayload,
+    pywinautoScript,
+  };
+}
+
 

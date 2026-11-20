@@ -43,7 +43,7 @@ export function createHaiwellMcpServer(
   const server = new McpServer(
     {
       name: 'haiwell-cloud-scada-mcp',
-      version: '2.3.0',
+      version: '2.4.0',
     },
     {
       capabilities: {

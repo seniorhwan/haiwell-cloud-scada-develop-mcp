@@ -4,8 +4,8 @@ import { HaiwellProjectStore } from './projectStore';
 import { HAIWELL_TOOLS, invokeHaiwellTool } from './toolRegistry';
 import { REAL_HAIWELL_350_TREE_NODES } from './hmiSpatialEngine';
 
-test('Haiwell Cloud Scada 3.50.x parity: 57 total tools cover all 22 real Project Browser nodes', () => {
-  assert.equal(HAIWELL_TOOLS.length, 57);
+test('Haiwell Cloud Scada 3.50.x parity: 58 total tools cover all 22 real Project Browser nodes', () => {
+  assert.equal(HAIWELL_TOOLS.length, 58);
   assert.equal(REAL_HAIWELL_350_TREE_NODES.length, 22);
 });
 
@@ -624,4 +624,114 @@ test('v2.3.0: Strict ES5 Node v0.10.41 enforcement, native $Device.Tag / Common.
   const findingsAfter = (auditAfter.data as { findings: { code: string; target: string }[] }).findings;
   assert.equal(findingsAfter.some((f) => f.code === 'AUD-ALWAYS-COLLECT' && f.target === 'ST1_SEQ'), false);
 });
+
+test('v2.4.0: haiwell_open_project_bridge_export compiles full 5-section open-.hwdev automation bundle matching Haiwell 3.50.1.19 dialogs', async () => {
+  const store = new HaiwellProjectStore();
+  await invokeHaiwellTool(
+    'haiwell_project_create',
+    {
+      id: 'prj_open_hwdev',
+      name: 'Demo Open Window Project',
+      targetHardware: 'CLOUD_HMI_B7H',
+      width: 1024,
+      height: 600,
+    },
+    store
+  );
+  await invokeHaiwellTool(
+    'haiwell_device_add',
+    {
+      projectId: 'prj_open_hwdev',
+      id: 'plc_rs485_1',
+      name: 'Station1_PLC',
+      protocol: 'MODBUS_RTU',
+      transport: 'RTU',
+      serialPort: 'COM2',
+      baudRate: 9600,
+      dataBits: 8,
+      stopBits: 1,
+      parity: 'NONE',
+      stationId: 1,
+      addressOffset: 'BASE_0',
+      blockLength: 48,
+      normalSpeedMs: 300,
+      highSpeedMs: 50,
+      lowSpeedMs: 1000,
+      batchWriteSupported: true,
+    },
+    store
+  );
+  await invokeHaiwellTool(
+    'haiwell_tag_upsert_batch',
+    {
+      projectId: 'prj_open_hwdev',
+      tags: [
+        { name: 'X0_Sensor', scope: 'PLC', deviceId: 'plc_rs485_1', address: '1X13312', dataType: 'BOOL', access: 'RO', collectFrequency: 'NORMAL', alwaysCollect: true },
+        { name: 'Y0_Actuator', scope: 'PLC', deviceId: 'plc_rs485_1', address: '0X13056', dataType: 'BOOL', access: 'RW', collectFrequency: 'HIGH', alwaysCollect: true },
+      ],
+    },
+    store
+  );
+  await invokeHaiwellTool(
+    'haiwell_script_upsert',
+    {
+      projectId: 'prj_open_hwdev',
+      id: 'task_startup',
+      name: 'DataLoggerInit',
+      trigger: 'STARTUP',
+      code: 'var x0 = Variable.GetByFullName("Station1_PLC.X0_Sensor"); Common.Log("Boot x0=" + x0);',
+    },
+    store
+  );
+
+  // Must succeed on deployment-ready project
+  const res = await invokeHaiwellTool(
+    'haiwell_open_project_bridge_export',
+    { projectId: 'prj_open_hwdev' },
+    store
+  );
+  assert.equal(res.ok, true);
+  const data = res.data as {
+    strategy: string;
+    counts: Record<string, number>;
+    plan: {
+      devices: { tabs: Record<string, Record<string, unknown>> }[];
+      variables: { gridRow: Record<string, unknown> }[];
+      tasks: { taskName: string }[];
+      events: { modalTitle: string; fields: Record<string, unknown> }[];
+    };
+    pywinautoScript: string;
+  };
+  assert.equal(data.strategy, 'OPEN_HWDEV_FULL_PROJECT_UIA_BRIDGE');
+  assert.equal(data.counts.devices, 1);
+  assert.equal(data.counts.variables, 2);
+  assert.equal(data.counts.tasks, 1);
+  assert.equal(data.counts.events, 1);
+
+  // Verify exact 4-tab Property Setting labels from Haiwell 3.50.1.19
+  const devTabs = data.plan.devices[0].tabs;
+  assert.equal(devTabs['Communication port']['COM port'], 'COM2');
+  assert.equal(devTabs['Communication port']['Parity check'], 'None');
+  assert.equal(devTabs['Collect and communicate']['Address offset'], 'base 0');
+  assert.equal(devTabs['Collect and communicate']['Block length'], 48);
+  assert.equal(devTabs['Collect and communicate']['High and Low Word'], 'CD AB');
+
+  // Verify exact Device Variable grid Register type strings
+  const x0Row = data.plan.variables.find((v) => v.gridRow['Variable name'] === 'X0_Sensor')!.gridRow;
+  assert.equal(x0Row['Register type'], '1X(Digital input,Function code 02)');
+  assert.equal(x0Row['Register address'], '13312');
+  assert.equal(x0Row['The mode of reading and writing'], 'Read only');
+
+  // Verify exact Event selection modal labels
+  assert.equal(data.plan.events[0].modalTitle, 'Event selection');
+  assert.equal(data.plan.events[0].fields['Event execution'], 'Only server background');
+  assert.equal(data.plan.events[0].fields['Execution mode'], 'Run-once');
+
+  // Verify Python runner supports --dry-run, --section, --simulate
+  assert.match(data.pywinautoScript, /--dry-run/);
+  assert.match(data.pywinautoScript, /--section/);
+  assert.match(data.pywinautoScript, /Property Setting/);
+  assert.match(data.pywinautoScript, /Event selection/);
+});
+
 
