@@ -17,6 +17,7 @@ import {
   getWordSpanForType,
   validatePlcAddress,
   validateTagValueForType,
+  VENDOR_MODBUS_REGISTER_MAPS,
 } from './plcAddressing';
 import {
   transpileStToHaiwellJs,
@@ -255,7 +256,7 @@ export function buildProjectExportBundle(project: HaiwellProject) {
   );
 
   const haiwellVarHeader =
-    'VariableName,VariableType,DeviceName,RegisterAddress,DataType,ReadWrite,Unit,MinValue,MaxValue,Description';
+    'VariableName,VariableType,DeviceName,RegisterAddress,DataType,ReadWrite,Unit,MinValue,MaxValue,AlwaysCollect,Description';
   const haiwellVarRows = Object.values(project.tags).map((t) => {
     const devName = t.deviceId
       ? project.devices.find((d) => d.id === t.deviceId)?.name ?? t.deviceId
@@ -270,12 +271,13 @@ export function buildProjectExportBundle(project: HaiwellProject) {
       escapeCsvCell(t.unit ?? '', true),
       escapeCsvCell(t.safeMin ?? ''),
       escapeCsvCell(t.safeMax ?? ''),
+      escapeCsvCell(t.alwaysCollect ? 'TRUE' : 'FALSE'),
       escapeCsvCell(t.description ?? '', true),
     ].join(',');
   });
 
   return {
-    format: 'haiwell-cloud-scada-bundle/v2.2',
+    format: 'haiwell-cloud-scada-bundle/v2.3',
     exportedAt: new Date().toISOString(),
     projectMeta: {
       id: project.id,
@@ -422,12 +424,75 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
     }
   }
 
-  // 4. Validate JavaScript scripts
+  // 1b. RS-485 RTU Daisy-Chain Bus Framing & Slave ID Uniqueness Check
+  const rtuByPort = new Map<string, typeof project.devices>();
+  for (const dev of project.devices) {
+    if (dev.enabled && dev.transport === 'RTU' && dev.serialPort) {
+      const key = dev.serialPort.trim().toUpperCase();
+      const list = rtuByPort.get(key) ?? [];
+      list.push(dev);
+      rtuByPort.set(key, list);
+    }
+  }
+  for (const [port, devs] of rtuByPort.entries()) {
+    const seenIds = new Set<number>();
+    const ref = devs[0];
+    for (const d of devs) {
+      if (seenIds.has(d.stationId)) {
+        findings.push({
+          code: 'AUD-RS485-BUS',
+          severity: 'CRITICAL',
+          domain: 'devices',
+          target: `${port}:${d.id}`,
+          message: `Duplicate Modbus RTU Slave ID ${d.stationId} on shared serial bus ${port}.`,
+          remediation: 'Assign unique stationId (1..247) to every PLC on the RS-485 daisy-chain.',
+        });
+      }
+      seenIds.add(d.stationId);
+      if (
+        d.baudRate !== ref.baudRate ||
+        d.dataBits !== ref.dataBits ||
+        d.parity !== ref.parity ||
+        d.stopBits !== ref.stopBits
+      ) {
+        findings.push({
+          code: 'AUD-RS485-BUS',
+          severity: 'CRITICAL',
+          domain: 'devices',
+          target: `${port}:${d.id}`,
+          message: `Serial framing mismatch on ${port}: "${d.name}" (${d.baudRate}-${d.dataBits}-${d.parity}-${d.stopBits}) differs from "${ref.name}" (${ref.baudRate}-${ref.dataBits}-${ref.parity}-${ref.stopBits}).`,
+          remediation: 'Unify baudRate, dataBits, parity, and stopBits across all slaves sharing an RS-485 bus.',
+        });
+      }
+    }
+  }
+
+  // 4. Validate JavaScript scripts (Strict ES5 on ARM HMIs + Haiwell 3.50.x runtime traps)
+  const displayedTags = new Set<string>();
+  for (const screen of project.screens) {
+    for (const w of screen.widgets) {
+      if (w.tagName) displayedTags.add(w.tagName);
+    }
+  }
+  const cyclicScripts = project.scripts.filter((s) => s.trigger === 'CYCLIC');
+  if (cyclicScripts.length > 1) {
+    findings.push({
+      code: 'AUD-MULTI-TIMER',
+      severity: 'MEDIUM',
+      domain: 'scripts',
+      target: cyclicScripts.map((s) => s.id).join(', '),
+      message: `${cyclicScripts.length} separate CYCLIC scripts defined. Haiwell Cloud SCADA 3.50.x www.js timerEventActions() has a multi-timer return bug that can skip subsequent cyclic tasks.`,
+      remediation: 'Consolidate periodic tasks into a single STARTUP script driving one Common.SetInterval(workerTick, ms) loop.',
+    });
+  }
+
+  const bgPolledTagsWarned = new Set<string>();
   for (const script of project.scripts) {
     const res = validateHaiwellScript(script.code, project.tags, {
       trigger: script.trigger,
       intervalMs: script.intervalMs,
       triggerTag: script.triggerTag,
+      targetHardware: project.targetHardware,
     });
     if (!res.valid) {
       findings.push({
@@ -435,9 +500,26 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
         severity: 'HIGH',
         domain: 'scripts',
         target: script.name,
-        message: `Script "${script.name}" failed static validation (${res.diagnostics.length} issue(s)).`,
-        remediation: 'Run haiwell_script_validate and resolve referenced tags or forbidden APIs.',
+        message: `Script "${script.name}" failed static validation (${res.diagnostics.filter((d) => d.severity === 'ERROR').length} error(s)).`,
+        remediation: 'Run haiwell_script_validate and resolve ES5 syntax, referenced tags, or forbidden APIs.',
       });
+    }
+    if (script.trigger === 'STARTUP' || script.trigger === 'CYCLIC' || script.trigger === 'TAG_CHANGE') {
+      const refs = new Set<string>([...res.referencedTags, ...(script.triggerTag ? [script.triggerTag] : [])]);
+      for (const tagName of refs) {
+        const tag = getOwnTag(project, tagName);
+        if (tag && tag.scope === 'PLC' && !displayedTags.has(tagName) && !tag.alwaysCollect && !bgPolledTagsWarned.has(tagName)) {
+          bgPolledTagsWarned.add(tagName);
+          findings.push({
+            code: 'AUD-ALWAYS-COLLECT',
+            severity: 'MEDIUM',
+            domain: 'tags',
+            target: tagName,
+            message: `PLC tag "${tagName}" is used by background script "${script.name}" but is not bound to any HMI screen and has alwaysCollect=false (Haiwell HMI skips polling unrendered PLC tags unless Always Collect is enabled).`,
+            remediation: `Set alwaysCollect=true on tag "${tagName}" via haiwell_tag_upsert_batch.`,
+          });
+        }
+      }
     }
   }
 
@@ -1279,6 +1361,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       port: z.number().int().min(1).max(65535).default(502),
       serialPort: z.string().optional(),
       baudRate: z.number().int().default(9600),
+      dataBits: z.union([z.literal(7), z.literal(8)]).default(8),
+      stopBits: z.union([z.literal(1), z.literal(2)]).default(1),
+      parity: z.enum(['NONE', 'EVEN', 'ODD']).default('NONE'),
       stationId: z.number().int().min(1).max(247).default(1),
       pollIntervalMs: z.number().int().min(20).max(60000).default(250),
       timeoutMs: z.number().int().min(100).max(30000).default(1500),
@@ -1299,9 +1384,32 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         throw new Error('TCP transport requires a host IP or hostname.');
       }
       if (input.transport === 'RTU' && !input.serialPort) {
-        throw new Error('RTU transport requires serialPort (e.g., COM1 or /dev/ttyUSB0).');
+        throw new Error('RTU transport requires serialPort (e.g., COM1, COM2, or /dev/ttyUSB0).');
       }
       const project = store.getProject(input.projectId);
+      if (input.transport === 'RTU' && input.serialPort) {
+        const normPort = input.serialPort.trim().toUpperCase();
+        const peers = project.devices.filter(
+          (d) => d.id !== input.id && d.enabled && d.transport === 'RTU' && d.serialPort?.trim().toUpperCase() === normPort
+        );
+        for (const peer of peers) {
+          if (peer.stationId === input.stationId) {
+            throw new Error(
+              `RS485_DUPLICATE_SLAVE_ID: Station ID ${input.stationId} on ${normPort} is already used by device "${peer.name}" (${peer.id}).`
+            );
+          }
+          if (
+            peer.baudRate !== input.baudRate ||
+            peer.dataBits !== input.dataBits ||
+            peer.parity !== input.parity ||
+            peer.stopBits !== input.stopBits
+          ) {
+            throw new Error(
+              `RS485_FRAMING_MISMATCH: Serial bus ${normPort} uses ${peer.baudRate}-${peer.dataBits}-${peer.parity}-${peer.stopBits} (device "${peer.name}"), but "${input.name}" requested ${input.baudRate}-${input.dataBits}-${input.parity}-${input.stopBits}. Unify framing across all RS-485 daisy-chain slaves.`
+            );
+          }
+        }
+      }
       const cfg = {
         id: input.id,
         name: input.name,
@@ -1311,9 +1419,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         port: input.port,
         serialPort: input.serialPort,
         baudRate: input.baudRate,
-        dataBits: 8 as const,
-        stopBits: 1 as const,
-        parity: 'NONE' as const,
+        dataBits: input.dataBits,
+        stopBits: input.stopBits,
+        parity: input.parity,
         stationId: input.stationId,
         pollIntervalMs: input.pollIntervalMs,
         timeoutMs: input.timeoutMs,
@@ -1335,7 +1443,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Multi-Vendor PLC Register & Modbus Offset Translator',
     safetyTier: 'read',
     description:
-      'Validate registers for Haiwell PLC (X/Y/M/T/C/S/AI/AQ/V/TV/CV/SV), Modbus (40001/HR:0), Siemens S7 (I0.0/DB1.DBD0), Mitsubishi MC (D100/X0F), Omron FINS (DM100/CIO0.00), BACnet (AI:0), or Allen-Bradley EIP symbolic tags.',
+      'Validate registers for Haiwell PLC (X/Y/M/T/C/S/AI/AQ/V/TV/CV/SV), Haiwell native Modbus (0X/1X/3X/4X/W), standard Modbus (40001/HR:0), Siemens S7 (I0.0/DB1.DBD0), Mitsubishi MC (D100/X0F), Omron FINS (DM100/CIO0.00), BACnet (AI:0), or Allen-Bradley EIP symbolic tags.',
     inputSchema: z.object({
       protocol: z.enum(PLC_PROTOCOLS).default('HAIWELL_PLC_TCP'),
       addresses: z.array(z.string().min(1)).min(1).max(200),
@@ -1351,7 +1459,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         protocol: input.protocol,
         allValid: results.every((r) => r.valid),
         results,
-        ...(input.includeAreaTable ? { haiwellRegisterMap: HAIWELL_REGISTER_MAP } : {}),
+        ...(input.includeAreaTable
+          ? { haiwellRegisterMap: HAIWELL_REGISTER_MAP, vendorModbusMaps: VENDOR_MODBUS_REGISTER_MAPS }
+          : {}),
       };
     },
   }),
@@ -1447,6 +1557,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             safeMax: z.number().optional(),
             safetyClass: z.enum(['SIL0', 'SIL1', 'SIL2', 'SIL3']).default('SIL0'),
             requiresInterlock: z.boolean().default(false),
+            alwaysCollect: z.boolean().optional(),
             initialValue: z.union([z.number(), z.boolean(), z.string()]).optional(),
           })
         )
@@ -1580,6 +1691,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           safeMax: t.safeMax,
           safetyClass: t.safetyClass,
           requiresInterlock: t.requiresInterlock || t.safetyClass === 'SIL2' || t.safetyClass === 'SIL3',
+          alwaysCollect: t.alwaysCollect ?? existingTag?.alwaysCollect,
           currentValue: valCheck.normalizedValue,
           quality: 'GOOD' as const,
           updatedAt: now,
@@ -1953,6 +2065,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       source: z.string().min(1),
       tagBindings: z.record(z.string(), z.string()).default({}),
+      apiStyle: z.enum(['TAG_API', 'HAIWELL_NATIVE_350']).default('TAG_API'),
       registerScriptId: z.string().optional(),
       cyclicIntervalMs: z.number().int().min(100).max(60000).default(1000),
     }),
@@ -1962,7 +2075,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         'PROGRAM DeltaCalc\nVAR_INPUT\n  Supply_Temp_C : REAL;\n  Return_Temp_C : REAL;\nEND_VAR\nVAR_OUTPUT\n  Plant_DeltaT_C : REAL;\nEND_VAR\nPlant_DeltaT_C := Return_Temp_C - Supply_Temp_C;\nEND_PROGRAM',
     },
     handler: (input, store) => {
-      const result = transpileStToHaiwellJs(input.source, input.tagBindings);
+      const result = transpileStToHaiwellJs(input.source, input.tagBindings, { apiStyle: input.apiStyle });
       if (!result.success || !result.jsCode) {
         return { transpiled: false, validation: result.validation };
       }
@@ -1971,6 +2084,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         const scriptCheck = validateHaiwellScript(result.jsCode, project.tags, {
           trigger: 'CYCLIC',
           intervalMs: input.cyclicIntervalMs,
+          targetHardware: project.targetHardware,
         });
         if (!scriptCheck.valid) {
           return {
@@ -2493,17 +2607,18 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Lexer-Hardened Haiwell JavaScript Static Analyzer',
     safetyTier: 'read',
     description:
-      'Validate Haiwell Cloud SCADA JavaScript scripts with string/comment-aware delimiter balancing, sandbox escape blocking, Tag.Read/Tag.Write cross-referencing, RO tag protection, and SIL interlock warnings.',
+      'Validate Haiwell Cloud SCADA JavaScript scripts with Strict ES5 (Node v0.10.41 ARM HMI) enforcement, native $Device.Var / Variable.GetByFullName / Tag.Read cross-referencing, Haiwell 3.50.x SQLite/Ajax/busy-wait runtime trap lints, sandbox escape blocking, RO tag protection, and SIL interlock warnings.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       code: z.string().min(1),
       trigger: z.enum(['STARTUP', 'SHUTDOWN', 'CYCLIC', 'TAG_CHANGE', 'SCREEN_EVENT', 'ALARM_EVENT']).optional(),
       intervalMs: z.number().int().optional(),
       triggerTag: z.string().optional(),
+      strictEs5: z.boolean().optional(),
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
-      code: 'const t = Tag.Read("Supply_Temp_C");\nif (t > 12) { System.Log("High supply temp: " + t); }',
+      code: 'var t = Tag.Read("Supply_Temp_C");\nif (t > 12) { Common.Log("High supply temp: " + t); }',
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
@@ -2511,6 +2626,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         trigger: input.trigger,
         intervalMs: input.intervalMs,
         triggerTag: input.triggerTag,
+        strictEs5: input.strictEs5,
+        targetHardware: project.targetHardware,
       });
     },
   }),
@@ -2521,7 +2638,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Haiwell JavaScript Script Registration',
     safetyTier: 'design',
     description:
-      'Validate and save a Haiwell Cloud SCADA JavaScript task (STARTUP, SHUTDOWN, CYCLIC, TAG_CHANGE, SCREEN_EVENT, ALARM_EVENT). Blocks saving on static validation or trigger configuration errors.',
+      'Validate and save a Haiwell Cloud SCADA JavaScript task (STARTUP, SHUTDOWN, CYCLIC, TAG_CHANGE, SCREEN_EVENT, ALARM_EVENT). Enforces Strict ES5 on embedded ARM HMIs (B7H/B7/C7/C10) and blocks saving on static validation or trigger configuration errors.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
@@ -2529,6 +2646,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       trigger: z.enum(['STARTUP', 'SHUTDOWN', 'CYCLIC', 'TAG_CHANGE', 'SCREEN_EVENT', 'ALARM_EVENT']),
       intervalMs: z.number().int().min(50).max(3600000).optional(),
       triggerTag: z.string().optional(),
+      strictEs5: z.boolean().optional(),
       code: z.string().min(1),
     }),
     sampleInput: {
@@ -2537,7 +2655,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       name: 'SetpointClampGuard',
       trigger: 'TAG_CHANGE',
       triggerTag: 'Chiller_Setpoint_C',
-      code: 'const sp = Tag.Read("Chiller_Setpoint_C");\nif (sp < 4.0) { Tag.Write("Chiller_Setpoint_C", 4.0); }',
+      code: 'var sp = Tag.Read("Chiller_Setpoint_C");\nif (sp < 4.0) { Tag.Write("Chiller_Setpoint_C", 4.0); }',
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
@@ -2545,6 +2663,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         trigger: input.trigger,
         intervalMs: input.intervalMs,
         triggerTag: input.triggerTag,
+        strictEs5: input.strictEs5,
+        targetHardware: project.targetHardware,
       });
       if (!validation.valid) return { saved: false, validation };
       const script = {

@@ -235,8 +235,8 @@ function makeSeedProject(): HaiwellProject {
         trigger: 'CYCLIC',
         intervalMs: 1000,
         code: [
-          'const supply = Tag.Read("Supply_Temp_C");',
-          'const ret = Tag.Read("Return_Temp_C");',
+          'var supply = Tag.Read("Supply_Temp_C");',
+          'var ret = Tag.Read("Return_Temp_C");',
           'Tag.Write("Plant_DeltaT_C", Number((ret - supply).toFixed(2)));',
         ].join('\n'),
         referencedTags: ['Supply_Temp_C', 'Return_Temp_C', 'Plant_DeltaT_C'],

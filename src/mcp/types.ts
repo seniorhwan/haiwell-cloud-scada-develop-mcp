@@ -122,6 +122,7 @@ export interface TagDefinition {
   safeMax?: number;
   safetyClass: SafetyClass;
   requiresInterlock: boolean;
+  alwaysCollect?: boolean;
   currentValue: number | boolean | string;
   previousValue?: number | boolean | string;
   quality: 'GOOD' | 'BAD' | 'UNCERTAIN' | 'SIMULATED';

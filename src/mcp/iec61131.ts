@@ -1273,30 +1273,40 @@ export function validateFbdNetwork(pouName: string, networkJson: string): Iec611
  */
 export function transpileStToHaiwellJs(
   source: string,
-  tagBindings: Record<string, string> = {}
+  tagBindings: Record<string, string> = {},
+  options?: { apiStyle?: 'TAG_API' | 'HAIWELL_NATIVE_350' }
 ): { success: boolean; jsCode?: string; validation: Iec61131ValidationResult } {
   const validation = validateStructuredText(source);
   if (!validation.valid) {
     return { success: false, validation };
   }
 
+  const apiStyle = options?.apiStyle ?? 'TAG_API';
   const cleaned = stripCommentsPreserveLines(source);
   const rawLines = cleaned.split(/\r?\n/);
 
+  // Strict ES5 output for Haiwell B7H-W ARM Linux Node.js v0.10.41 compatibility
+  // (no const/let, no arrow functions, no template literals, no Math.trunc)
   const jsLines: string[] = [
     `// Transpiled from IEC 61131-3 ST POU: ${validation.pouName ?? 'Unnamed'}`,
-    `// Standard: ${validation.standard}`,
-    `const __LIMIT = (mn, v, mx) => Math.max(mn, Math.min(mx, v));`,
-    `const __SEL = (g, a, b) => (g ? b : a);`,
+    `// Standard: ${validation.standard} | Target JS: Strict ES5 (Haiwell HMI Node v0.10.41 safe)`,
+    `function __LIMIT(mn, v, mx) { return Math.max(mn, Math.min(mx, v)); }`,
+    `function __SEL(g, a, b) { return g ? b : a; }`,
+    `function __TRUNC(x) { return x < 0 ? Math.ceil(x) : Math.floor(x); }`,
   ];
+
+  const readCall = (scadaTag: string) =>
+    apiStyle === 'HAIWELL_NATIVE_350'
+      ? `Variable.GetByFullName(${JSON.stringify(scadaTag)})`
+      : `Tag.Read(${JSON.stringify(scadaTag)})`;
 
   for (const v of validation.variables) {
     const scadaTag = tagBindings[v.name] ?? v.name;
     if (v.section === 'VAR_INPUT' || v.section === 'VAR_IN_OUT' || v.section === 'VAR_GLOBAL') {
-      jsLines.push(`let ${v.name} = Tag.Read(${JSON.stringify(scadaTag)});`);
+      jsLines.push(`var ${v.name} = ${readCall(scadaTag)};`);
     } else if (!IEC_STANDARD_FBS.has(v.dataType)) {
       const init = v.isArray ? '[]' : v.dataType === 'BOOL' ? 'false' : v.dataType === 'STRING' ? '""' : '0';
-      jsLines.push(`let ${v.name} = ${init};`);
+      jsLines.push(`var ${v.name} = ${init};`);
     }
   }
 
@@ -1350,7 +1360,7 @@ export function transpileStToHaiwellJs(
       .replace(/\bMAX\s*\(/gi, 'Math.max(')
       .replace(/\bLIMIT\s*\(/gi, '__LIMIT(')
       .replace(/\bSEL\s*\(/gi, '__SEL(')
-      .replace(/\b(?:REAL_TO_INT|REAL_TO_DINT|DINT_TO_INT|REAL_TO_UINT)\s*\(/gi, 'Math.trunc(')
+      .replace(/\b(?:REAL_TO_INT|REAL_TO_DINT|DINT_TO_INT|REAL_TO_UINT)\s*\(/gi, '__TRUNC(')
       .replace(/\b(?:INT_TO_REAL|DINT_TO_REAL|UINT_TO_REAL)\s*\(/gi, 'Number(');
     return converted.replace(/__STR_(\d+)__/g, (_, idx) => tokens[Number(idx)]);
   };
@@ -1447,7 +1457,7 @@ export function transpileStToHaiwellJs(
     } else if (/^WHILE\b/i.test(t)) {
       const cond = t.replace(/^WHILE\s+/i, '').replace(/\s+DO$/i, '');
       const wd = `__wd_${++loopCounter}`;
-      jsLines.push(`${pad()}let ${wd} = 0;`);
+      jsLines.push(`${pad()}var ${wd} = 0;`);
       jsLines.push(`${pad()}while (${convertExpr(cond)}) {`);
       indent++;
       jsLines.push(`${pad()}if (++${wd} > 10000) break;`);
@@ -1458,7 +1468,7 @@ export function transpileStToHaiwellJs(
       if (top && top.kind === 'WHILE') blockStack.pop();
     } else if (/^REPEAT\b/i.test(t)) {
       const wd = `__wd_${++loopCounter}`;
-      jsLines.push(`${pad()}let ${wd} = 0;`);
+      jsLines.push(`${pad()}var ${wd} = 0;`);
       jsLines.push(`${pad()}do {`);
       indent++;
       jsLines.push(`${pad()}if (++${wd} > 10000) break;`);
@@ -1490,7 +1500,11 @@ export function transpileStToHaiwellJs(
   for (const v of validation.variables) {
     if (v.section === 'VAR_OUTPUT' || v.section === 'VAR_IN_OUT') {
       const scadaTag = tagBindings[v.name] ?? v.name;
-      jsLines.push(`Tag.Write(${JSON.stringify(scadaTag)}, ${v.name});`);
+      if (apiStyle === 'HAIWELL_NATIVE_350') {
+        jsLines.push(`Variable.SetByFullName(${JSON.stringify(scadaTag)}, ${v.name});`);
+      } else {
+        jsLines.push(`Tag.Write(${JSON.stringify(scadaTag)}, ${v.name});`);
+      }
     }
   }
 

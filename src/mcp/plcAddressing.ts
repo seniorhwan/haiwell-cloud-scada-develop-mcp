@@ -27,6 +27,38 @@ export interface InvalidPlcAddress {
   hint: string;
 }
 
+/**
+ * Verified field-commissioned Modbus RTU Slave address mappings used inside
+ * Haiwell Cloud Scada 3.50.x Variable tables (0X=Coil, 1X=Discrete Input, 3X=Input Reg, 4X=Holding Reg).
+ */
+export const VENDOR_MODBUS_REGISTER_MAPS = {
+  HAIWELL_NATIVE_NOTATION: {
+    '0X': 'Coil (BOOL, RW, FC01/05/15, 0..65535)',
+    '1X': 'Discrete Input (BOOL, RO, FC02, 0..65535)',
+    '3X': 'Input Register (WORD, RO, FC04, 0..65535)',
+    '4X': 'Holding Register (WORD, RW, FC03/06/16, 0..65535)',
+    W: 'Internal HMI Word Memory (WORD/STRING, RW, 0..65535)',
+  },
+  MITSUBISHI_FX3U_MODBUS_RTU_SLAVE: {
+    serialConfigNote: 'FX3U-485ADP-MB: D8400=H3081 (9600-8-N-1 RTU), D8401=H10 (Slave), D8414=SlaveID',
+    areas: {
+      X0: '1X13312 (Discrete Input RO, octal X0..X7 -> 1X13312..1X13319)',
+      Y0: '0X13056 (Coil RW, octal Y0..Y7 -> 0X13056..0X13063)',
+      M0: '0X0 (Coil RW, M0..M7679 -> 0X0..0X7679)',
+      D0: '4X0 (Holding Register RW, D0..D7999 -> 4X0..4X7999)',
+    },
+  },
+  DELTA_DVP_ES2_MODBUS_RTU_SLAVE: {
+    serialConfigNote: 'DVP-ES2 COM2 RS-485: D1120=16#0081 (9600-8-N-1), D1121=SlaveID, SET M1143 (RTU), SET M1120',
+    areas: {
+      X0: '1X1024 (Discrete Input RO, octal X0..X7 -> 1X1024..1X1031)',
+      Y0: '0X1280 (Coil RW, octal Y0..Y7 -> 0X1280..0X1287)',
+      M0: '0X2048 (Coil RW, M0..M1535 -> 0X2048..0X3583)',
+      D0: '4X4096 (Holding Register RW, D0..D4999 -> 4X4096..4X9095)',
+    },
+  },
+} as const;
+
 export function getWordSpanForType(dataType: TagDataType): number {
   switch (dataType) {
     case 'BOOL':
@@ -158,12 +190,88 @@ export function validatePlcAddress(
       };
     }
 
+    // Native Haiwell Cloud Scada Modbus notation: 0X40, 1X13312, 3X100, 4X4196 (optional .0..15 bit slice on 3X/4X)
+    const haiwellModbusMatch = /^(0X|1X|3X|4X)(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
+    if (haiwellModbusMatch) {
+      const prefixArea = haiwellModbusMatch[1];
+      const idx = Number.parseInt(haiwellModbusMatch[2], 10);
+      const bitStr = haiwellModbusMatch[3];
+      if (idx < 0 || idx > 65535) {
+        return {
+          valid: false,
+          protocol,
+          input: rawAddress,
+          error: `Haiwell Modbus offset ${idx} out of 16-bit range (0..65535).`,
+          hint: `Use ${prefixArea}0..${prefixArea}65535.`,
+        };
+      }
+      const isCoilOrDi = prefixArea === '0X' || prefixArea === '1X';
+      if (bitStr !== undefined) {
+        const bit = Number.parseInt(bitStr, 10);
+        if (isCoilOrDi) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Bit register ${prefixArea}${idx} cannot have a bit suffix .${bitStr}.`,
+            hint: `Use ${prefixArea}${idx} directly.`,
+          };
+        }
+        if (bit < 0 || bit > 15) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Word bit offset .${bit} out of range (0..15).`,
+            hint: `Use ${prefixArea}${idx}.0 through ${prefixArea}${idx}.15.`,
+          };
+        }
+      }
+      const isRo = prefixArea === '1X' || prefixArea === '3X';
+      const isBit = isCoilOrDi || bitStr !== undefined;
+      const base1 = prefixArea === '0X' ? 1 : prefixArea === '1X' ? 10001 : prefixArea === '3X' ? 30001 : 40001;
+      const space = prefixArea === '3X' ? 'MODBUS_IR' : 'MODBUS_HR';
+      return {
+        valid: true,
+        protocol,
+        normalized: bitStr !== undefined ? `${prefixArea}${idx}.${Number.parseInt(bitStr, 10)}` : `${prefixArea}${idx}`,
+        kind: isBit ? 'BIT' : 'WORD',
+        readOnly: isRo,
+        modbusOffset0Based: idx,
+        modbusAddress1Based: base1 + idx,
+        wordAddressKey: !isBit ? { space, startIndex: idx } : undefined,
+      };
+    }
+
+    // Haiwell HMI internal word memory (e.g. W0..W65535)
+    const internalWMatch = /^W(\d+)$/.exec(upper);
+    if (internalWMatch) {
+      const idx = Number.parseInt(internalWMatch[1], 10);
+      if (idx < 0 || idx > 65535) {
+        return {
+          valid: false,
+          protocol,
+          input: rawAddress,
+          error: `Internal word offset W${idx} out of range (0..65535).`,
+          hint: 'Use W0..W65535.',
+        };
+      }
+      return {
+        valid: true,
+        protocol,
+        normalized: `W${idx}`,
+        kind: 'WORD',
+        readOnly: false,
+        wordAddressKey: { space: 'HAIWELL_INTERNAL_W', startIndex: idx },
+      };
+    }
+
     return {
       valid: false,
       protocol,
       input: rawAddress,
       error: `Unrecognized Modbus address "${rawAddress}".`,
-      hint: 'Use 40001, 30001, 10001, 00001, or HR:100 / IR:10 / COIL:0 / DI:0.',
+      hint: 'Use Haiwell notation (0X0, 1X1024, 3X0, 4X4096), 5/6-digit (40001, 30001, 10001, 00001), or HR:100 / IR:10 / COIL:0 / DI:0.',
     };
   }
 
