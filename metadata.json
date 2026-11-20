@@ -1,0 +1,6 @@
+{
+  "name": "Haiwell Cloud SCADA MCP Server",
+  "description": "Production-grade headless Model Context Protocol (MCP) server and agent skill suite for Haiwell Cloud SCADA Develop, featuring strict IEC 61131-3 validation, automated HMI layout generation, and MQTT/OPC UA protocol integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
