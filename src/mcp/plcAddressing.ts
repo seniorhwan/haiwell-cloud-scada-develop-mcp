@@ -16,7 +16,7 @@ export interface ValidatedPlcAddress {
   readOnly: boolean;
   modbusOffset0Based?: number;
   modbusAddress1Based?: number;
-  wordAddressKey?: { space: string; startIndex: number };
+  wordAddressKey?: { space: string; startIndex: number; unit?: 'WORD' | 'BYTE'; byteWidth?: number };
 }
 
 export interface InvalidPlcAddress {
@@ -170,18 +170,22 @@ export function validatePlcAddress(
   // 3. Siemens S7-1200 / S7-1500
   if (protocol === 'SIEMENS_S7_1200' || protocol === 'SIEMENS_S7_1500') {
     const upper = trimmed.toUpperCase();
-    const dbMatch = /^DB(\d+)\.(DBX(\d+)\.([0-7])|DB[BWD](\d+))$/.exec(upper);
+    const dbMatch = /^DB(\d+)\.(DBX(\d+)\.([0-7])|DB([BWD])(\d+))$/.exec(upper);
     if (dbMatch) {
       const dbNum = Number.parseInt(dbMatch[1], 10);
       const isBit = upper.includes('.DBX');
-      const byteOffset = Number.parseInt(dbMatch[3] ?? dbMatch[5], 10);
+      const sizeChar = dbMatch[5];
+      const byteOffset = Number.parseInt(dbMatch[3] ?? dbMatch[6], 10);
+      const byteWidth = sizeChar === 'D' ? 4 : sizeChar === 'W' ? 2 : 1;
       return {
         valid: true,
         protocol,
         normalized: upper,
         kind: isBit ? 'BIT' : 'WORD',
         readOnly: false,
-        wordAddressKey: !isBit ? { space: `S7_DB${dbNum}`, startIndex: Math.floor(byteOffset / 2) } : undefined,
+        wordAddressKey: !isBit
+          ? { space: `S7_DB${dbNum}_B`, startIndex: byteOffset, unit: 'BYTE', byteWidth }
+          : undefined,
       };
     }
     const ioMatch = /^([IQM])([BWD])?(\d+)(?:\.([0-7]))?$/.exec(upper);
@@ -200,13 +204,16 @@ export function validatePlcAddress(
           hint: 'Use I0.0, Q0.1, M10.2, IW64, MW100, MD200, or DB1.DBD0.',
         };
       }
+      const byteWidth = size === 'D' ? 4 : size === 'W' ? 2 : 1;
       return {
         valid: true,
         protocol,
         normalized: upper,
         kind: isBit ? 'BIT' : 'WORD',
         readOnly: area === 'I',
-        wordAddressKey: !isBit ? { space: `S7_${area}`, startIndex: Math.floor(byteIdx / 2) } : undefined,
+        wordAddressKey: !isBit
+          ? { space: `S7_${area}_B`, startIndex: byteIdx, unit: 'BYTE', byteWidth }
+          : undefined,
       };
     }
     return {
@@ -284,7 +291,7 @@ export function validatePlcAddress(
       normalized: upper,
       kind: bit !== undefined ? 'BIT' : 'WORD',
       readOnly: false,
-      wordAddressKey: bit === undefined ? { space: `OMRON_${m[1]}`, startIndex: idx } : undefined,
+      wordAddressKey: bit === undefined ? { space: `OMRON_${m[1] === 'DM' ? 'D' : m[1]}`, startIndex: idx } : undefined,
     };
   }
 
@@ -452,7 +459,10 @@ export function detectWordOverlapConflicts(
     exactSeen.set(exactKey, tag);
 
     if (parsed.wordAddressKey) {
-      const span = Math.max(1, tag.wordSpan ?? getWordSpanForType(tag.dataType));
+      const isByteUnit = parsed.wordAddressKey.unit === 'BYTE';
+      const span = isByteUnit
+        ? Math.max(1, parsed.wordAddressKey.byteWidth ?? 1)
+        : Math.max(1, tag.wordSpan ?? getWordSpanForType(tag.dataType));
       for (let offset = 0; offset < span; offset++) {
         const slotKey = `${tag.deviceId}:${parsed.wordAddressKey.space}:${parsed.wordAddressKey.startIndex + offset}`;
         const occupant = wordOccupancy.get(slotKey);
@@ -463,7 +473,7 @@ export function detectWordOverlapConflicts(
             deviceId: tag.deviceId,
             addressA: `${occupant.address} (${occupant.dataType})`,
             addressB: `${tag.address} (${tag.dataType})`,
-            reason: `Multi-word register overlap at word slot ${slotKey}.`,
+            reason: `${isByteUnit ? 'Byte' : 'Multi-word'} register overlap at slot ${slotKey}.`,
           });
           break;
         }

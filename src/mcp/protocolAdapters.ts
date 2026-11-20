@@ -102,21 +102,67 @@ export function buildMqttPayload(
 
 const BLOCKED_PROBE_HOSTS = [
   /^169\.254\./,
-  /^metadata\.google\.internal$/i,
+  /^::ffff:169\.254\./i,
+  /^::ffff:a9fe:/i,
+  /^fe80:/i,
+  /^0+\.0+\.0+\.0+$/,
+  /^::$/,
+  /^metadata(\.google\.internal|\.goog)?$/i,
   /^100\.100\.100\.200$/,
+  /^::ffff:100\.100\.100\.200$/i,
+  /^::ffff:6464:64c8$/i,
   /^fd00:ec2::254$/i,
 ];
+
+function decodeNumericIpv4(raw: string): string | null {
+  const s = raw.trim();
+  // Single integer IPv4 (decimal e.g. 2852039166 or hex e.g. 0xa9fea9fe or octal)
+  if (/^(0x[0-9a-f]+|0[0-7]+|\d+)$/i.test(s)) {
+    const num = s.toLowerCase().startsWith('0x')
+      ? Number.parseInt(s, 16)
+      : s.startsWith('0') && s.length > 1
+        ? Number.parseInt(s, 8)
+        : Number.parseInt(s, 10);
+    if (Number.isInteger(num) && num >= 0 && num <= 0xffffffff) {
+      return [(num >>> 24) & 255, (num >>> 16) & 255, (num >>> 8) & 255, num & 255].join('.');
+    }
+  }
+  // Dotted octal/hex octets (e.g. 0251.0376.0251.0376 or 0xa9.0xfe.0xa9.0xfe)
+  const parts = s.split('.');
+  if (parts.length === 4 && parts.every((p) => /^(0x[0-9a-f]+|0[0-7]+|\d+)$/i.test(p))) {
+    const octets = parts.map((p) =>
+      p.toLowerCase().startsWith('0x')
+        ? Number.parseInt(p, 16)
+        : p.startsWith('0') && p.length > 1
+          ? Number.parseInt(p, 8)
+          : Number.parseInt(p, 10)
+    );
+    if (octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+      return octets.join('.');
+    }
+  }
+  return null;
+}
+
+export function isBlockedSsrfHost(rawHost: string): boolean {
+  const host = rawHost.trim().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+  if (!host) return true;
+  if (BLOCKED_PROBE_HOSTS.some((re) => re.test(host))) return true;
+  const decoded = decodeNumericIpv4(host);
+  if (decoded && BLOCKED_PROBE_HOSTS.some((re) => re.test(decoded))) return true;
+  return false;
+}
 
 export async function probeTcpEndpoint(
   host: string,
   port: number,
   timeoutMs = 1500
 ): Promise<{ reachable: boolean; latencyMs: number; error?: string }> {
-  if (!host || BLOCKED_PROBE_HOSTS.some((re) => re.test(host.trim()))) {
+  if (isBlockedSsrfHost(host)) {
     return {
       reachable: false,
       latencyMs: 0,
-      error: `SSRF_BLOCK: Probing cloud metadata/link-local host "${host}" is forbidden.`,
+      error: `SSRF_BLOCK: Probing cloud metadata/link-local/unspecified host "${host}" is forbidden.`,
     };
   }
   if (!Number.isInteger(port) || port < 1 || port > 65535) {

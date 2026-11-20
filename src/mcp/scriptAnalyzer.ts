@@ -95,6 +95,69 @@ function stripJsCommentsAndStrings(code: string): string {
   return out;
 }
 
+function stripJsCommentsOnly(code: string): string {
+  let out = '';
+  let i = 0;
+  let state: 'NORMAL' | 'SINGLE' | 'DOUBLE' | 'TEMPLATE' | 'LINE_COMMENT' | 'BLOCK_COMMENT' = 'NORMAL';
+
+  while (i < code.length) {
+    const ch = code[i];
+    const next = code[i + 1] ?? '';
+
+    if (state === 'LINE_COMMENT') {
+      if (ch === '\n') {
+        state = 'NORMAL';
+        out += '\n';
+      }
+      i++;
+      continue;
+    }
+    if (state === 'BLOCK_COMMENT') {
+      if (ch === '*' && next === '/') {
+        state = 'NORMAL';
+        i += 2;
+      } else {
+        if (ch === '\n') out += '\n';
+        i++;
+      }
+      continue;
+    }
+    if (state === 'SINGLE' || state === 'DOUBLE' || state === 'TEMPLATE') {
+      const quote = state === 'SINGLE' ? "'" : state === 'DOUBLE' ? '"' : '`';
+      if (ch === '\\') {
+        out += ch + next;
+        i += 2;
+        continue;
+      }
+      if (ch === quote) state = 'NORMAL';
+      out += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === '/' && next === '/') {
+      state = 'LINE_COMMENT';
+      i += 2;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      state = 'BLOCK_COMMENT';
+      i += 2;
+      continue;
+    }
+    if (ch === "'") state = 'SINGLE';
+    else if (ch === '"') state = 'DOUBLE';
+    else if (ch === '`') state = 'TEMPLATE';
+
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+const hasOwn = (obj: Record<string, TagDefinition>, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(obj, key);
+
 export function validateHaiwellScript(
   code: string,
   knownTags: Record<string, TagDefinition>,
@@ -114,6 +177,7 @@ export function validateHaiwellScript(
     return { valid: false, referencedTags: [], writtenTags: [], diagnostics };
   }
 
+  const noComments = stripJsCommentsOnly(code);
   const scrubbed = stripJsCommentsAndStrings(code);
 
   // Trigger metadata sanity checks
@@ -126,7 +190,7 @@ export function validateHaiwellScript(
     });
   }
   if (triggerMeta?.trigger === 'TAG_CHANGE') {
-    if (!triggerMeta.triggerTag || !knownTags[triggerMeta.triggerTag]) {
+    if (!triggerMeta.triggerTag || !hasOwn(knownTags, triggerMeta.triggerTag)) {
       diagnostics.push({
         code: 'HWJS-TRG-002',
         severity: 'ERROR',
@@ -163,13 +227,13 @@ export function validateHaiwellScript(
     });
   }
 
-  // Extract Tag.Read("...")
+  // Extract Tag.Read("...") from comment-stripped code
   const readRegex = /Tag\.Read\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
   let m: RegExpExecArray | null;
-  while ((m = readRegex.exec(code)) !== null) {
+  while ((m = readRegex.exec(noComments)) !== null) {
     const tagName = m[1];
     referencedTags.add(tagName);
-    if (!knownTags[tagName]) {
+    if (!hasOwn(knownTags, tagName)) {
       diagnostics.push({
         code: 'HWJS-TAG-001',
         severity: 'ERROR',
@@ -179,13 +243,13 @@ export function validateHaiwellScript(
     }
   }
 
-  // Extract Tag.Write("...", val)
+  // Extract Tag.Write("...", val) from comment-stripped code
   const writeRegex = /Tag\.Write\s*\(\s*['"]([^'"]+)['"]\s*,/g;
-  while ((m = writeRegex.exec(code)) !== null) {
+  while ((m = writeRegex.exec(noComments)) !== null) {
     const tagName = m[1];
     referencedTags.add(tagName);
     writtenTags.add(tagName);
-    const tag = knownTags[tagName];
+    const tag = hasOwn(knownTags, tagName) ? knownTags[tagName] : undefined;
     if (!tag) {
       diagnostics.push({
         code: 'HWJS-TAG-002',
@@ -202,7 +266,7 @@ export function validateHaiwellScript(
           fixHint: `Write to a RW coil/register instead of read-only input "${tagName}".`,
         });
       }
-      if ((tag.safetyClass === 'SIL2' || tag.safetyClass === 'SIL3') && !code.includes('EStop_OK')) {
+      if ((tag.safetyClass === 'SIL2' || tag.safetyClass === 'SIL3') && !noComments.includes('EStop_OK')) {
         diagnostics.push({
           code: 'HWJS-SAFE-003',
           severity: 'WARNING',

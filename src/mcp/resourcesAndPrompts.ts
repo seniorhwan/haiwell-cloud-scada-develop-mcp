@@ -356,7 +356,7 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
 2. haiwell_device_add + haiwell_device_validate_address for all registers
 3. haiwell_tag_upsert_batch with explicit scaling, safeMin/safeMax, and SIL safetyClass (zero multi-word overlap)
 4. haiwell_iec61131_validate -> haiwell_iec61131_pou_save (zero errors required)
-5. haiwell_hmi_screen_generate (ISA_101_HIGH_PERFORMANCE, zero collisions, zero overflowWidgets)
+5. haiwell_hmi_pid_compile (for P&ID topologies) or haiwell_hmi_screen_generate (ISA_101_HIGH_PERFORMANCE), then haiwell_hmi_spatial_verify (confirm 0px collisions/port gaps) and optionally haiwell_hmi_desktop_bridge_export
 6. haiwell_alarm_configure (ISA-18.2 priorities + multi-channel push)
 7. haiwell_mqtt_configure + haiwell_mqtt_topic_bind (Sparkplug B + TLS)
 8. haiwell_opcua_configure + haiwell_opcua_nodeset_map (Basic256Sha256 + SignAndEncrypt)
@@ -381,7 +381,7 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
           role: 'user' as const,
           content: {
             type: 'text' as const,
-            text: `Query tags in "${pid}" via haiwell_tag_query, generate an ISA-101 HMI screen "${args.screenTitle ?? 'Process Overview'}" via haiwell_hmi_screen_generate, confirm overflowWidgets=[], zero collisions, zero touchTargetViolations, and render via haiwell_hmi_screen_render_svg.`,
+            text: `Query tags in "${pid}" via haiwell_tag_query, inspect components via haiwell_hmi_toolbox_catalog, then compile a zero-collision HMI screen "${args.screenTitle ?? 'Process Overview'}" via haiwell_hmi_pid_compile (for process P&ID flows) or haiwell_hmi_screen_generate. Verify with haiwell_hmi_spatial_verify (0 collisions, 0 out-of-bounds, 0 touchTargetViolations, maxPipePortGapPx<=1), repair if needed via haiwell_hmi_layout_solve, render SVG via haiwell_hmi_screen_render_svg, and export native/UIA build artifacts via haiwell_hmi_desktop_bridge_export.`,
           },
         },
       ];
@@ -424,7 +424,7 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
 export function generateAgentSkillMarkdown(mcpEndpointUrl: string): string {
   return `---
 name: haiwell-cloud-scada-develop
-description: Zero-UI, production-grade headless MCP server for Haiwell Cloud SCADA Develop. Covers 15 industrial automation domains across 42 strictly validated tools for VS Code, Google Antigravity, Claude Code, and Codex.
+description: Zero-UI, production-grade headless MCP server for Haiwell Cloud SCADA Develop. Covers 15 industrial automation domains across ${HAIWELL_TOOLS.length} strictly validated tools for VS Code, Google Antigravity, Claude Code, and Codex.
 mcp_endpoint: ${mcpEndpointUrl}
 transports: [streamable-http, stdio]
 ---
@@ -436,13 +436,13 @@ transports: [streamable-http, stdio]
 2. **Validate multi-vendor PLC addresses**: call \`haiwell_device_validate_address\` with the device protocol (Haiwell, Modbus, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, BACnet) before creating tags. Never overlap 32-bit/64-bit multi-word register spans.
 3. **Dry-run control writes**: invoke \`haiwell_tag_read_write\` or \`haiwell_tag_batch_io\` with \`dryRun: true\` before committing live writes.
 4. **Gate PLC logic on IEC 61131-3 validation**: resolve all \`ERROR\` diagnostics from \`haiwell_iec61131_validate\` before \`haiwell_iec61131_pou_save\`.
-5. **Run FAT simulation + safety audit**: run \`haiwell_simulation_step\` (E-Stop trip test) and \`haiwell_project_audit_safety\` (\`deploymentReady: true\`) before \`haiwell_project_export\`.
+5. **Compile HMI spatially (never blind drag-and-drop)**: use \`haiwell_hmi_pid_compile\` / \`haiwell_hmi_screen_generate\`, verify with \`haiwell_hmi_spatial_verify\`, auto-repair with \`haiwell_hmi_layout_solve\`, and export native/UIA plans with \`haiwell_hmi_desktop_bridge_export\`.
+6. **Run FAT simulation + safety audit**: run \`haiwell_simulation_step\` (E-Stop trip test) and \`haiwell_project_audit_safety\` (\`deploymentReady: true\`) before \`haiwell_project_export\`.
 
 ## Complete Tool Index (${HAIWELL_TOOLS.length} Tools across 15 Domains)
 ${HAIWELL_CAPABILITY_MATRIX.map(
   (d) => `- **${d.title}**: ${d.tools.map((t) => `\`${t}\``).join(', ')}`
-).join('\n')}
-`;
+).join('\n')}`;
 }
 
 export function generateClientConfigs(baseUrl: string) {

@@ -54,11 +54,13 @@ export function evaluateProjectAlarms(project: HaiwellProject): AlarmEvalSummary
   const newlyTriggered: ActiveAlarmEvent[] = [];
   const cleared: ActiveAlarmEvent[] = [];
 
+  const hasOwnTag = (name: string) => Object.prototype.hasOwnProperty.call(project.tags, name);
+
   for (const alm of project.alarms) {
     if (!alm.enabled) continue;
     if (alm.shelvedUntil && Date.parse(alm.shelvedUntil) > nowMs) continue;
 
-    const tag = project.tags[alm.tagName];
+    const tag = hasOwnTag(alm.tagName) ? project.tags[alm.tagName] : undefined;
     if (!tag) continue;
 
     const cur = toNumeric(tag.currentValue);
@@ -82,6 +84,9 @@ export function evaluateProjectAlarms(project: HaiwellProject): AlarmEvalSummary
         triggeredAt: now,
       };
       project.alarmHistory.push(ev);
+      if (project.alarmHistory.length > 500) {
+        project.alarmHistory.splice(0, project.alarmHistory.length - 500);
+      }
       newlyTriggered.push(ev);
     } else if (!tripped && existingActive) {
       existingActive.clearedAt = now;
@@ -107,6 +112,7 @@ export interface SimulationStepInput {
 
 export function runSimulationSteps(project: HaiwellProject, input: SimulationStepInput) {
   const steps = Math.max(1, Math.min(input.steps ?? 1, 50));
+  const hasOwnTag = (name: string) => Object.prototype.hasOwnProperty.call(project.tags, name);
   const trace: {
     step: number;
     triggeredEvents: string[];
@@ -120,7 +126,7 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
     // 1. Apply raw ADC injections with linear scaling
     if (s === 1 && input.injectRawAdcValues) {
       for (const [tagName, rawVal] of Object.entries(input.injectRawAdcValues)) {
-        const tag = project.tags[tagName];
+        const tag = hasOwnTag(tagName) ? project.tags[tagName] : undefined;
         if (!tag) continue;
         tag.previousValue = tag.currentValue;
         tag.currentValue = tag.scaling ? applyLinearScaling(rawVal, tag.scaling) : rawVal;
@@ -132,7 +138,7 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
     // 2. Apply direct tag injections on step 1
     if (s === 1 && input.injectTagValues) {
       for (const [tagName, val] of Object.entries(input.injectTagValues)) {
-        const tag = project.tags[tagName];
+        const tag = hasOwnTag(tagName) ? project.tags[tagName] : undefined;
         if (!tag) continue;
         tag.previousValue = tag.currentValue;
         tag.currentValue = val;
@@ -143,7 +149,7 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
 
     // 3. Evaluate E-Stop hardware fail-safe de-energization if enabled
     const outputsForcedSafe: string[] = [];
-    const eStopTag = project.tags['EStop_OK'];
+    const eStopTag = hasOwnTag('EStop_OK') ? project.tags['EStop_OK'] : undefined;
     const eStopTripped = Boolean(eStopTag && eStopTag.currentValue === false);
     if (eStopTripped && input.enforceEStopSafeState !== false) {
       for (const tag of Object.values(project.tags)) {
@@ -163,7 +169,7 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
     const triggeredEvents: string[] = [];
     for (const rule of project.eventTriggers) {
       if (!rule.enabled) continue;
-      const src = project.tags[rule.sourceTag];
+      const src = hasOwnTag(rule.sourceTag) ? project.tags[rule.sourceTag] : undefined;
       if (!src) continue;
       const cur = toNumeric(src.currentValue);
       const prev = src.previousValue !== undefined ? toNumeric(src.previousValue) : cur;
@@ -178,7 +184,7 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
       if (fired) {
         triggeredEvents.push(`${rule.id}:${rule.actionType}->${rule.targetId}`);
         if (rule.actionType === 'WRITE_TAG' && rule.actionValue !== undefined) {
-          const targetTag = project.tags[rule.targetId];
+          const targetTag = hasOwnTag(rule.targetId) ? project.tags[rule.targetId] : undefined;
           if (targetTag && targetTag.access !== 'RO' && !eStopTripped) {
             targetTag.previousValue = targetTag.currentValue;
             targetTag.currentValue = rule.actionValue;
@@ -199,6 +205,11 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
       eStopTripped,
       outputsForcedSafe,
     });
+
+    // 6. Real PLC end-of-scan latch: previousValue := currentValue so edges/ROC do not phantom-refire on steps 2..N
+    for (const tag of Object.values(project.tags)) {
+      tag.previousValue = tag.currentValue;
+    }
   }
 
   return {

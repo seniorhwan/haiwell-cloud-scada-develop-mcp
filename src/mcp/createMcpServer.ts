@@ -85,7 +85,7 @@ export function createHaiwellMcpServer(store: HaiwellProjectStore = defaultProje
     new ResourceTemplate('haiwell://project/{projectId}/{section}', {
       list: async () => ({
         resources: store.listProjects().flatMap((p) =>
-          (['tree', 'opcua-nodeset2', 'safety-audit', 'export-bundle', 'tags-csv'] as const).map((sec) => ({
+          (['summary', 'tree', 'opcua-nodeset2', 'safety-audit', 'export-bundle', 'tags-csv'] as const).map((sec) => ({
             uri: `haiwell://project/${p.id}/${sec}`,
             name: `${p.id} (${sec})`,
             mimeType: sec === 'opcua-nodeset2' ? 'application/xml' : sec === 'tags-csv' ? 'text/csv' : 'application/json',
@@ -94,7 +94,7 @@ export function createHaiwellMcpServer(store: HaiwellProjectStore = defaultProje
       }),
     }),
     {
-      description: 'Read tree, opcua-nodeset2, safety-audit, export-bundle, or tags-csv for any projectId.',
+      description: 'Read summary, tree, opcua-nodeset2, safety-audit, export-bundle, or tags-csv for any projectId.',
     },
     async (uri) => {
       const payload = readHaiwellResource(uri.href, store);

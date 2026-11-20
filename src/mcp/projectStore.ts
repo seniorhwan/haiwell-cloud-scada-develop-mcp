@@ -620,6 +620,16 @@ export class HaiwellProjectStore {
         deps.push(`event_trigger:${ev.id}`);
       }
     }
+    for (const sch of project.schedules) {
+      if (sch.actionType === 'WRITE_TAG' && sch.targetId === tagName) {
+        deps.push(`schedule:${sch.id}`);
+      }
+    }
+    for (const pou of project.pous) {
+      if (pou.boundTags.includes(tagName)) {
+        deps.push(`pou:${pou.id}`);
+      }
+    }
     return deps;
   }
 
@@ -653,13 +663,41 @@ export class HaiwellProjectStore {
 
   readMqttLoopback(topicFilter?: string): { topic: string; payload: unknown; qos: number; timestamp: string }[] {
     if (!topicFilter) return [...this.mqttLoopbackBuffer];
-    const regexStr = topicFilter
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\\\+/g, '[^/]+')
-      .replace(/#$/, '.*');
-    const regex = new RegExp(`^${regexStr}$`);
-    return this.mqttLoopbackBuffer.filter((msg) => regex.test(msg.topic));
+    return this.mqttLoopbackBuffer.filter((msg) => matchMqttTopicFilter(topicFilter, msg.topic));
   }
+}
+
+/**
+ * Exact O(N) MQTT 3.1.1 §4.7 topic filter matcher (zero RegExp / zero ReDoS).
+ * - Multi-level "#" matches parent level (e.g. "plant/#" matches "plant" AND "plant/a/b").
+ * - Single-level "+" matches exactly one level.
+ * - Leading "#" or "+" does NOT match "$"-prefixed broker system topics (§4.7.2).
+ */
+export function matchMqttTopicFilter(filter: string, topic: string): boolean {
+  if (!filter || !topic) return false;
+  if (topic.startsWith('$') && (filter.startsWith('#') || filter.startsWith('+'))) {
+    return false;
+  }
+  const fLevels = filter.split('/');
+  const tLevels = topic.split('/');
+
+  for (let i = 0; i < fLevels.length; i++) {
+    const f = fLevels[i];
+    if (f === '#') {
+      return i === fLevels.length - 1;
+    }
+    if (i >= tLevels.length) {
+      return false;
+    }
+    if (f !== '+' && f !== tLevels[i]) {
+      return false;
+    }
+  }
+
+  // MQTT §4.7.1.2: "sport/tennis/player1/#" matches "sport/tennis/player1"
+  if (fLevels.length === tLevels.length) return true;
+  if (fLevels.length === tLevels.length + 1 && fLevels[fLevels.length - 1] === '#') return true;
+  return false;
 }
 
 export const defaultProjectStore = new HaiwellProjectStore(process.env.HAIWELL_WORKSPACE_DIR);

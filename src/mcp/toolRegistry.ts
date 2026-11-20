@@ -1,10 +1,11 @@
 /**
  * Hardened Single-Source-of-Truth MCP Tool Registry:
- * 42 production-grade tools across 15 Haiwell Cloud SCADA Develop domains.
- * Features LLM-tolerant input normalization, strict Zod v4 validation,
- * multi-vendor PLC register & multi-word overlap detection, binary type/range guards,
- * ISA-18.2 deduplicating alarm state machine, atomic batch I/O, snapshots/rollback,
- * referential-integrity deletion, faceplates, webhooks, and headless FAT simulation.
+ * 47 production-grade tools across 15 Haiwell Cloud SCADA Develop domains.
+ * Features LLM-tolerant input normalization (prototype-pollution safe), strict Zod v4 validation,
+ * multi-vendor PLC register & multi-word/byte overlap detection, binary type/range guards,
+ * spatial HMI P&ID compilation & desktop bridge export, ISA-18.2 deduplicating alarm state machine,
+ * atomic batch I/O, snapshots/rollback, full referential-integrity deletion, faceplates, webhooks,
+ * and headless FAT simulation.
  */
 
 import { z } from 'zod';
@@ -38,6 +39,7 @@ import {
 import {
   buildMqttPayload,
   generateOpcUaNodeSet2Xml,
+  isBlockedSsrfHost,
   mapTagTypeToOpcUa,
   probeTcpEndpoint,
   validateMqttTopic,
@@ -45,7 +47,7 @@ import {
 import { validateHaiwellScript } from './scriptAnalyzer';
 import { evaluateProjectAlarms, runSimulationSteps } from './simulationEngine';
 import type { HaiwellProjectStore } from './projectStore';
-import type { HaiwellDomain, HaiwellProject, PlcDriverProtocol, ToolSafetyTier } from './types';
+import type { HaiwellDomain, HaiwellProject, PlcDriverProtocol, TagDefinition, ToolSafetyTier } from './types';
 
 export interface HaiwellToolDefinition<TShape extends z.ZodRawShape = z.ZodRawShape> {
   name: string;
@@ -146,8 +148,34 @@ function validateCronExpression(cron: string): { valid: boolean; error?: string 
   return { valid: true };
 }
 
+const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function getOwnTag(project: HaiwellProject, tagName: string): TagDefinition | undefined {
+  return Object.prototype.hasOwnProperty.call(project.tags, tagName) ? project.tags[tagName] : undefined;
+}
+
+function hasOwnTag(project: HaiwellProject, tagName: string): boolean {
+  return Object.prototype.hasOwnProperty.call(project.tags, tagName);
+}
+
+function stripPrototypeKeysDeep(val: unknown): unknown {
+  if (Array.isArray(val)) {
+    return val.map(stripPrototypeKeysDeep);
+  }
+  if (val && typeof val === 'object') {
+    const clean: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+      if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+      clean[k] = stripPrototypeKeysDeep(v);
+    }
+    return clean;
+  }
+  return val;
+}
+
 /**
  * Safely normalizes common LLM client serialization quirks before strict Zod validation:
+ * - Recursively strips prototype-pollution keys (__proto__, constructor, prototype)
  * - Converts explicit `null` on optional keys to `undefined`
  * - Parses stringified JSON arrays/objects when a client double-encodes complex arguments
  */
@@ -168,19 +196,20 @@ export function normalizeAgentArgs(raw: unknown): Record<string, unknown> {
 
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
     if (v === null) continue;
     if (typeof v === 'string') {
       const trimmed = v.trim();
       if ((trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('{') && trimmed.endsWith('}'))) {
         try {
-          out[k] = JSON.parse(trimmed);
+          out[k] = stripPrototypeKeysDeep(JSON.parse(trimmed));
           continue;
         } catch {
           // Keep literal string (e.g., LD/FBD JSON source intentionally passed as string!)
         }
       }
     }
-    out[k] = v;
+    out[k] = stripPrototypeKeysDeep(v);
   }
   // Keep `source` as string for IEC 61131-3 tools even if LD/FBD JSON array was passed as array
   if (out.source !== undefined && typeof out.source !== 'string') {
@@ -189,25 +218,36 @@ export function normalizeAgentArgs(raw: unknown): Record<string, unknown> {
   return out;
 }
 
+function escapeCsvCell(val: unknown, protectFormula = false): string {
+  let s = val === undefined || val === null ? '' : String(val);
+  if (protectFormula && /^[=+\-@\t\r]/.test(s)) {
+    s = `'${s}`;
+  }
+  if (/[",\r\n]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
 export function buildProjectExportBundle(project: HaiwellProject) {
   const tagCsvHeader =
     'name,scope,deviceId,address,modbus0Based,modbus1Based,wordSpan,dataType,access,unit,safeMin,safeMax,safetyClass,requiresInterlock';
   const tagCsvRows = Object.values(project.tags).map((t) =>
     [
-      t.name,
-      t.scope,
-      t.deviceId ?? '',
-      t.address ?? '',
-      t.modbusOffset0Based ?? '',
-      t.modbusAddress1Based ?? '',
-      t.wordSpan ?? '',
-      t.dataType,
-      t.access,
-      t.unit ?? '',
-      t.safeMin ?? '',
-      t.safeMax ?? '',
-      t.safetyClass,
-      t.requiresInterlock,
+      escapeCsvCell(t.name, true),
+      escapeCsvCell(t.scope),
+      escapeCsvCell(t.deviceId ?? '', true),
+      escapeCsvCell(t.address ?? '', true),
+      escapeCsvCell(t.modbusOffset0Based ?? ''),
+      escapeCsvCell(t.modbusAddress1Based ?? ''),
+      escapeCsvCell(t.wordSpan ?? ''),
+      escapeCsvCell(t.dataType),
+      escapeCsvCell(t.access),
+      escapeCsvCell(t.unit ?? '', true),
+      escapeCsvCell(t.safeMin ?? ''),
+      escapeCsvCell(t.safeMax ?? ''),
+      escapeCsvCell(t.safetyClass),
+      escapeCsvCell(t.requiresInterlock),
     ].join(',')
   );
 
@@ -398,6 +438,55 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
     });
   }
 
+  // 6. Dangling tag reference audit across alarms, OPC UA, MQTT, triggers, recipes, trends, Data-Link, reports
+  const pushDangling = (domain: HaiwellDomain, target: string, tagName: string) => {
+    findings.push({
+      code: 'AUD-DANGLING-TAG',
+      severity: 'HIGH',
+      domain,
+      target,
+      message: `${target} references missing SCADA tag "${tagName}".`,
+      remediation: `Create tag "${tagName}" or remove the stale reference before deployment.`,
+    });
+  };
+  for (const alm of project.alarms) {
+    if (!hasOwnTag(project, alm.tagName)) pushDangling('alarms', `alarm:${alm.id}`, alm.tagName);
+  }
+  for (const node of project.opcua.nodes) {
+    if (!hasOwnTag(project, node.tagName)) pushDangling('opcua', `opcua_node:${node.nodeId}`, node.tagName);
+  }
+  for (const bind of project.mqtt.bindings) {
+    for (const tn of bind.tags) {
+      if (!hasOwnTag(project, tn)) pushDangling('mqtt', `mqtt_binding:${bind.id}`, tn);
+    }
+  }
+  for (const ev of project.eventTriggers) {
+    if (!hasOwnTag(project, ev.sourceTag)) pushDangling('scripts', `event_trigger:${ev.id}`, ev.sourceTag);
+    if (ev.actionType === 'WRITE_TAG' && !hasOwnTag(project, ev.targetId)) {
+      pushDangling('scripts', `event_trigger:${ev.id}`, ev.targetId);
+    }
+  }
+  for (const rcp of project.recipes) {
+    for (const tn of rcp.tagNames) {
+      if (!hasOwnTag(project, tn)) pushDangling('recipes', `recipe:${rcp.id}`, tn);
+    }
+  }
+  for (const trd of project.trends) {
+    for (const tn of trd.tagNames) {
+      if (!hasOwnTag(project, tn)) pushDangling('trends', `trend:${trd.id}`, tn);
+    }
+  }
+  for (const dl of project.dataLinks) {
+    for (const col of dl.columnMappings) {
+      if (!hasOwnTag(project, col.tagName)) pushDangling('datalink', `datalink:${dl.id}`, col.tagName);
+    }
+  }
+  for (const rp of project.reports) {
+    for (const col of rp.columns) {
+      if (!hasOwnTag(project, col.tagName)) pushDangling('operations', `report:${rp.id}`, col.tagName);
+    }
+  }
+
   const critical = findings.filter((f) => f.severity === 'CRITICAL').length;
   const high = findings.filter((f) => f.severity === 'HIGH').length;
   return {
@@ -421,7 +510,7 @@ function checkTagWriteSafety(
   value: unknown,
   confirmSafetyOverride: boolean
 ) {
-  const tag = project.tags[tagName];
+  const tag = getOwnTag(project, tagName);
   if (!tag) return { ok: false as const, blockedBy: 'TAG_NOT_FOUND', message: `Tag "${tagName}" not found.` };
   if (tag.access === 'RO') {
     return {
@@ -450,7 +539,7 @@ function checkTagWriteSafety(
       };
     }
   }
-  const estop = project.tags['EStop_OK'];
+  const estop = getOwnTag(project, 'EStop_OK');
   if (tag.requiresInterlock && estop && estop.currentValue === false) {
     return {
       ok: false as const,
@@ -490,6 +579,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       height: z.number().int().min(240).max(2160).default(800),
       defaultLanguage: z.string().min(2).max(12).default('en-US'),
       cloudEnabled: z.boolean().default(true),
+      overwrite: z.boolean().default(false),
     }),
     sampleInput: {
       id: 'prj_pump_station_02',
@@ -499,6 +589,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       height: 600,
     },
     handler: (input, store) => {
+      if (!input.overwrite && store.listProjects().some((p) => p.id === input.id)) {
+        throw new Error(
+          `PROJECT_ALREADY_EXISTS: Project "${input.id}" already exists. Choose a new id or pass overwrite=true explicitly.`
+        );
+      }
       const now = new Date().toISOString();
       const project: HaiwellProject = {
         id: input.id,
@@ -715,7 +810,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const project = store.getProject(input.projectId);
 
       if (input.entityType === 'tag') {
-        if (!project.tags[input.entityId]) throw new Error(`Tag "${input.entityId}" not found.`);
+        if (!hasOwnTag(project, input.entityId)) throw new Error(`Tag "${input.entityId}" not found.`);
         const deps = store.findTagDependents(project, input.entityId);
         if (deps.length > 0 && !input.cascade) {
           return {
@@ -729,12 +824,48 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         if (input.cascade) {
           project.alarms = project.alarms.filter((a) => a.tagName !== input.entityId);
           project.opcua.nodes = project.opcua.nodes.filter((n) => n.tagName !== input.entityId);
-          project.mqtt.bindings.forEach((b) => {
-            b.tags = b.tags.filter((t) => t !== input.entityId);
-          });
+          project.mqtt.bindings = project.mqtt.bindings
+            .map((b) => ({ ...b, tags: b.tags.filter((t) => t !== input.entityId) }))
+            .filter((b) => b.tags.length > 0);
           project.screens.forEach((s) => {
             s.widgets = s.widgets.filter((w) => w.tagName !== input.entityId);
           });
+          project.recipes = project.recipes
+            .map((r) => ({
+              ...r,
+              tagNames: r.tagNames.filter((t) => t !== input.entityId),
+              records: r.records.map((rec) => {
+                const nextValues = { ...rec.values };
+                delete nextValues[input.entityId];
+                return { ...rec, values: nextValues };
+              }),
+            }))
+            .filter((r) => r.tagNames.length > 0);
+          project.trends = project.trends
+            .map((tr) => ({ ...tr, tagNames: tr.tagNames.filter((t) => t !== input.entityId) }))
+            .filter((tr) => tr.tagNames.length > 0);
+          project.dataLinks = project.dataLinks
+            .map((dl) => ({
+              ...dl,
+              columnMappings: dl.columnMappings.filter((c) => c.tagName !== input.entityId),
+            }))
+            .filter((dl) => dl.columnMappings.length > 0);
+          project.reports = project.reports
+            .map((rp) => ({ ...rp, columns: rp.columns.filter((c) => c.tagName !== input.entityId) }))
+            .filter((rp) => rp.columns.length > 0);
+          project.eventTriggers = project.eventTriggers.filter(
+            (ev) => ev.sourceTag !== input.entityId && !(ev.actionType === 'WRITE_TAG' && ev.targetId === input.entityId)
+          );
+          project.schedules = project.schedules.filter(
+            (sch) => !(sch.actionType === 'WRITE_TAG' && sch.targetId === input.entityId)
+          );
+          project.pous = project.pous.map((pou) => ({
+            ...pou,
+            boundTags: pou.boundTags.filter((t) => t !== input.entityId),
+          }));
+          project.scripts = project.scripts.filter(
+            (sc) => sc.triggerTag !== input.entityId && !sc.referencedTags.includes(input.entityId)
+          );
         }
         store.saveProject(project);
         return { deleted: true, entityType: 'tag', entityId: input.entityId, cascadedDependents: deps };
@@ -760,9 +891,57 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             project.tags[t].deviceId = undefined;
             project.tags[t].scope = 'INTERNAL';
           }
+          if (project.transparentTunnel?.targetDeviceId === input.entityId) {
+            project.transparentTunnel = null;
+          }
         }
         store.saveProject(project);
         return { deleted: true, entityType: 'device', entityId: input.entityId };
+      }
+
+      if (input.entityType === 'screen') {
+        if (!project.screens.some((s) => s.id === input.entityId)) {
+          throw new Error(`screen "${input.entityId}" not found.`);
+        }
+        const screenDeps: string[] = [];
+        for (const s of project.screens) {
+          if (s.id === input.entityId) continue;
+          for (const w of s.widgets) {
+            if (w.targetScreenId === input.entityId) screenDeps.push(`screen:${s.id}/widget:${w.id}`);
+          }
+        }
+        for (const cam of project.cameras) {
+          if (cam.screenId === input.entityId) screenDeps.push(`camera:${cam.id}`);
+        }
+        for (const ev of project.eventTriggers) {
+          if (ev.actionType === 'OPEN_SCREEN' && ev.targetId === input.entityId) {
+            screenDeps.push(`event_trigger:${ev.id}`);
+          }
+        }
+        if (screenDeps.length > 0 && !input.cascade) {
+          return {
+            deleted: false,
+            blockedBy: 'REFERENTIAL_INTEGRITY',
+            dependents: screenDeps,
+            message: `Cannot delete screen "${input.entityId}" because ${screenDeps.length} reference(s) point to it. Pass cascade=true to prune.`,
+          };
+        }
+        project.screens = project.screens.filter((s) => s.id !== input.entityId);
+        if (input.cascade) {
+          for (const s of project.screens) {
+            s.widgets = s.widgets.map((w) =>
+              w.targetScreenId === input.entityId ? { ...w, targetScreenId: undefined } : w
+            );
+          }
+          project.cameras = project.cameras.map((c) =>
+            c.screenId === input.entityId ? { ...c, screenId: undefined } : c
+          );
+          project.eventTriggers = project.eventTriggers.filter(
+            (ev) => !(ev.actionType === 'OPEN_SCREEN' && ev.targetId === input.entityId)
+          );
+        }
+        store.saveProject(project);
+        return { deleted: true, entityType: 'screen', entityId: input.entityId, cascadedDependents: screenDeps, revision: project.revision };
       }
 
       if (input.entityType === 'widget') {
@@ -783,7 +962,6 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
 
       switch (input.entityType) {
         case 'pou': project.pous = removeById(project.pous); break;
-        case 'screen': project.screens = removeById(project.screens); break;
         case 'faceplate': project.faceplates = removeById(project.faceplates); break;
         case 'script': project.scripts = removeById(project.scripts); break;
         case 'event_trigger': project.eventTriggers = removeById(project.eventTriggers); break;
@@ -804,7 +982,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         case 'camera': project.cameras = removeById(project.cameras); break;
       }
       store.saveProject(project);
-      return { deleted: true, entityType: input.entityType, entityId: input.entityId, revision: project.revision };
+      return { deleted: true, entityType: 'entityType' in input ? input.entityType : 'unknown', entityId: input.entityId, revision: project.revision };
     },
   }),
 
@@ -1074,6 +1252,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const candidateTags = { ...project.tags };
 
       for (const t of input.tags) {
+        if (FORBIDDEN_PROTO_KEYS.has(t.name) || Object.prototype.hasOwnProperty.call(Object.prototype, t.name)) {
+          errors.push({
+            tag: t.name,
+            code: 'RESERVED_IDENTIFIER',
+            error: `Tag name "${t.name}" is a reserved JavaScript Object.prototype identifier.`,
+          });
+          continue;
+        }
         let modbus0: number | undefined;
         let modbus1: number | undefined;
         let normalizedAddr = t.address;
@@ -1138,7 +1324,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         }
 
         const defaultVal = t.dataType === 'BOOL' ? false : t.dataType === 'STRING' ? '' : 0;
-        const proposedInit = t.initialValue ?? project.tags[t.name]?.currentValue ?? defaultVal;
+        const existingTag = getOwnTag(project, t.name);
+        const proposedInit = t.initialValue ?? existingTag?.currentValue ?? defaultVal;
         const valCheck = validateTagValueForType(t.dataType, proposedInit);
         if (!valCheck.valid) {
           errors.push({ tag: t.name, code: valCheck.code, error: valCheck.error });
@@ -1270,7 +1457,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
-      const tag = project.tags[input.tagName];
+      const tag = getOwnTag(project, input.tagName);
       if (!tag) throw new Error(`Tag "${input.tagName}" not found in project "${project.id}".`);
 
       if (input.operation === 'READ') {
@@ -1380,7 +1567,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         const values: Record<string, unknown> = {};
         const missing: string[] = [];
         for (const n of names) {
-          const t = project.tags[n];
+          const t = getOwnTag(project, n);
           if (!t) missing.push(n);
           else values[n] = { value: t.currentValue, unit: t.unit, quality: t.quality, type: t.dataType };
         }
@@ -1506,7 +1693,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         return { saved: false, reason: 'IEC_61131_3_VALIDATION_FAILED', validation };
       }
 
-      const missingTags = input.boundTags.filter((t) => !project.tags[t]);
+      const missingTags = input.boundTags.filter((t) => !hasOwnTag(project, t));
       const pou = {
         id: input.id,
         name: validation.pouName ?? input.name,
@@ -1555,6 +1742,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           trigger: 'CYCLIC',
           intervalMs: input.cyclicIntervalMs,
         });
+        if (!scriptCheck.valid) {
+          return {
+            transpiled: true,
+            registered: false,
+            jsCode: result.jsCode,
+            scriptValidation: scriptCheck,
+            message: 'Transpiled JS failed SCADA script validation (e.g., undeclared tag or RO write); script was NOT registered.',
+          };
+        }
         const entry = {
           id: input.registerScriptId,
           name: result.validation.pouName ?? input.registerScriptId,
@@ -1562,14 +1758,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           intervalMs: input.cyclicIntervalMs,
           code: result.jsCode,
           referencedTags: scriptCheck.referencedTags,
-          validated: scriptCheck.valid,
+          validated: true,
           updatedAt: new Date().toISOString(),
         };
         const idx = project.scripts.findIndex((s) => s.id === entry.id);
         if (idx >= 0) project.scripts[idx] = entry;
         else project.scripts.push(entry);
         store.saveProject(project);
-        return { transpiled: true, registeredScript: entry, scriptValidation: scriptCheck };
+        return { transpiled: true, registered: true, registeredScript: entry, scriptValidation: scriptCheck };
       }
       return { transpiled: true, jsCode: result.jsCode, validationSummary: result.validation.summary };
     },
@@ -2118,15 +2314,29 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
-      if (!project.tags[input.sourceTag]) throw new Error(`sourceTag "${input.sourceTag}" does not exist.`);
+      if (!hasOwnTag(project, input.sourceTag)) throw new Error(`sourceTag "${input.sourceTag}" does not exist.`);
+      if ((input.condition === 'GT' || input.condition === 'LT' || input.condition === 'EQ') && input.threshold === undefined) {
+        throw new Error(`Condition "${input.condition}" requires an explicit numeric threshold.`);
+      }
       if (input.actionType === 'WRITE_TAG') {
-        const t = project.tags[input.targetId];
+        const t = getOwnTag(project, input.targetId);
         if (!t) throw new Error(`Target tag "${input.targetId}" does not exist.`);
         if (t.access === 'RO') throw new Error(`Target tag "${input.targetId}" is read-only.`);
+        if (input.actionValue === undefined) throw new Error('WRITE_TAG event trigger requires actionValue.');
+        const valCheck = validateTagValueForType(t.dataType, input.actionValue);
+        if (!valCheck.valid) throw new Error(`Invalid actionValue for "${t.name}": ${valCheck.error}`);
       } else if (input.actionType === 'OPEN_SCREEN' && !project.screens.some((s) => s.id === input.targetId)) {
         throw new Error(`Target screen "${input.targetId}" does not exist.`);
       } else if (input.actionType === 'RUN_SCRIPT' && !project.scripts.some((s) => s.id === input.targetId)) {
         throw new Error(`Target script "${input.targetId}" does not exist.`);
+      } else if (input.actionType === 'DOWNLOAD_RECIPE') {
+        const [grpId, recId] = input.targetId.split(':');
+        const grp = project.recipes.find((r) => r.id === grpId);
+        if (!grp || !grp.records.some((r) => r.recordId === recId)) {
+          throw new Error(`Target recipe "${input.targetId}" not found (use format groupId:recordId).`);
+        }
+      } else if (input.actionType === 'SEND_WEBHOOK' && !project.webhooks.some((w) => w.id === input.targetId)) {
+        throw new Error(`Target webhook "${input.targetId}" does not exist.`);
       }
       const idx = project.eventTriggers.findIndex((e) => e.id === input.id);
       if (idx >= 0) project.eventTriggers[idx] = input;
@@ -2177,7 +2387,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
-      if (!project.tags[input.tagName]) {
+      if (!hasOwnTag(project, input.tagName)) {
         throw new Error(`Alarm tag "${input.tagName}" does not exist in project "${project.id}".`);
       }
       const alarm = { ...input, priority: input.priority as 1 | 2 | 3 | 4, enabled: true };
@@ -2327,7 +2537,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const project = store.getProject(input.projectId);
       const topicCheck = validateMqttTopic(input.topic, input.direction);
       if (!topicCheck.valid) return { bound: false, topicValidation: topicCheck };
-      const missingTags = input.tags.filter((t) => !project.tags[t]);
+      const missingTags = input.tags.filter((t) => !hasOwnTag(project, t));
       if (missingTags.length > 0) return { bound: false, error: `Unknown tags: ${missingTags.join(', ')}` };
       if (input.allowRemoteWrite && !project.mqtt.tlsEnabled) {
         return { bound: false, error: 'SAFETY_BLOCK: Remote MQTT write requires TLS enabled on broker config.' };
@@ -2417,6 +2627,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       authMode: 'Username',
     },
     handler: (input, store) => {
+      if ((input.securityPolicy === 'None') !== (input.securityMode === 'None')) {
+        throw new Error(
+          `OPCUA_SECURITY_MISMATCH: securityPolicy="${input.securityPolicy}" cannot be combined with securityMode="${input.securityMode}". Per OPC UA Part 6, None policy requires None mode and vice versa.`
+        );
+      }
       const project = store.getProject(input.projectId);
       project.opcua = {
         ...project.opcua,
@@ -2459,7 +2674,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const ns = project.opcua.namespaceIndex;
       const mapped: typeof project.opcua.nodes = [];
       for (const tagName of input.tagNames) {
-        const tag = project.tags[tagName];
+        const tag = getOwnTag(project, tagName);
         if (!tag) throw new Error(`Tag "${tagName}" not found in project "${project.id}".`);
         const uaType = mapTagTypeToOpcUa(tag.dataType);
         const node = {
@@ -2519,7 +2734,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       }
       const node = project.opcua.nodes.find((n) => n.nodeId === input.nodeId);
       if (!node) throw new Error(`OPC UA nodeId "${input.nodeId}" not found.`);
-      const tag = project.tags[node.tagName];
+      const tag = getOwnTag(project, node.tagName);
       if (!tag) throw new Error(`Bound SCADA tag "${node.tagName}" missing.`);
       if (input.action === 'READ_NODE') {
         return {
@@ -2588,11 +2803,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
+      const sanitizedValues: Record<string, number | boolean | string> = {};
       for (const tagName of input.tagNames) {
-        const tag = project.tags[tagName];
+        const tag = getOwnTag(project, tagName);
         if (!tag) throw new Error(`Recipe tag "${tagName}" does not exist.`);
         if (tag.access === 'RO') throw new Error(`Recipe tag "${tagName}" is read-only (RO).`);
-        const val = input.record.values[tagName];
+        const val = Object.prototype.hasOwnProperty.call(input.record.values, tagName)
+          ? input.record.values[tagName]
+          : undefined;
         if (val === undefined) throw new Error(`Recipe record missing value for tag "${tagName}".`);
         const tc = validateTagValueForType(tag.dataType, val);
         if (!tc.valid) throw new Error(`Recipe value for "${tagName}": ${tc.error}`);
@@ -2604,13 +2822,17 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             throw new Error(`Recipe value ${tc.normalizedValue} for "${tagName}" violates safeMax (${tag.safeMax}).`);
           }
         }
+        sanitizedValues[tagName] = tc.normalizedValue;
       }
       let group = project.recipes.find((r) => r.id === input.groupId);
       if (!group) {
-        group = { id: input.groupId, name: input.groupName, tagNames: input.tagNames, records: [] };
+        group = { id: input.groupId, name: input.groupName, tagNames: [...input.tagNames], records: [] };
         project.recipes.push(group);
+      } else {
+        group.name = input.groupName;
+        group.tagNames = Array.from(new Set([...group.tagNames, ...input.tagNames]));
       }
-      const rec = { ...input.record, updatedAt: new Date().toISOString() };
+      const rec = { ...input.record, values: sanitizedValues, updatedAt: new Date().toISOString() };
       const rIdx = group.records.findIndex((r) => r.recordId === rec.recordId);
       if (rIdx >= 0) group.records[rIdx] = rec;
       else group.records.push(rec);
@@ -2672,12 +2894,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       // Atomic pre-flight validation of ALL recipe tags before mutating ANY tag!
       const rejections: { tagName: string; blockedBy: string; message: string }[] = [];
       const rollbackSnapshot: Record<string, number | boolean | string> = {};
+      const normalizedWrites: Record<string, number | boolean | string> = {};
       for (const [k, v] of Object.entries(rec.values)) {
         const check = checkTagWriteSafety(project, k, v, input.confirmSafetyOverride);
         if (!check.ok) {
           rejections.push({ tagName: k, blockedBy: check.blockedBy, message: check.message });
         } else {
           rollbackSnapshot[k] = check.tag.currentValue;
+          normalizedWrites[k] = check.normalizedValue;
         }
       }
       if (rejections.length > 0) {
@@ -2691,8 +2915,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
 
       if (!input.dryRun) {
         const now = new Date().toISOString();
-        for (const [k, v] of Object.entries(rec.values)) {
-          const tag = project.tags[k];
+        for (const [k, v] of Object.entries(normalizedWrites)) {
+          const tag = getOwnTag(project, k)!;
           tag.previousValue = tag.currentValue;
           tag.currentValue = v;
           tag.updatedAt = now;
@@ -2737,7 +2961,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (input.action === 'UPSERT_GROUP') {
         if (!input.name || !input.tagNames?.length) throw new Error('UPSERT_GROUP requires name and tagNames.');
         for (const tn of input.tagNames) {
-          if (!project.tags[tn]) throw new Error(`Trend tag "${tn}" does not exist.`);
+          if (!hasOwnTag(project, tn)) throw new Error(`Trend tag "${tn}" does not exist.`);
         }
         const group = {
           id: input.groupId,
@@ -2759,9 +2983,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (!group) throw new Error(`Trend group "${input.groupId}" not found.`);
       if (input.action === 'CAPTURE_SAMPLE') {
         const values: Record<string, number> = {};
-        for (const t of group.tagNames) values[t] = Number(project.tags[t]?.currentValue ?? 0);
+        for (const t of group.tagNames) values[t] = Number(getOwnTag(project, t)?.currentValue ?? 0);
         const sample = { timestamp: new Date().toISOString(), values };
         group.samples.push(sample);
+        if (group.samples.length > 2000) {
+          group.samples.splice(0, group.samples.length - 2000);
+        }
         store.saveProject(project);
         return { captured: true, sample, totalSamples: group.samples.length };
       }
@@ -2824,7 +3051,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         if (SQL_RESERVED.has(m.column.toUpperCase())) throw new Error(`Column "${m.column}" is a reserved SQL keyword.`);
         if (seenCols.has(m.column.toLowerCase())) throw new Error(`Duplicate column mapping "${m.column}".`);
         seenCols.add(m.column.toLowerCase());
-        if (!project.tags[m.tagName]) throw new Error(`Data-Link mapped tag "${m.tagName}" does not exist.`);
+        if (!hasOwnTag(project, m.tagName)) throw new Error(`Data-Link mapped tag "${m.tagName}" does not exist.`);
       }
       const cfg = { ...input, parameterizedOnly: true };
       const idx = project.dataLinks.findIndex((d) => d.id === cfg.id);
@@ -2871,11 +3098,20 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const parsed = new URL(input.url);
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        throw new Error(`SAFETY_BLOCK: Unsupported webhook protocol "${parsed.protocol}". Only https:// (or http:// when tlsRequired=false) is allowed.`);
+      }
       if (input.tlsRequired && parsed.protocol !== 'https:') {
         throw new Error('SAFETY_BLOCK: tlsRequired=true forbids non-HTTPS webhook URLs.');
       }
-      if (/^(169\.254\.|metadata\.google\.internal$|100\.100\.100\.200$)/i.test(parsed.hostname)) {
-        throw new Error(`SSRF_BLOCK: Forbidden cloud metadata host "${parsed.hostname}".`);
+      if (isBlockedSsrfHost(parsed.hostname)) {
+        throw new Error(`SSRF_BLOCK: Forbidden cloud metadata/link-local/unspecified host "${parsed.hostname}".`);
+      }
+      const testRendered = input.payloadTemplate.replace(/\{\{[A-Za-z0-9_]+\}\}/g, 'sample');
+      try {
+        JSON.parse(testRendered);
+      } catch {
+        throw new Error('INVALID_PAYLOAD_TEMPLATE: payloadTemplate must produce valid JSON when {{placeholders}} are substituted.');
       }
       const project = store.getProject(input.projectId);
       const idx = project.webhooks.findIndex((w) => w.id === input.id);
@@ -2924,7 +3160,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         throw new Error(`Scheduled target script "${input.targetId}" does not exist.`);
       }
       if (input.actionType === 'WRITE_TAG') {
-        const t = project.tags[input.targetId];
+        const t = getOwnTag(project, input.targetId);
         if (!t) throw new Error(`Scheduled target tag "${input.targetId}" does not exist.`);
         if (t.access === 'RO') throw new Error(`Scheduled target tag "${input.targetId}" is read-only.`);
       }
@@ -2983,7 +3219,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       for (const c of input.columns) {
-        if (!project.tags[c.tagName]) throw new Error(`Report column tag "${c.tagName}" does not exist.`);
+        if (!hasOwnTag(project, c.tagName)) throw new Error(`Report column tag "${c.tagName}" does not exist.`);
       }
       const idx = project.reports.findIndex((r) => r.id === input.id);
       if (idx >= 0) project.reports[idx] = input;
@@ -3058,10 +3294,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
-      project.translations[input.locale] = {
-        ...(project.translations[input.locale] ?? {}),
-        ...input.entries,
-      };
+      const safeEntries: Record<string, string> = {};
+      for (const [k, v] of Object.entries(input.entries)) {
+        if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+        safeEntries[k] = v;
+      }
+      const existing = Object.prototype.hasOwnProperty.call(project.translations, input.locale)
+        ? project.translations[input.locale]
+        : {};
+      project.translations[input.locale] = { ...existing, ...safeEntries };
       store.saveProject(project);
       return {
         locale: input.locale,

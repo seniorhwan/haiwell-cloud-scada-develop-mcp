@@ -933,7 +933,7 @@ export function compileDesktopAutomationBridge(
   }));
 
   const winRegex = options.windowTitleRegex ?? '.*Haiwell Cloud SCADA Develop.*';
-  const pyPlanJson = JSON.stringify(uiaExecutionSteps, null, 2);
+  const pyPlanB64 = Buffer.from(JSON.stringify(uiaExecutionSteps), 'utf8').toString('base64');
 
   const pywinautoScript = [
     `#!/usr/bin/env python3`,
@@ -946,18 +946,29 @@ export function compileDesktopAutomationBridge(
     `  3. Read back Property Grid values via UIA to assert 100% placement & binding fidelity.`,
     `Dependencies: pip install pywinauto`,
     `"""`,
-    `import json, time`,
+    `import base64, json, re, time`,
     `from pywinauto import Application`,
     ``,
     `WINDOW_TITLE_RE = ${JSON.stringify(winRegex)}`,
-    `STEPS = json.loads(r'''${pyPlanJson.replace(/'''/g, "\\'\\'\\'")}''')`,
+    `STEPS = json.loads(base64.b64decode("${pyPlanB64}").decode("utf-8"))`,
+    ``,
+    `def escape_send_keys(text: str) -> str:`,
+    `    # Escape pywinauto SendKeys modifier metacharacters: + ^ % ~ ( ) { }`,
+    `    return re.sub(r"([+^%~(){}])", r"{\\1}", text)`,
     ``,
     `def set_and_verify_property(prop_grid, prop_name: str, expected_val, retries: int = 3):`,
     `    expected_str = str(expected_val)`,
     `    for attempt in range(1, retries + 1):`,
     `        row = prop_grid.child_window(title=prop_name, control_type="DataItem")`,
     `        row.click_input()`,
-    `        row.type_keys("^a{BACKSPACE}" + expected_str + "{ENTER}", with_spaces=True)`,
+    `        if hasattr(row, "set_edit_text"):`,
+    `            try:`,
+    `                row.set_edit_text(expected_str)`,
+    `                row.type_keys("{ENTER}")`,
+    `            except Exception:`,
+    `                row.type_keys("^a{BACKSPACE}" + escape_send_keys(expected_str) + "{ENTER}", with_spaces=True)`,
+    `        else:`,
+    `            row.type_keys("^a{BACKSPACE}" + escape_send_keys(expected_str) + "{ENTER}", with_spaces=True)`,
     `        time.sleep(0.05)`,
     `        actual = str(row.legacy_properties().get("Value", "")).strip()`,
     `        if actual == expected_str:`,

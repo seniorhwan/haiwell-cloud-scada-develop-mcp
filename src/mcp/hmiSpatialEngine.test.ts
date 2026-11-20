@@ -136,7 +136,11 @@ test('desktop bridge exports native screen manifest + closed-loop pywinauto prop
   assert.ok(bridge.uiaExecutionSteps.length >= 4);
   assert.match(bridge.pywinautoScript, /set_and_verify_property/);
   assert.match(bridge.pywinautoScript, /postConditionAssertions/);
-  assert.match(bridge.pywinautoScript, /Pump1_Run_Cmd/);
+  const b64Match = /base64\.b64decode\("([A-Za-z0-9+/=]+)"\)/.exec(bridge.pywinautoScript);
+  assert.ok(b64Match, 'Expected Base64-encoded STEPS payload in pywinautoScript');
+  const decodedStepsJson = Buffer.from(b64Match[1], 'base64').toString('utf8');
+  assert.match(decodedStepsJson, /Pump1_Run_Cmd/);
+  assert.doesNotThrow(() => JSON.parse(decodedStepsJson));
 
   // Refuses to export bridge if screen has unfixed collisions
   const broken = prj.screens.find((s) => s.id === 'scr_pid_bridge')!;

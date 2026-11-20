@@ -1303,18 +1303,25 @@ export function transpileStToHaiwellJs(
   let inVar = false;
   const bodyLines: { text: string; line: number }[] = [];
   rawLines.forEach((raw, idx) => {
-    const t = raw.trim();
-    if (!t) return;
-    if (/^(PROGRAM|FUNCTION_BLOCK|FUNCTION|END_PROGRAM|END_FUNCTION_BLOCK|END_FUNCTION)\b/i.test(t)) return;
-    if (/^(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_TEMP|VAR)\b/i.test(t)) {
-      inVar = true;
-      return;
+    // Normalize single-line VAR ... END_VAR blocks identical to validateStructuredText
+    const expandedSegments = raw
+      .replace(/\b(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_TEMP|VAR)\b/gi, '\n$1\n')
+      .replace(/\bEND_VAR\b/gi, '\nEND_VAR\n')
+      .split('\n');
+    for (const seg of expandedSegments) {
+      const t = seg.trim();
+      if (!t) continue;
+      if (/^(PROGRAM|FUNCTION_BLOCK|FUNCTION|END_PROGRAM|END_FUNCTION_BLOCK|END_FUNCTION)\b/i.test(t)) continue;
+      if (/^(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_TEMP|VAR)\b/i.test(t)) {
+        inVar = true;
+        continue;
+      }
+      if (/^END_VAR\b/i.test(t)) {
+        inVar = false;
+        continue;
+      }
+      if (!inVar) bodyLines.push({ text: t, line: idx + 1 });
     }
-    if (/^END_VAR\b/i.test(t)) {
-      inVar = false;
-      return;
-    }
-    if (!inVar) bodyLines.push({ text: t, line: idx + 1 });
   });
 
   const statements = expandBodyStatements(bodyLines);
@@ -1348,22 +1355,44 @@ export function transpileStToHaiwellJs(
     return converted.replace(/__STR_(\d+)__/g, (_, idx) => tokens[Number(idx)]);
   };
 
-  let inCase = false;
+  interface TranspileFrame {
+    kind: 'IF' | 'CASE' | 'FOR' | 'WHILE' | 'REPEAT';
+    caseBranchOpen?: boolean;
+    watchdogVar?: string;
+  }
+  const blockStack: TranspileFrame[] = [];
+  let loopCounter = 0;
+  const topFrame = () => blockStack[blockStack.length - 1];
+
+  const closeOpenCaseBranch = () => {
+    const top = topFrame();
+    if (top && top.kind === 'CASE' && top.caseBranchOpen) {
+      jsLines.push(`${pad()}break;`);
+      indent = Math.max(0, indent - 1);
+      top.caseBranchOpen = false;
+    }
+  };
 
   for (const stmt of statements) {
     const t = stmt.text;
+    const top = topFrame();
+
     if (/^IF\b/i.test(t)) {
       const cond = t.replace(/^IF\s+/i, '').replace(/\s+THEN$/i, '');
       jsLines.push(`${pad()}if (${convertExpr(cond)}) {`);
       indent++;
+      blockStack.push({ kind: 'IF' });
     } else if (/^ELSIF\b/i.test(t)) {
       indent = Math.max(0, indent - 1);
       const cond = t.replace(/^ELSIF\s+/i, '').replace(/\s+THEN$/i, '');
       jsLines.push(`${pad()}} else if (${convertExpr(cond)}) {`);
       indent++;
     } else if (/^ELSE\b/i.test(t)) {
-      if (inCase) {
+      if (top && top.kind === 'CASE') {
+        closeOpenCaseBranch();
         jsLines.push(`${pad()}default:`);
+        indent++;
+        top.caseBranchOpen = true;
       } else {
         indent = Math.max(0, indent - 1);
         jsLines.push(`${pad()}} else {`);
@@ -1372,29 +1401,80 @@ export function transpileStToHaiwellJs(
     } else if (/^END_IF\b/i.test(t)) {
       indent = Math.max(0, indent - 1);
       jsLines.push(`${pad()}}`);
+      if (top && top.kind === 'IF') blockStack.pop();
     } else if (/^CASE\b/i.test(t)) {
       const sel = t.replace(/^CASE\s+/i, '').replace(/\s+OF$/i, '');
       jsLines.push(`${pad()}switch (${convertExpr(sel)}) {`);
       indent++;
-      inCase = true;
+      blockStack.push({ kind: 'CASE', caseBranchOpen: false });
     } else if (/^END_CASE\b/i.test(t)) {
+      closeOpenCaseBranch();
       indent = Math.max(0, indent - 1);
       jsLines.push(`${pad()}}`);
-      inCase = false;
-    } else if (inCase && /^(-?\d+(?:\s*,\s*-?\d+)*)\s*:$/.test(t)) {
+      if (topFrame()?.kind === 'CASE') blockStack.pop();
+    } else if (top && top.kind === 'CASE' && /^(-?\d+(?:\s*,\s*-?\d+)*)\s*:$/.test(t)) {
+      closeOpenCaseBranch();
       const nums = t.replace(/:$/, '').split(',').map((s) => s.trim());
       for (const n of nums) jsLines.push(`${pad()}case ${n}:`);
+      indent++;
+      top.caseBranchOpen = true;
     } else if (/^FOR\b/i.test(t)) {
       const m = /^FOR\s+([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(.+?)\s+TO\s+(.+?)(?:\s+BY\s+(.+?))?\s+DO$/i.exec(t);
       if (m) {
         const [, iter, start, end, step] = m;
-        const stepExpr = step ? `${iter} += ${convertExpr(step)}` : `${iter}++`;
-        jsLines.push(`${pad()}for (${iter} = ${convertExpr(start)}; ${iter} <= ${convertExpr(end)}; ${stepExpr}) {`);
+        const endJs = convertExpr(end);
+        const startJs = convertExpr(start);
+        let condJs = `${iter} <= ${endJs}`;
+        let stepJs = `${iter}++`;
+        if (step) {
+          const stepJsExpr = convertExpr(step);
+          const numericStep = Number(step.trim());
+          stepJs = `${iter} += (${stepJsExpr})`;
+          if (Number.isFinite(numericStep)) {
+            condJs = numericStep < 0 ? `${iter} >= ${endJs}` : `${iter} <= ${endJs}`;
+          } else {
+            condJs = `((${stepJsExpr}) >= 0 ? ${iter} <= ${endJs} : ${iter} >= ${endJs})`;
+          }
+        }
+        jsLines.push(`${pad()}for (${iter} = ${startJs}; ${condJs}; ${stepJs}) {`);
         indent++;
+        blockStack.push({ kind: 'FOR' });
       }
     } else if (/^END_FOR\b/i.test(t)) {
       indent = Math.max(0, indent - 1);
       jsLines.push(`${pad()}}`);
+      if (top && top.kind === 'FOR') blockStack.pop();
+    } else if (/^WHILE\b/i.test(t)) {
+      const cond = t.replace(/^WHILE\s+/i, '').replace(/\s+DO$/i, '');
+      const wd = `__wd_${++loopCounter}`;
+      jsLines.push(`${pad()}let ${wd} = 0;`);
+      jsLines.push(`${pad()}while (${convertExpr(cond)}) {`);
+      indent++;
+      jsLines.push(`${pad()}if (++${wd} > 10000) break;`);
+      blockStack.push({ kind: 'WHILE', watchdogVar: wd });
+    } else if (/^END_WHILE\b/i.test(t)) {
+      indent = Math.max(0, indent - 1);
+      jsLines.push(`${pad()}}`);
+      if (top && top.kind === 'WHILE') blockStack.pop();
+    } else if (/^REPEAT\b/i.test(t)) {
+      const wd = `__wd_${++loopCounter}`;
+      jsLines.push(`${pad()}let ${wd} = 0;`);
+      jsLines.push(`${pad()}do {`);
+      indent++;
+      jsLines.push(`${pad()}if (++${wd} > 10000) break;`);
+      blockStack.push({ kind: 'REPEAT', watchdogVar: wd });
+    } else if (/^UNTIL\b/i.test(t)) {
+      const cond = t.replace(/^UNTIL\s+/i, '').replace(/;$/, '').trim();
+      indent = Math.max(0, indent - 1);
+      jsLines.push(`${pad()}} while (!(${convertExpr(cond)}));`);
+      if (top && top.kind === 'REPEAT') blockStack.pop();
+    } else if (/^END_REPEAT\b/i.test(t)) {
+      // Closed at UNTIL; pop defensively if UNTIL was absent
+      if (top && top.kind === 'REPEAT') {
+        indent = Math.max(0, indent - 1);
+        jsLines.push(`${pad()}} while (false);`);
+        blockStack.pop();
+      }
     } else if (/^EXIT\s*;?$/i.test(t)) {
       jsLines.push(`${pad()}break;`);
     } else if (/^RETURN\s*;?$/i.test(t)) {
@@ -1404,7 +1484,6 @@ export function transpileStToHaiwellJs(
       const lhs = t.slice(0, sep).trim();
       const rhs = t.slice(sep + 2).replace(/;$/, '').trim();
       jsLines.push(`${pad()}${lhs} = ${convertExpr(rhs)};`);
-      if (inCase) jsLines.push(`${pad()}break;`);
     }
   }
 
