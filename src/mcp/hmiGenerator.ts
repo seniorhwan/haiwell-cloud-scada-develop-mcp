@@ -1,10 +1,17 @@
 /**
- * Automated HMI Screen Layout Generator & Collision Validator for Haiwell Cloud SCADA Develop.
- * Enforces ISA-101 High-Performance HMI conventions, bounds checking, overlap detection,
- * unified PC/Web/Mobile scaling metadata, and deterministic headless SVG output.
+ * Hardened ISA-101 HMI Auto-Layout Engine, Touch-Target Validator,
+ * Faceplate Template Expander, Navigation Graph Verifier, & SVG Generator.
+ * Never silently drops overflowing widgets!
  */
 
-import type { HmiScreen, HmiWidget, HmiWidgetType, TagDefinition } from './types';
+import type {
+  HaiwellTargetHardware,
+  HmiFaceplateTemplate,
+  HmiScreen,
+  HmiWidget,
+  HmiWidgetType,
+  TagDefinition,
+} from './types';
 
 export interface LayoutCollision {
   widgetA: string;
@@ -17,8 +24,19 @@ export interface HmiLayoutValidation {
   collisions: LayoutCollision[];
   outOfBounds: string[];
   unresolvedTags: string[];
+  brokenNavTargets: string[];
+  touchTargetViolations: string[];
   isa101Notices: string[];
 }
+
+const INTERACTIVE_WIDGET_TYPES = new Set<HmiWidgetType>([
+  'BIT_BUTTON',
+  'NUMERIC_INPUT',
+  'PUMP',
+  'VALVE',
+  'RECIPE_SELECTOR',
+  'NAV_BAR',
+]);
 
 export function detectWidgetCollisions(widgets: HmiWidget[]): LayoutCollision[] {
   const collisions: LayoutCollision[] = [];
@@ -42,12 +60,17 @@ export function detectWidgetCollisions(widgets: HmiWidget[]): LayoutCollision[] 
 
 export function validateHmiScreen(
   screen: HmiScreen,
-  knownTags: Record<string, TagDefinition>
+  knownTags: Record<string, TagDefinition>,
+  options: { knownScreenIds?: Set<string>; targetHardware?: HaiwellTargetHardware } = {}
 ): HmiLayoutValidation {
   const collisions = detectWidgetCollisions(screen.widgets);
   const outOfBounds: string[] = [];
   const unresolvedTags: string[] = [];
+  const brokenNavTargets: string[] = [];
+  const touchTargetViolations: string[] = [];
   const isa101Notices: string[] = [];
+
+  const isTouchPanel = Boolean(options.targetHardware?.startsWith('CLOUD_HMI_'));
 
   for (const w of screen.widgets) {
     if (w.x < 0 || w.y < 0 || w.x + w.width > screen.width || w.y + w.height > screen.height) {
@@ -59,9 +82,15 @@ export function validateHmiScreen(
     if (w.writeEnabled && w.tagName && knownTags[w.tagName]?.access === 'RO') {
       isa101Notices.push(`Widget "${w.id}" enables write on read-only tag "${w.tagName}".`);
     }
+    if (w.targetScreenId && options.knownScreenIds && !options.knownScreenIds.has(w.targetScreenId)) {
+      brokenNavTargets.push(`${w.id}->${w.targetScreenId}`);
+    }
+    if (isTouchPanel && (INTERACTIVE_WIDGET_TYPES.has(w.type) || w.writeEnabled) && (w.width < 44 || w.height < 44)) {
+      touchTargetViolations.push(`${w.id} (${w.width}x${w.height}px < 44x44px minimum touch target)`);
+    }
   }
 
-  if (screen.layoutStandard === 'ISA_101_HIGH_PERFORMANCE') {
+  if (screen.layoutStandard === 'ISA_101_HIGH_PERFORMANCE' && !screen.isPopup) {
     const hasAlarmBanner = screen.widgets.some((w) => w.type === 'ALARM_BANNER');
     if (!hasAlarmBanner) {
       isa101Notices.push('ISA-101 recommends a dedicated top ALARM_BANNER on Level-2/3 operator displays.');
@@ -69,10 +98,17 @@ export function validateHmiScreen(
   }
 
   return {
-    valid: collisions.length === 0 && outOfBounds.length === 0 && unresolvedTags.length === 0,
+    valid:
+      collisions.length === 0 &&
+      outOfBounds.length === 0 &&
+      unresolvedTags.length === 0 &&
+      brokenNavTargets.length === 0 &&
+      touchTargetViolations.length === 0,
     collisions,
     outOfBounds,
     unresolvedTags,
+    brokenNavTargets,
+    touchTargetViolations,
     isa101Notices,
   };
 }
@@ -92,6 +128,7 @@ export interface AutoLayoutSpec {
     label: string;
     tagName?: string;
     writeEnabled?: boolean;
+    targetScreenId?: string;
     unit?: string;
     min?: number;
     max?: number;
@@ -100,14 +137,28 @@ export interface AutoLayoutSpec {
   }[];
 }
 
+export interface AutoLayoutResult {
+  screen: HmiScreen;
+  overflowWidgets: string[];
+}
+
 export function generateAutoLayoutScreen(spec: AutoLayoutSpec): HmiScreen {
+  return generateAutoLayoutScreenDetailed(spec).screen;
+}
+
+/**
+ * Dynamically computes row heights so all widgets fit within viewport without silent drops.
+ * If even compact minimum rows (52px) cannot fit all items, explicitly reports overflowWidgets.
+ */
+export function generateAutoLayoutScreenDetailed(spec: AutoLayoutSpec): AutoLayoutResult {
   const pad = 20;
-  const gap = 16;
+  const gap = 14;
   const cols = Math.max(1, Math.min(spec.columns ?? 4, 8));
   const widgets: HmiWidget[] = [];
+  const overflowWidgets: string[] = [];
 
   let topOffset = pad;
-  const bottomReserve = spec.includeNavBar ? 64 : 0;
+  const bottomReserve = spec.includeNavBar ? 60 : 0;
 
   if (spec.includeAlarmBanner !== false) {
     widgets.push({
@@ -122,51 +173,74 @@ export function generateAutoLayoutScreen(spec: AutoLayoutSpec): HmiScreen {
     topOffset += 44 + gap;
   }
 
-  const usableWidth = spec.width - pad * 2;
-  const colWidth = Math.floor((usableWidth - gap * (cols - 1)) / cols);
-  const baseRowHeight = 110;
-
-  let curCol = 0;
-  let curRow = 0;
+  // First pass: calculate total grid rows needed using 2D occupancy grid (prevents span overlap!)
+  const occupied = new Set<string>();
+  const placements: { item: AutoLayoutSpec['items'][number]; idx: number; col: number; row: number; cSpan: number; rSpan: number }[] = [];
+  let maxRowUsed = 0;
 
   spec.items.forEach((item, idx) => {
     const cSpan = Math.max(1, Math.min(item.colSpan ?? 1, cols));
     const rSpan = Math.max(1, Math.min(item.rowSpan ?? 1, 3));
 
-    if (curCol + cSpan > cols) {
-      curCol = 0;
-      curRow++;
+    let placed = false;
+    for (let r = 0; !placed && r < 200; r++) {
+      for (let c = 0; c <= cols - cSpan; c++) {
+        let fits = true;
+        for (let dr = 0; dr < rSpan && fits; dr++) {
+          for (let dc = 0; dc < cSpan && fits; dc++) {
+            if (occupied.has(`${r + dr},${c + dc}`)) fits = false;
+          }
+        }
+        if (fits) {
+          for (let dr = 0; dr < rSpan; dr++) {
+            for (let dc = 0; dc < cSpan; dc++) occupied.add(`${r + dr},${c + dc}`);
+          }
+          placements.push({ item, idx, col: c, row: r, cSpan, rSpan });
+          maxRowUsed = Math.max(maxRowUsed, r + rSpan);
+          placed = true;
+          break;
+        }
+      }
     }
+  });
 
-    const x = pad + curCol * (colWidth + gap);
-    const y = topOffset + curRow * (baseRowHeight + gap);
-    const width = cSpan * colWidth + (cSpan - 1) * gap;
-    const height = rSpan * baseRowHeight + (rSpan - 1) * gap;
+  const usableWidth = spec.width - pad * 2;
+  const colWidth = Math.floor((usableWidth - gap * (cols - 1)) / cols);
+  const availableHeight = spec.height - topOffset - bottomReserve - pad;
+  const computedRowHeight =
+    maxRowUsed > 0
+      ? Math.min(115, Math.floor((availableHeight - gap * (maxRowUsed - 1)) / maxRowUsed))
+      : 110;
+  const baseRowHeight = Math.max(52, computedRowHeight);
 
-    if (y + height <= spec.height - bottomReserve - pad) {
+  for (const p of placements) {
+    const x = pad + p.col * (colWidth + gap);
+    const y = topOffset + p.row * (baseRowHeight + gap);
+    const width = p.cSpan * colWidth + (p.cSpan - 1) * gap;
+    const height = p.rSpan * baseRowHeight + (p.rSpan - 1) * gap;
+    const id = p.item.id ?? `w_${p.idx + 1}_${p.item.type.toLowerCase()}`;
+
+    if (y + height <= spec.height - bottomReserve - pad + 2) {
       widgets.push({
-        id: item.id ?? `w_${idx + 1}_${item.type.toLowerCase()}`,
-        type: item.type,
-        label: item.label,
+        id,
+        type: p.item.type,
+        label: p.item.label,
         x,
         y,
         width,
         height,
-        tagName: item.tagName,
-        writeEnabled: item.writeEnabled ?? false,
-        unit: item.unit,
-        min: item.min,
-        max: item.max,
+        tagName: p.item.tagName,
+        writeEnabled: p.item.writeEnabled ?? false,
+        targetScreenId: p.item.targetScreenId,
+        unit: p.item.unit,
+        min: p.item.min,
+        max: p.item.max,
         precision: 2,
       });
+    } else {
+      overflowWidgets.push(id);
     }
-
-    curCol += cSpan;
-    if (curCol >= cols) {
-      curCol = 0;
-      curRow += rSpan;
-    }
-  });
+  }
 
   if (spec.includeNavBar) {
     widgets.push({
@@ -174,24 +248,50 @@ export function generateAutoLayoutScreen(spec: AutoLayoutSpec): HmiScreen {
       type: 'NAV_BAR',
       label: 'Screen Navigation',
       x: pad,
-      y: spec.height - 52 - pad / 2,
+      y: spec.height - 44 - pad / 2,
       width: spec.width - pad * 2,
       height: 44,
     });
   }
 
   return {
-    id: spec.screenId,
-    name: spec.name,
-    width: spec.width,
-    height: spec.height,
-    layoutStandard: spec.layoutStandard,
-    backgroundColor: spec.layoutStandard === 'ISA_101_HIGH_PERFORMANCE' ? '#E5E7EB' : '#F1F5F9',
-    autoScaleMobile: true,
-    autoScaleWeb: true,
-    widgets,
-    createdAt: new Date().toISOString(),
+    screen: {
+      id: spec.screenId,
+      name: spec.name,
+      width: spec.width,
+      height: spec.height,
+      layoutStandard: spec.layoutStandard,
+      backgroundColor: spec.layoutStandard === 'ISA_101_HIGH_PERFORMANCE' ? '#E5E7EB' : '#F1F5F9',
+      autoScaleMobile: true,
+      autoScaleWeb: true,
+      widgets,
+      createdAt: new Date().toISOString(),
+    },
+    overflowWidgets,
   };
+}
+
+export function instantiateFaceplate(
+  template: HmiFaceplateTemplate,
+  instanceId: string,
+  originX: number,
+  originY: number,
+  tagPrefix: string,
+  overrides: Record<string, string> = {}
+): HmiWidget[] {
+  return template.widgets.map((w, idx) => {
+    const resolvedTag = w.tagName
+      ? w.tagName.replace(/\{\{([A-Za-z0-9_]+)\}\}/g, (_, key) => overrides[key] ?? `${tagPrefix}_${key}`)
+      : undefined;
+    return {
+      ...w,
+      id: `${instanceId}_${idx + 1}`,
+      x: originX + w.x,
+      y: originY + w.y,
+      tagName: resolvedTag,
+      faceplateId: template.id,
+    };
+  });
 }
 
 function escapeXml(str: string): string {
@@ -199,13 +299,10 @@ function escapeXml(str: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 
-/**
- * Generates deterministic, standards-compliant SVG blueprint for a Haiwell HMI screen.
- * Suitable for headless visual diffing, archival, or import as custom Haiwell vector mimic.
- */
 export function renderScreenToSvg(
   screen: HmiScreen,
   tags: Record<string, TagDefinition>

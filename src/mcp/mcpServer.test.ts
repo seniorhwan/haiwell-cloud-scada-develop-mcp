@@ -4,11 +4,11 @@ import { HaiwellProjectStore } from './projectStore';
 import { HAIWELL_TOOLS, invokeHaiwellTool } from './toolRegistry';
 import { HAIWELL_CAPABILITY_MATRIX, readHaiwellResource } from './resourcesAndPrompts';
 
-test('tool registry covers all 14 Haiwell Cloud SCADA Develop domains with valid Zod schemas', () => {
+test('tool registry covers all 15 Haiwell Cloud SCADA Develop domains with valid Zod schemas', () => {
   const domains = new Set(HAIWELL_TOOLS.map((t) => t.domain));
-  assert.equal(domains.size, 14);
-  assert.equal(HAIWELL_CAPABILITY_MATRIX.length, 14);
-  assert.ok(HAIWELL_TOOLS.length >= 25);
+  assert.equal(domains.size, 15);
+  assert.equal(HAIWELL_CAPABILITY_MATRIX.length, 15);
+  assert.ok(HAIWELL_TOOLS.length >= 40);
 });
 
 test('enforces safety guards on read-only hardware tags, engineering bounds, and SIL interlocks', async () => {

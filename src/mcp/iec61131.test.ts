@@ -82,9 +82,16 @@ test('detects Ladder double-coil hazard and physical input coil write', () => {
 test('validates FBD network and transpiles ST to Haiwell JavaScript', () => {
   const fbd = validateFbdNetwork(
     'ScaleNet',
-    JSON.stringify([{ id: 'B1', blockType: 'LIMIT', inputs: { IN: 'AI0' }, outputs: { OUT: 'V10' } }])
+    JSON.stringify([{ id: 'B1', blockType: 'LIMIT', inputs: { MN: '0', IN: 'AI0', MX: '100' }, outputs: { OUT: 'V10' } }])
   );
   assert.equal(fbd.valid, true);
+
+  const missingPins = validateFbdNetwork(
+    'BadScaleNet',
+    JSON.stringify([{ id: 'B1', blockType: 'LIMIT', inputs: { IN: 'AI0' }, outputs: { OUT: 'V10' } }])
+  );
+  assert.equal(missingPins.valid, false);
+  assert.ok(missingPins.diagnostics.some((d) => d.code === 'IEC-FBD-004'));
 
   const st = `
 PROGRAM DeltaCalc

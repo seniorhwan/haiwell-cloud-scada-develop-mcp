@@ -1,17 +1,33 @@
 /**
- * Single-source-of-truth MCP Tool Registry covering all 14 Haiwell Cloud SCADA Develop domains.
- * Uses Zod v4 for strict wire-level schema validation and automatic JSON Schema generation.
+ * Hardened Single-Source-of-Truth MCP Tool Registry:
+ * 42 production-grade tools across 15 Haiwell Cloud SCADA Develop domains.
+ * Features LLM-tolerant input normalization, strict Zod v4 validation,
+ * multi-vendor PLC register & multi-word overlap detection, binary type/range guards,
+ * ISA-18.2 deduplicating alarm state machine, atomic batch I/O, snapshots/rollback,
+ * referential-integrity deletion, faceplates, webhooks, and headless FAT simulation.
  */
 
 import { z } from 'zod';
-import { HAIWELL_REGISTER_MAP, parseHaiwellRegister } from './haiwellRegisters';
+import { HAIWELL_REGISTER_MAP } from './haiwellRegisters';
+import {
+  applyLinearScaling,
+  detectWordOverlapConflicts,
+  getWordSpanForType,
+  validatePlcAddress,
+  validateTagValueForType,
+} from './plcAddressing';
 import {
   transpileStToHaiwellJs,
   validateFbdNetwork,
   validateLadderGraph,
   validateStructuredText,
 } from './iec61131';
-import { generateAutoLayoutScreen, renderScreenToSvg, validateHmiScreen } from './hmiGenerator';
+import {
+  generateAutoLayoutScreenDetailed,
+  instantiateFaceplate,
+  renderScreenToSvg,
+  validateHmiScreen,
+} from './hmiGenerator';
 import {
   buildMqttPayload,
   generateOpcUaNodeSet2Xml,
@@ -20,8 +36,9 @@ import {
   validateMqttTopic,
 } from './protocolAdapters';
 import { validateHaiwellScript } from './scriptAnalyzer';
+import { evaluateProjectAlarms, runSimulationSteps } from './simulationEngine';
 import type { HaiwellProjectStore } from './projectStore';
-import type { HaiwellDomain, HaiwellProject, ToolSafetyTier } from './types';
+import type { HaiwellDomain, HaiwellProject, PlcDriverProtocol, ToolSafetyTier } from './types';
 
 export interface HaiwellToolDefinition<TShape extends z.ZodRawShape = z.ZodRawShape> {
   name: string;
@@ -42,8 +59,132 @@ function defineTool<TShape extends z.ZodRawShape>(
 
 const DEFAULT_PROJECT_ID = 'prj_chiller_plant_01';
 
+const PLC_PROTOCOLS = [
+  'HAIWELL_PLC_TCP',
+  'HAIWELL_PLC_RTU',
+  'MODBUS_TCP',
+  'MODBUS_RTU',
+  'SIEMENS_S7_1200',
+  'SIEMENS_S7_1500',
+  'MITSUBISHI_MC_3E',
+  'OMRON_FINS_TCP',
+  'ALLEN_BRADLEY_EIP',
+  'DELTA_DVP_MODBUS',
+  'SCHNEIDER_MODBUS',
+  'BACNET_IP',
+  'OPC_UA_CLIENT',
+  'MQTT_CLIENT',
+] as const;
+
+const WIDGET_TYPES = [
+  'NUMERIC_DISPLAY',
+  'NUMERIC_INPUT',
+  'BIT_BUTTON',
+  'BIT_LAMP',
+  'MULTI_STATE_INDICATOR',
+  'BAR_GRAPH',
+  'GAUGE',
+  'TANK',
+  'PUMP',
+  'VALVE',
+  'PIPELINE',
+  'TREND_CHART',
+  'ALARM_BANNER',
+  'RECIPE_SELECTOR',
+  'CAMERA_VIEW',
+  'DATA_TABLE',
+  'NAV_BAR',
+  'LABEL',
+  'FACEPLATE_INSTANCE',
+] as const;
+
+const SQL_RESERVED = new Set(['SELECT', 'DROP', 'DELETE', 'INSERT', 'UPDATE', 'TABLE', 'FROM', 'WHERE', 'UNION', 'ORDER', 'GROUP', 'INDEX', 'ALTER', 'CREATE', 'EXEC', 'EXECUTE', 'GRANT', 'REVOKE', 'TRUNCATE', 'JOIN']);
+
+function validateCronExpression(cron: string): { valid: boolean; error?: string } {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length !== 5) return { valid: false, error: 'CRON must have exactly 5 fields: minute hour dom month dow.' };
+  const bounds: [string, number, number][] = [
+    ['minute', 0, 59],
+    ['hour', 0, 23],
+    ['day-of-month', 1, 31],
+    ['month', 1, 12],
+    ['day-of-week', 0, 7],
+  ];
+  for (let i = 0; i < 5; i++) {
+    const field = parts[i];
+    const [name, min, max] = bounds[i];
+    for (const seg of field.split(',')) {
+      const stepParts = seg.split('/');
+      if (stepParts.length > 2) return { valid: false, error: `Invalid step in CRON ${name}: "${seg}".` };
+      if (stepParts[1] !== undefined) {
+        const step = Number(stepParts[1]);
+        if (!Number.isInteger(step) || step < 1 || step > max) {
+          return { valid: false, error: `Invalid step "${stepParts[1]}" in CRON ${name}.` };
+        }
+      }
+      const rangeStr = stepParts[0];
+      if (rangeStr === '*') continue;
+      const rangeParts = rangeStr.split('-');
+      if (rangeParts.length > 2) return { valid: false, error: `Invalid range "${rangeStr}" in CRON ${name}.` };
+      for (const nStr of rangeParts) {
+        if (!/^\d+$/.test(nStr)) return { valid: false, error: `Non-numeric token "${nStr}" in CRON ${name}.` };
+        const n = Number(nStr);
+        if (n < min || n > max) return { valid: false, error: `CRON ${name} value ${n} out of bounds [${min}..${max}].` };
+      }
+      if (rangeParts.length === 2 && Number(rangeParts[0]) > Number(rangeParts[1])) {
+        return { valid: false, error: `CRON ${name} range start > end in "${rangeStr}".` };
+      }
+    }
+  }
+  return { valid: true };
+}
+
+/**
+ * Safely normalizes common LLM client serialization quirks before strict Zod validation:
+ * - Converts explicit `null` on optional keys to `undefined`
+ * - Parses stringified JSON arrays/objects when a client double-encodes complex arguments
+ */
+export function normalizeAgentArgs(raw: unknown): Record<string, unknown> {
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return normalizeAgentArgs(parsed);
+      }
+    } catch {
+      return {};
+    }
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (v === null) continue;
+    if (typeof v === 'string') {
+      const trimmed = v.trim();
+      if ((trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('{') && trimmed.endsWith('}'))) {
+        try {
+          out[k] = JSON.parse(trimmed);
+          continue;
+        } catch {
+          // Keep literal string (e.g., LD/FBD JSON source intentionally passed as string!)
+        }
+      }
+    }
+    out[k] = v;
+  }
+  // Keep `source` as string for IEC 61131-3 tools even if LD/FBD JSON array was passed as array
+  if (out.source !== undefined && typeof out.source !== 'string') {
+    out.source = JSON.stringify(out.source);
+  }
+  return out;
+}
+
 export function buildProjectExportBundle(project: HaiwellProject) {
-  const tagCsvHeader = 'name,scope,deviceId,address,modbus0Based,modbus1Based,dataType,access,unit,safeMin,safeMax,safetyClass,requiresInterlock';
+  const tagCsvHeader =
+    'name,scope,deviceId,address,modbus0Based,modbus1Based,wordSpan,dataType,access,unit,safeMin,safeMax,safetyClass,requiresInterlock';
   const tagCsvRows = Object.values(project.tags).map((t) =>
     [
       t.name,
@@ -52,6 +193,7 @@ export function buildProjectExportBundle(project: HaiwellProject) {
       t.address ?? '',
       t.modbusOffset0Based ?? '',
       t.modbusAddress1Based ?? '',
+      t.wordSpan ?? '',
       t.dataType,
       t.access,
       t.unit ?? '',
@@ -63,12 +205,13 @@ export function buildProjectExportBundle(project: HaiwellProject) {
   );
 
   return {
-    format: 'haiwell-cloud-scada-bundle/v1',
+    format: 'haiwell-cloud-scada-bundle/v2',
     exportedAt: new Date().toISOString(),
     projectMeta: {
       id: project.id,
       name: project.name,
       version: project.version,
+      revision: project.revision,
       targetHardware: project.targetHardware,
       resolution: project.resolution,
       defaultLanguage: project.defaultLanguage,
@@ -98,33 +241,52 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
     remediation: string;
   }[] = [];
 
-  // 1. Check PLC register collisions on same device
-  const deviceAddrMap = new Map<string, string>();
+  const deviceProtocols = new Map<string, PlcDriverProtocol>(project.devices.map((d) => [d.id, d.protocol]));
+
+  // 1. Multi-word & exact register overlap check
+  for (const conflict of detectWordOverlapConflicts(project.tags, deviceProtocols)) {
+    findings.push({
+      code: 'AUD-TAG-OVERLAP',
+      severity: 'CRITICAL',
+      domain: 'tags',
+      target: `${conflict.tagA} <-> ${conflict.tagB}`,
+      message: conflict.reason,
+      remediation: 'Reassign non-overlapping PLC registers accounting for 32-bit (2-word) and 64-bit (4-word) spans.',
+    });
+  }
+
   for (const tag of Object.values(project.tags)) {
-    if (tag.scope === 'PLC' && tag.deviceId && tag.address) {
-      const key = `${tag.deviceId}:${tag.address.toUpperCase()}`;
-      if (deviceAddrMap.has(key)) {
+    if (tag.scope === 'PLC') {
+      if (!tag.deviceId || !deviceProtocols.has(tag.deviceId)) {
         findings.push({
-          code: 'AUD-TAG-COLLISION',
+          code: 'AUD-TAG-ORPHAN-DEVICE',
           severity: 'HIGH',
           domain: 'tags',
           target: tag.name,
-          message: `Address collision: "${tag.name}" and "${deviceAddrMap.get(key)}" both map to ${key}.`,
-          remediation: 'Assign distinct PLC register addresses or mark one tag as an internal alias.',
+          message: `PLC tag "${tag.name}" references unknown deviceId "${tag.deviceId ?? ''}".`,
+          remediation: 'Add the missing device via haiwell_device_add or rebind deviceId.',
         });
-      }
-      deviceAddrMap.set(key, tag.name);
-
-      const parsed = parseHaiwellRegister(tag.address);
-      if (parsed.valid && parsed.readOnly && tag.access !== 'RO') {
-        findings.push({
-          code: 'AUD-TAG-RO-VIOLATION',
-          severity: 'CRITICAL',
-          domain: 'tags',
-          target: tag.name,
-          message: `Tag "${tag.name}" allows ${tag.access} access on physical read-only register ${tag.address}.`,
-          remediation: 'Set tag access mode to RO.',
-        });
+      } else if (tag.address) {
+        const parsed = validatePlcAddress(deviceProtocols.get(tag.deviceId)!, tag.address);
+        if (!parsed.valid) {
+          findings.push({
+            code: 'AUD-TAG-BAD-ADDR',
+            severity: 'CRITICAL',
+            domain: 'tags',
+            target: tag.name,
+            message: parsed.error,
+            remediation: parsed.hint,
+          });
+        } else if (parsed.readOnly && tag.access !== 'RO') {
+          findings.push({
+            code: 'AUD-TAG-RO-VIOLATION',
+            severity: 'CRITICAL',
+            domain: 'tags',
+            target: tag.name,
+            message: `Tag "${tag.name}" allows ${tag.access} access on physical read-only register ${tag.address}.`,
+            remediation: 'Set tag access mode to RO.',
+          });
+        }
       }
     }
     if ((tag.safetyClass === 'SIL2' || tag.safetyClass === 'SIL3') && tag.access !== 'RO' && !tag.requiresInterlock) {
@@ -139,41 +301,52 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
     }
   }
 
-  // 2. Validate IEC 61131-3 POUs
+  // 2. Validate IEC 61131-3 POUs (ST, LD, FBD)
   for (const pou of project.pous) {
-    if (pou.language === 'ST') {
-      const res = validateStructuredText(pou.source);
-      if (!res.valid) {
-        findings.push({
-          code: 'AUD-IEC-INVALID',
-          severity: 'CRITICAL',
-          domain: 'iec61131',
-          target: pou.name,
-          message: `POU "${pou.name}" has ${res.summary.errors} IEC 61131-3 error(s).`,
-          remediation: 'Fix diagnostics reported by haiwell_iec61131_validate before deployment.',
-        });
-      }
+    const res =
+      pou.language === 'ST'
+        ? validateStructuredText(pou.source)
+        : pou.language === 'LD'
+          ? validateLadderGraph(pou.name, pou.source)
+          : validateFbdNetwork(pou.name, pou.source);
+    if (!res.valid) {
+      findings.push({
+        code: 'AUD-IEC-INVALID',
+        severity: 'CRITICAL',
+        domain: 'iec61131',
+        target: pou.name,
+        message: `POU "${pou.name}" (${pou.language}) has ${res.summary.errors} IEC 61131-3 error(s).`,
+        remediation: 'Fix diagnostics reported by haiwell_iec61131_validate before deployment.',
+      });
     }
   }
 
-  // 3. Validate HMI screens
+  // 3. Validate HMI screens (collisions, bounds, tags, nav links, touch targets)
+  const screenIds = new Set(project.screens.map((s) => s.id));
   for (const screen of project.screens) {
-    const res = validateHmiScreen(screen, project.tags);
+    const res = validateHmiScreen(screen, project.tags, {
+      knownScreenIds: screenIds,
+      targetHardware: project.targetHardware,
+    });
     if (!res.valid) {
       findings.push({
         code: 'AUD-HMI-LAYOUT',
         severity: 'MEDIUM',
         domain: 'hmi',
         target: screen.id,
-        message: `Screen "${screen.name}" has ${res.collisions.length} collision(s), ${res.outOfBounds.length} out-of-bounds widget(s), ${res.unresolvedTags.length} unresolved tag(s).`,
-        remediation: 'Re-run haiwell_hmi_screen_generate or adjust widget coordinates.',
+        message: `Screen "${screen.name}" issues: collisions=${res.collisions.length}, outOfBounds=${res.outOfBounds.length}, unresolvedTags=${res.unresolvedTags.length}, brokenNav=${res.brokenNavTargets.length}, touchTargets=${res.touchTargetViolations.length}.`,
+        remediation: 'Regenerate or fix widget geometry, bindings, and navigation links.',
       });
     }
   }
 
   // 4. Validate JavaScript scripts
   for (const script of project.scripts) {
-    const res = validateHaiwellScript(script.code, project.tags);
+    const res = validateHaiwellScript(script.code, project.tags, {
+      trigger: script.trigger,
+      intervalMs: script.intervalMs,
+      triggerTag: script.triggerTag,
+    });
     if (!res.valid) {
       findings.push({
         code: 'AUD-SCRIPT-INVALID',
@@ -186,7 +359,7 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
     }
   }
 
-  // 5. Security & protocol checks
+  // 5. Security & IIoT protocol checks
   if (project.cloudEnabled && !project.security.abKeyEnabled) {
     findings.push({
       code: 'AUD-SEC-ABKEY',
@@ -222,6 +395,7 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
   const high = findings.filter((f) => f.severity === 'HIGH').length;
   return {
     projectId: project.id,
+    revision: project.revision,
     deploymentReady: critical === 0 && high === 0,
     counts: {
       total: findings.length,
@@ -234,9 +408,63 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
   };
 }
 
+function checkTagWriteSafety(
+  project: HaiwellProject,
+  tagName: string,
+  value: unknown,
+  confirmSafetyOverride: boolean
+) {
+  const tag = project.tags[tagName];
+  if (!tag) return { ok: false as const, blockedBy: 'TAG_NOT_FOUND', message: `Tag "${tagName}" not found.` };
+  if (tag.access === 'RO') {
+    return {
+      ok: false as const,
+      blockedBy: 'READ_ONLY_GUARD',
+      message: `Tag "${tag.name}" (${tag.address ?? tag.scope}) is read-only (RO).`,
+    };
+  }
+  const typeCheck = validateTagValueForType(tag.dataType, value);
+  if (!typeCheck.valid) {
+    return { ok: false as const, blockedBy: typeCheck.code, message: typeCheck.error };
+  }
+  if (typeof typeCheck.normalizedValue === 'number') {
+    if (tag.safeMin !== undefined && typeCheck.normalizedValue < tag.safeMin) {
+      return {
+        ok: false as const,
+        blockedBy: 'SAFE_RANGE_MIN',
+        message: `Rejected value ${typeCheck.normalizedValue} for "${tag.name}": below safeMin (${tag.safeMin}).`,
+      };
+    }
+    if (tag.safeMax !== undefined && typeCheck.normalizedValue > tag.safeMax) {
+      return {
+        ok: false as const,
+        blockedBy: 'SAFE_RANGE_MAX',
+        message: `Rejected value ${typeCheck.normalizedValue} for "${tag.name}": above safeMax (${tag.safeMax}).`,
+      };
+    }
+  }
+  const estop = project.tags['EStop_OK'];
+  if (tag.requiresInterlock && estop && estop.currentValue === false) {
+    return {
+      ok: false as const,
+      blockedBy: 'ESTOP_INTERLOCK_ACTIVE',
+      message: `Write to "${tag.name}" blocked: EStop_OK is FALSE.`,
+    };
+  }
+  if (tag.requiresInterlock && !confirmSafetyOverride) {
+    return {
+      ok: false as const,
+      blockedBy: 'INTERLOCK_CONFIRMATION_REQUIRED',
+      safetyClass: tag.safetyClass,
+      message: `Tag "${tag.name}" (${tag.safetyClass}) requires confirmSafetyOverride=true before writing.`,
+    };
+  }
+  return { ok: true as const, tag, normalizedValue: typeCheck.normalizedValue };
+}
+
 export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   // =========================================================================
-  // 1. PROJECT LIFECYCLE & WORKSPACE MANAGEMENT
+  // 1. PROJECT LIFECYCLE, SNAPSHOTS, SAFE DELETE & AUDIT
   // =========================================================================
   defineTool({
     name: 'haiwell_project_create',
@@ -262,8 +490,6 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       targetHardware: 'CLOUD_HMI_C10',
       width: 1024,
       height: 600,
-      defaultLanguage: 'en-US',
-      cloudEnabled: true,
     },
     handler: (input, store) => {
       const now = new Date().toISOString();
@@ -271,6 +497,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         id: input.id,
         name: input.name,
         version: '1.0.0',
+        revision: 0,
         targetHardware: input.targetHardware,
         resolution: { width: input.width, height: input.height },
         defaultLanguage: input.defaultLanguage,
@@ -282,7 +509,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         tags: {},
         pous: [],
         screens: [],
+        faceplates: [],
         scripts: [],
+        eventTriggers: [],
+        webhooks: [],
         alarms: [],
         alarmHistory: [],
         mqtt: {
@@ -342,10 +572,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       });
       return {
         projectId: project.id,
+        revision: project.revision,
         name: project.name,
         targetHardware: project.targetHardware,
         resolution: project.resolution,
-        createdAt: project.createdAt,
       };
     },
   }),
@@ -356,7 +586,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Project Tree Inspection',
     safetyTier: 'read',
     description:
-      'Return a compact, machine-readable snapshot of the Haiwell Cloud SCADA project tree (counts and identifiers for devices, tags, POUs, screens, scripts, alarms, MQTT, OPC UA, recipes, trends, Data-Link, schedules, reports, cameras).',
+      'Return a compact, token-efficient snapshot of the Haiwell Cloud SCADA project tree including revision, devices, tags, POUs, screens, faceplates, scripts, triggers, webhooks, alarms, MQTT, OPC UA, recipes, trends, Data-Link, schedules, reports, and cameras.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       includeAllProjects: z.boolean().default(false),
@@ -369,6 +599,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           id: p.id,
           name: p.name,
           version: p.version,
+          revision: p.revision,
           targetHardware: p.targetHardware,
           resolution: p.resolution,
           cloudEnabled: p.cloudEnabled,
@@ -379,9 +610,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           transparentTunnel: p.transparentTunnel,
           tagCount: Object.keys(p.tags).length,
           tagNames: Object.keys(p.tags),
-          pous: p.pous.map((pou) => ({ id: pou.id, name: pou.name, language: pou.language, pouType: pou.pouType, errorCount: pou.diagnostics.filter((d) => d.severity === 'ERROR').length })),
+          pous: p.pous.map((pou) => ({ id: pou.id, name: pou.name, language: pou.language, pouType: pou.pouType })),
           screens: p.screens.map((s) => ({ id: s.id, name: s.name, layoutStandard: s.layoutStandard, widgetCount: s.widgets.length })),
+          faceplates: p.faceplates.map((f) => ({ id: f.id, name: f.name, placeholders: f.tagPlaceholders })),
           scripts: p.scripts.map((s) => ({ id: s.id, name: s.name, trigger: s.trigger, validated: s.validated })),
+          eventTriggers: p.eventTriggers.map((e) => ({ id: e.id, sourceTag: e.sourceTag, condition: e.condition, actionType: e.actionType })),
+          webhooks: p.webhooks.map((w) => ({ id: w.id, name: w.name, url: w.url, enabled: w.enabled })),
           alarms: p.alarms.map((a) => ({ id: a.id, name: a.name, tagName: a.tagName, condition: a.condition, priority: a.priority })),
           mqtt: { mode: p.mqtt.mode, brokerUri: p.mqtt.brokerUri, tlsEnabled: p.mqtt.tlsEnabled, bindingCount: p.mqtt.bindings.length },
           opcua: { role: p.opcua.role, endpointUrl: p.opcua.endpointUrl, securityPolicy: p.opcua.securityPolicy, nodeCount: p.opcua.nodes.length },
@@ -400,12 +634,180 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   defineTool({
+    name: 'haiwell_project_snapshot_rollback',
+    domain: 'project',
+    haiwellFeature: 'Atomic Project Checkpoints & Rollback',
+    safetyTier: 'design',
+    description:
+      'Create named project checkpoints before risky multi-step agent edits, list snapshots, or atomically roll back to a known-good snapshot.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      action: z.enum(['CREATE', 'LIST', 'ROLLBACK']),
+      label: z.string().max(80).default('agent-checkpoint'),
+      snapshotId: z.string().optional(),
+    }),
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'CREATE', label: 'pre-plc-refactor' },
+    handler: (input, store) => {
+      if (input.action === 'CREATE') {
+        return { created: true, snapshot: store.createSnapshot(input.projectId, input.label) };
+      }
+      if (input.action === 'LIST') {
+        return { projectId: input.projectId, snapshots: store.listSnapshots(input.projectId) };
+      }
+      if (!input.snapshotId) throw new Error('ROLLBACK requires snapshotId.');
+      const restored = store.rollbackSnapshot(input.projectId, input.snapshotId);
+      return { rolledBack: true, projectId: restored.id, revision: restored.revision, snapshotId: input.snapshotId };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_entity_delete',
+    domain: 'project',
+    haiwellFeature: 'Referential-Integrity Protected Entity Deletion',
+    safetyTier: 'design',
+    description:
+      'Safely remove any project entity (project, device, tag, pou, screen, widget, faceplate, script, event_trigger, webhook, alarm, mqtt_binding, opcua_node, recipe_group, trend, datalink, schedule, report, camera). Blocks deletion if dependent references exist unless cascade=true.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      entityType: z.enum([
+        'project',
+        'device',
+        'tag',
+        'pou',
+        'screen',
+        'widget',
+        'faceplate',
+        'script',
+        'event_trigger',
+        'webhook',
+        'alarm',
+        'mqtt_binding',
+        'opcua_node',
+        'recipe_group',
+        'trend',
+        'datalink',
+        'schedule',
+        'report',
+        'camera',
+      ]),
+      entityId: z.string().min(1),
+      parentScreenId: z.string().optional(),
+      cascade: z.boolean().default(false),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      entityType: 'tag',
+      entityId: 'Supply_Temp_C',
+      cascade: false,
+    },
+    handler: (input, store) => {
+      if (input.entityType === 'project') {
+        const deleted = store.deleteProject(input.entityId);
+        return { deleted, entityType: 'project', entityId: input.entityId };
+      }
+      const project = store.getProject(input.projectId);
+
+      if (input.entityType === 'tag') {
+        if (!project.tags[input.entityId]) throw new Error(`Tag "${input.entityId}" not found.`);
+        const deps = store.findTagDependents(project, input.entityId);
+        if (deps.length > 0 && !input.cascade) {
+          return {
+            deleted: false,
+            blockedBy: 'REFERENTIAL_INTEGRITY',
+            dependents: deps,
+            message: `Cannot delete tag "${input.entityId}" because ${deps.length} object(s) reference it. Pass cascade=true to prune references.`,
+          };
+        }
+        delete project.tags[input.entityId];
+        if (input.cascade) {
+          project.alarms = project.alarms.filter((a) => a.tagName !== input.entityId);
+          project.opcua.nodes = project.opcua.nodes.filter((n) => n.tagName !== input.entityId);
+          project.mqtt.bindings.forEach((b) => {
+            b.tags = b.tags.filter((t) => t !== input.entityId);
+          });
+          project.screens.forEach((s) => {
+            s.widgets = s.widgets.filter((w) => w.tagName !== input.entityId);
+          });
+        }
+        store.saveProject(project);
+        return { deleted: true, entityType: 'tag', entityId: input.entityId, cascadedDependents: deps };
+      }
+
+      if (input.entityType === 'device') {
+        const boundTags = Object.values(project.tags)
+          .filter((t) => t.deviceId === input.entityId)
+          .map((t) => t.name);
+        if (boundTags.length > 0 && !input.cascade) {
+          return {
+            deleted: false,
+            blockedBy: 'REFERENTIAL_INTEGRITY',
+            dependents: boundTags,
+            message: `Device "${input.entityId}" has ${boundTags.length} bound tag(s). Pass cascade=true to detach.`,
+          };
+        }
+        const before = project.devices.length;
+        project.devices = project.devices.filter((d) => d.id !== input.entityId);
+        if (project.devices.length === before) throw new Error(`Device "${input.entityId}" not found.`);
+        if (input.cascade) {
+          for (const t of boundTags) {
+            project.tags[t].deviceId = undefined;
+            project.tags[t].scope = 'INTERNAL';
+          }
+        }
+        store.saveProject(project);
+        return { deleted: true, entityType: 'device', entityId: input.entityId };
+      }
+
+      if (input.entityType === 'widget') {
+        const scr = project.screens.find((s) => s.id === input.parentScreenId);
+        if (!scr) throw new Error(`Widget deletion requires valid parentScreenId.`);
+        const before = scr.widgets.length;
+        scr.widgets = scr.widgets.filter((w) => w.id !== input.entityId);
+        if (scr.widgets.length === before) throw new Error(`Widget "${input.entityId}" not found.`);
+        store.saveProject(project);
+        return { deleted: true, entityType: 'widget', entityId: input.entityId };
+      }
+
+      const removeById = <T extends { id: string }>(arr: T[]): T[] => {
+        const next = arr.filter((x) => x.id !== input.entityId);
+        if (next.length === arr.length) throw new Error(`${input.entityType} "${input.entityId}" not found.`);
+        return next;
+      };
+
+      switch (input.entityType) {
+        case 'pou': project.pous = removeById(project.pous); break;
+        case 'screen': project.screens = removeById(project.screens); break;
+        case 'faceplate': project.faceplates = removeById(project.faceplates); break;
+        case 'script': project.scripts = removeById(project.scripts); break;
+        case 'event_trigger': project.eventTriggers = removeById(project.eventTriggers); break;
+        case 'webhook': project.webhooks = removeById(project.webhooks); break;
+        case 'alarm': project.alarms = removeById(project.alarms); break;
+        case 'mqtt_binding': project.mqtt.bindings = removeById(project.mqtt.bindings); break;
+        case 'opcua_node': {
+          const before = project.opcua.nodes.length;
+          project.opcua.nodes = project.opcua.nodes.filter((n) => n.nodeId !== input.entityId);
+          if (project.opcua.nodes.length === before) throw new Error(`OPC UA node "${input.entityId}" not found.`);
+          break;
+        }
+        case 'recipe_group': project.recipes = removeById(project.recipes); break;
+        case 'trend': project.trends = removeById(project.trends); break;
+        case 'datalink': project.dataLinks = removeById(project.dataLinks); break;
+        case 'schedule': project.schedules = removeById(project.schedules); break;
+        case 'report': project.reports = removeById(project.reports); break;
+        case 'camera': project.cameras = removeById(project.cameras); break;
+      }
+      store.saveProject(project);
+      return { deleted: true, entityType: input.entityType, entityId: input.entityId, revision: project.revision };
+    },
+  }),
+
+  defineTool({
     name: 'haiwell_project_audit_safety',
     domain: 'project',
     haiwellFeature: 'Pre-Deployment Industrial Safety & Integrity Audit',
     safetyTier: 'read',
     description:
-      'Run a full safety and standards audit across PLC register mappings, SIL interlocks, IEC 61131-3 POUs, HMI screen collisions, JavaScript scripts, MQTT TLS, OPC UA encryption, and A/B Key cloud policy.',
+      'Run full safety audit across multi-word PLC register overlaps, orphan devices, SIL2/SIL3 interlocks, IEC 61131-3 ST/LD/FBD POUs, HMI collisions/touch-targets/nav links, JS scripts, MQTT TLS, OPC UA encryption, and A/B Key policy.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
     }),
@@ -443,35 +845,20 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   // =========================================================================
-  // 2. PLC & COMMUNICATION DRIVERS
+  // 2. MULTI-VENDOR PLC DRIVERS, ADDRESS MAP & CLOUD TUNNEL
   // =========================================================================
   defineTool({
     name: 'haiwell_device_add',
     domain: 'devices',
-    haiwellFeature: 'PLC & Fieldbus Driver Configuration',
+    haiwellFeature: 'Multi-Vendor PLC & Fieldbus Driver Configuration',
     safetyTier: 'design',
     description:
-      'Add or update a PLC/field device communication driver (Haiwell PLC TCP/RTU, Modbus TCP/RTU, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, Delta, Schneider, BACnet).',
+      'Add or update a PLC/field device communication driver (Haiwell PLC TCP/RTU, Modbus TCP/RTU, Siemens S7-1200/1500, Mitsubishi MC 3E, Omron FINS, Allen-Bradley EIP, Delta, Schneider, BACnet/IP).',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       id: z.string().regex(/^[a-z0-9_-]{2,40}$/),
       name: z.string().min(2).max(100),
-      protocol: z.enum([
-        'HAIWELL_PLC_TCP',
-        'HAIWELL_PLC_RTU',
-        'MODBUS_TCP',
-        'MODBUS_RTU',
-        'SIEMENS_S7_1200',
-        'SIEMENS_S7_1500',
-        'MITSUBISHI_MC_3E',
-        'OMRON_FINS_TCP',
-        'ALLEN_BRADLEY_EIP',
-        'DELTA_DVP_MODBUS',
-        'SCHNEIDER_MODBUS',
-        'BACNET_IP',
-        'OPC_UA_CLIENT',
-        'MQTT_CLIENT',
-      ]),
+      protocol: z.enum(PLC_PROTOCOLS),
       transport: z.enum(['TCP', 'RTU', 'CLOUD_TUNNEL']).default('TCP'),
       host: z.string().optional(),
       port: z.number().int().min(1).max(65535).default(502),
@@ -484,16 +871,21 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
-      id: 'meter_power_01',
-      name: 'Main Switchgear Modbus Power Meter',
-      protocol: 'MODBUS_TCP',
+      id: 'plc_siemens_02',
+      name: 'Siemens S7-1200 Cooling Tower PLC',
+      protocol: 'SIEMENS_S7_1200',
       transport: 'TCP',
-      host: '192.168.1.62',
-      port: 502,
-      stationId: 2,
-      pollIntervalMs: 500,
+      host: '192.168.1.60',
+      port: 102,
+      stationId: 1,
     },
     handler: (input, store) => {
+      if (input.transport === 'TCP' && !input.host) {
+        throw new Error('TCP transport requires a host IP or hostname.');
+      }
+      if (input.transport === 'RTU' && !input.serialPort) {
+        throw new Error('RTU transport requires serialPort (e.g., COM1 or /dev/ttyUSB0).');
+      }
       const project = store.getProject(input.projectId);
       const cfg = {
         id: input.id,
@@ -525,21 +917,26 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_device_validate_address',
     domain: 'devices',
-    haiwellFeature: 'Haiwell PLC Register & Modbus Offset Translator',
+    haiwellFeature: 'Multi-Vendor PLC Register & Modbus Offset Translator',
     safetyTier: 'read',
     description:
-      'Validate Haiwell PLC native registers (X, Y, M, T, C, S, AI, AQ, V, TV, CV, SV) and compute exact 0-based/1-based Modbus offsets, hex addresses, function codes, IEC 61131-3 direct addresses, and write permissions.',
+      'Validate registers for Haiwell PLC (X/Y/M/T/C/S/AI/AQ/V/TV/CV/SV), Modbus (40001/HR:0), Siemens S7 (I0.0/DB1.DBD0), Mitsubishi MC (D100/X0F), Omron FINS (DM100/CIO0.00), BACnet (AI:0), or Allen-Bradley EIP symbolic tags.',
     inputSchema: z.object({
-      addresses: z.array(z.string().min(1)).min(1).max(100),
+      protocol: z.enum(PLC_PROTOCOLS).default('HAIWELL_PLC_TCP'),
+      addresses: z.array(z.string().min(1)).min(1).max(200),
       includeAreaTable: z.boolean().default(false),
     }),
-    sampleInput: { addresses: ['X0', 'Y0', 'M100', 'AI0', 'AQ2', 'V100', 'V100.3', 'SV10'], includeAreaTable: false },
+    sampleInput: {
+      protocol: 'HAIWELL_PLC_TCP',
+      addresses: ['X0', 'Y0', 'M100', 'AI0', 'AQ2', 'V100', 'V100.3', 'SV10'],
+    },
     handler: (input) => {
-      const results = input.addresses.map((addr) => parseHaiwellRegister(addr));
+      const results = input.addresses.map((addr) => validatePlcAddress(input.protocol, addr));
       return {
+        protocol: input.protocol,
         allValid: results.every((r) => r.valid),
         results,
-        ...(input.includeAreaTable ? { registerMapReference: HAIWELL_REGISTER_MAP } : {}),
+        ...(input.includeAreaTable ? { haiwellRegisterMap: HAIWELL_REGISTER_MAP } : {}),
       };
     },
   }),
@@ -599,15 +996,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   // =========================================================================
-  // 3. TAG / VARIABLE DATABASE & GRANULAR TELEMETRY CONTROL
+  // 3. TAG DATABASE, MULTI-WORD OVERLAP GUARD & ATOMIC BATCH I/O
   // =========================================================================
   defineTool({
     name: 'haiwell_tag_upsert_batch',
     domain: 'tags',
-    haiwellFeature: 'Variable / Tag Database Management',
+    haiwellFeature: 'Variable / Tag Database Management (Multi-Vendor & Overlap Checked)',
     safetyTier: 'design',
     description:
-      'Batch upsert PLC, internal, system, or cloud-shared variables with automatic Haiwell register validation, Modbus mapping, linear scaling, deadband, and SIL safety write bounds.',
+      'Batch upsert PLC, internal, system, or cloud-shared variables. Validates deviceId existence, multi-vendor PLC addressing, dataType-to-register-kind compatibility, linear scaling, binary initial values, and 32-bit/64-bit multi-word register overlap collisions.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       tags: z
@@ -621,6 +1018,16 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             access: z.enum(['RO', 'RW', 'WO']).default('RW'),
             unit: z.string().max(16).optional(),
             description: z.string().max(200).optional(),
+            scaling: z
+              .object({
+                rawMin: z.number(),
+                rawMax: z.number(),
+                engMin: z.number(),
+                engMax: z.number(),
+                clamp: z.boolean().default(true),
+              })
+              .optional(),
+            deadband: z.number().min(0).optional(),
             safeMin: z.number().optional(),
             safeMax: z.number().optional(),
             safetyClass: z.enum(['SIL0', 'SIL1', 'SIL2', 'SIL3']).default('SIL0'),
@@ -638,75 +1045,144 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           name: 'Flow_Rate_LPM',
           scope: 'PLC',
           deviceId: 'plc_chiller_01',
-          address: 'AI2',
+          address: 'AI4',
           dataType: 'FLOAT32',
           access: 'RO',
           unit: 'L/min',
+          scaling: { rawMin: 0, rawMax: 32000, engMin: 0, engMax: 500, clamp: true },
           safeMin: 0,
           safeMax: 500,
-          safetyClass: 'SIL0',
           initialValue: 185.4,
         },
       ],
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
+      const deviceProtocols = new Map<string, PlcDriverProtocol>(project.devices.map((d) => [d.id, d.protocol]));
       const now = new Date().toISOString();
-      const errors: { tag: string; error: string }[] = [];
+      const errors: { tag: string; code: string; error: string }[] = [];
       const upserted: string[] = [];
+
+      // Candidate map so multi-word overlaps are caught BEFORE committing
+      const candidateTags = { ...project.tags };
 
       for (const t of input.tags) {
         let modbus0: number | undefined;
         let modbus1: number | undefined;
+        let normalizedAddr = t.address;
         let effectiveAccess = t.access;
 
-        if (t.scope === 'PLC' && t.address) {
-          const parsed = parseHaiwellRegister(t.address);
+        if (t.scope === 'PLC') {
+          if (!t.deviceId || !deviceProtocols.has(t.deviceId)) {
+            errors.push({
+              tag: t.name,
+              code: 'UNKNOWN_DEVICE_ID',
+              error: `PLC tag "${t.name}" references unknown deviceId "${t.deviceId ?? ''}". Add device first.`,
+            });
+            continue;
+          }
+          if (!t.address) {
+            errors.push({ tag: t.name, code: 'MISSING_ADDRESS', error: `PLC tag "${t.name}" requires an address.` });
+            continue;
+          }
+          const protocol = deviceProtocols.get(t.deviceId)!;
+          const parsed = validatePlcAddress(protocol, t.address);
           if (!parsed.valid) {
-            errors.push({ tag: t.name, error: parsed.error });
+            errors.push({ tag: t.name, code: 'INVALID_PLC_ADDRESS', error: `${parsed.error} ${parsed.hint}` });
             continue;
           }
           if (parsed.readOnly && t.access !== 'RO') {
             errors.push({
               tag: t.name,
-              error: `Hardware register ${parsed.normalized} (${parsed.areaName}) is read-only; access must be RO.`,
+              code: 'READ_ONLY_REGISTER',
+              error: `Hardware register ${parsed.normalized} is read-only; access must be RO.`,
+            });
+            continue;
+          }
+          if (parsed.kind === 'BIT' && t.dataType !== 'BOOL') {
+            errors.push({
+              tag: t.name,
+              code: 'REGISTER_TYPE_MISMATCH',
+              error: `Bit register ${parsed.normalized} can only be bound to BOOL, not ${t.dataType}.`,
+            });
+            continue;
+          }
+          if (parsed.kind === 'WORD' && t.dataType === 'BOOL') {
+            errors.push({
+              tag: t.name,
+              code: 'REGISTER_TYPE_MISMATCH',
+              error: `WORD register ${parsed.normalized} cannot bind BOOL without bit suffix (e.g., ${parsed.normalized}.0).`,
             });
             continue;
           }
           modbus0 = parsed.modbusOffset0Based;
           modbus1 = parsed.modbusAddress1Based;
+          normalizedAddr = parsed.normalized;
           if (parsed.readOnly) effectiveAccess = 'RO';
         }
 
+        if (t.scaling && t.scaling.rawMin === t.scaling.rawMax) {
+          errors.push({ tag: t.name, code: 'INVALID_SCALING', error: 'scaling.rawMin and scaling.rawMax cannot be equal (division by zero).' });
+          continue;
+        }
         if (t.safeMin !== undefined && t.safeMax !== undefined && t.safeMin > t.safeMax) {
-          errors.push({ tag: t.name, error: `safeMin (${t.safeMin}) cannot exceed safeMax (${t.safeMax}).` });
+          errors.push({ tag: t.name, code: 'INVALID_RANGE', error: `safeMin (${t.safeMin}) cannot exceed safeMax (${t.safeMax}).` });
           continue;
         }
 
         const defaultVal = t.dataType === 'BOOL' ? false : t.dataType === 'STRING' ? '' : 0;
-        project.tags[t.name] = {
+        const proposedInit = t.initialValue ?? project.tags[t.name]?.currentValue ?? defaultVal;
+        const valCheck = validateTagValueForType(t.dataType, proposedInit);
+        if (!valCheck.valid) {
+          errors.push({ tag: t.name, code: valCheck.code, error: valCheck.error });
+          continue;
+        }
+
+        const candidate = {
           name: t.name,
           scope: t.scope,
           deviceId: t.deviceId,
-          address: t.address?.toUpperCase(),
+          address: normalizedAddr,
           modbusOffset0Based: modbus0,
           modbusAddress1Based: modbus1,
+          wordSpan: getWordSpanForType(t.dataType),
           dataType: t.dataType,
           access: effectiveAccess,
           unit: t.unit,
           description: t.description,
+          scaling: t.scaling,
+          deadband: t.deadband,
           safeMin: t.safeMin,
           safeMax: t.safeMax,
           safetyClass: t.safetyClass,
           requiresInterlock: t.requiresInterlock || t.safetyClass === 'SIL2' || t.safetyClass === 'SIL3',
-          currentValue: t.initialValue ?? project.tags[t.name]?.currentValue ?? defaultVal,
-          quality: 'GOOD',
+          currentValue: valCheck.normalizedValue,
+          quality: 'GOOD' as const,
           updatedAt: now,
         };
+
+        const testMap = { ...candidateTags, [t.name]: candidate };
+        const overlaps = detectWordOverlapConflicts(testMap, deviceProtocols).filter(
+          (c) => c.tagA === t.name || c.tagB === t.name
+        );
+        if (overlaps.length > 0) {
+          errors.push({
+            tag: t.name,
+            code: 'REGISTER_OVERLAP_COLLISION',
+            error: overlaps[0].reason,
+          });
+          continue;
+        }
+
+        candidateTags[t.name] = candidate;
         upserted.push(t.name);
       }
 
-      store.saveProject(project);
+      if (upserted.length > 0) {
+        project.tags = candidateTags;
+        store.saveProject(project);
+      }
+
       return {
         upsertedCount: upserted.length,
         upserted,
@@ -766,12 +1242,13 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Low-Latency Telemetry Read & Safety-Interlocked Write Primitive',
     safetyTier: 'control_guarded',
     description:
-      'Execute granular telemetry reads or safety-guarded control writes. Rejects writes to RO registers (X/AI), enforces safeMin/safeMax engineering limits, checks E-Stop interlock state, and requires explicit confirmSafetyOverride + reason for interlocked outputs.',
+      'Execute granular telemetry reads (with optional raw ADC linear scaling preview) or strictly type/range/interlock-guarded control writes. Rejects RO writes, NaN/overflow, out-of-range values, and unconfirmed SIL interlocks.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       operation: z.enum(['READ', 'WRITE']),
       tagName: z.string().min(1),
       value: z.union([z.number(), z.boolean(), z.string()]).optional(),
+      rawAdcInput: z.number().optional(),
       dryRun: z.boolean().default(false),
       confirmSafetyOverride: z.boolean().default(false),
       reason: z.string().max(200).optional(),
@@ -782,19 +1259,22 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       tagName: 'Chiller_Setpoint_C',
       value: 8.5,
       dryRun: true,
-      reason: 'Agent energy optimization setpoint test',
+      reason: 'Agent setpoint verification',
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       const tag = project.tags[input.tagName];
-      if (!tag) {
-        throw new Error(`Tag "${input.tagName}" not found in project "${project.id}".`);
-      }
+      if (!tag) throw new Error(`Tag "${input.tagName}" not found in project "${project.id}".`);
 
       if (input.operation === 'READ') {
+        const scaledPreview =
+          input.rawAdcInput !== undefined && tag.scaling
+            ? applyLinearScaling(input.rawAdcInput, tag.scaling)
+            : undefined;
         return {
           tagName: tag.name,
           value: tag.currentValue,
+          ...(scaledPreview !== undefined ? { scaledFromRawAdc: scaledPreview } : {}),
           unit: tag.unit,
           dataType: tag.dataType,
           quality: tag.quality,
@@ -804,72 +1284,18 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         };
       }
 
-      if (input.value === undefined) {
-        throw new Error('WRITE operation requires an explicit "value".');
-      }
+      if (input.value === undefined) throw new Error('WRITE operation requires an explicit "value".');
 
-      if (tag.access === 'RO') {
+      const guard = checkTagWriteSafety(project, input.tagName, input.value, input.confirmSafetyOverride);
+      if (!guard.ok) {
         store.appendAudit(project, {
           actor: 'mcp-agent',
           action: 'TAG_WRITE',
           target: tag.name,
           outcome: 'BLOCKED',
-          detail: 'Attempted write to RO hardware register.',
+          detail: `${guard.blockedBy}: ${guard.message}`,
         });
-        return {
-          written: false,
-          blockedBy: 'READ_ONLY_GUARD',
-          message: `Tag "${tag.name}" (${tag.address ?? tag.scope}) is read-only (RO).`,
-        };
-      }
-
-      if (typeof input.value === 'number') {
-        if (tag.safeMin !== undefined && input.value < tag.safeMin) {
-          store.appendAudit(project, {
-            actor: 'mcp-agent',
-            action: 'TAG_WRITE',
-            target: tag.name,
-            outcome: 'BLOCKED',
-            detail: `Value ${input.value} below safeMin ${tag.safeMin}.`,
-          });
-          return {
-            written: false,
-            blockedBy: 'SAFE_RANGE_MIN',
-            message: `Rejected value ${input.value} for "${tag.name}": below safeMin (${tag.safeMin}).`,
-          };
-        }
-        if (tag.safeMax !== undefined && input.value > tag.safeMax) {
-          store.appendAudit(project, {
-            actor: 'mcp-agent',
-            action: 'TAG_WRITE',
-            target: tag.name,
-            outcome: 'BLOCKED',
-            detail: `Value ${input.value} above safeMax ${tag.safeMax}.`,
-          });
-          return {
-            written: false,
-            blockedBy: 'SAFE_RANGE_MAX',
-            message: `Rejected value ${input.value} for "${tag.name}": above safeMax (${tag.safeMax}).`,
-          };
-        }
-      }
-
-      const estop = project.tags['EStop_OK'];
-      if (tag.requiresInterlock && estop && estop.currentValue === false) {
-        return {
-          written: false,
-          blockedBy: 'ESTOP_INTERLOCK_ACTIVE',
-          message: `Write to "${tag.name}" blocked: EStop_OK is FALSE.`,
-        };
-      }
-
-      if (tag.requiresInterlock && !input.confirmSafetyOverride) {
-        return {
-          written: false,
-          blockedBy: 'INTERLOCK_CONFIRMATION_REQUIRED',
-          safetyClass: tag.safetyClass,
-          message: `Tag "${tag.name}" (${tag.safetyClass}) requires confirmSafetyOverride=true and a reason before writing.`,
-        };
+        return { written: false, ...guard };
       }
 
       const previousValue = tag.currentValue;
@@ -879,7 +1305,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           action: 'TAG_WRITE_DRY_RUN',
           target: tag.name,
           outcome: 'SIMULATED',
-          detail: `Dry-run ${previousValue} -> ${input.value} (${input.reason ?? 'no reason'})`,
+          detail: `Dry-run ${previousValue} -> ${guard.normalizedValue} (${input.reason ?? 'no reason'})`,
         });
         return {
           written: false,
@@ -887,11 +1313,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           wouldPassGuards: true,
           tagName: tag.name,
           previousValue,
-          proposedValue: input.value,
+          proposedValue: guard.normalizedValue,
         };
       }
 
-      tag.currentValue = input.value;
+      tag.previousValue = previousValue;
+      tag.currentValue = guard.normalizedValue;
       tag.updatedAt = new Date().toISOString();
       store.saveProject(project);
       store.appendAudit(project, {
@@ -899,7 +1326,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         action: 'TAG_WRITE',
         target: tag.name,
         outcome: 'ALLOWED',
-        detail: `${previousValue} -> ${input.value} (${input.reason ?? 'agent control'})`,
+        detail: `${previousValue} -> ${guard.normalizedValue} (${input.reason ?? 'agent control'})`,
       });
       return {
         written: true,
@@ -911,16 +1338,112 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
   }),
 
+  defineTool({
+    name: 'haiwell_tag_batch_io',
+    domain: 'tags',
+    haiwellFeature: 'Atomic All-or-Nothing Multi-Tag Telemetry Read & Control Write',
+    safetyTier: 'control_guarded',
+    description:
+      'High-throughput batch telemetry READ across multiple tags or atomic all-or-nothing guarded WRITE (if ANY tag fails RO/type/range/E-Stop/interlock checks, ZERO tags are mutated).',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      operation: z.enum(['READ', 'WRITE']),
+      tagNames: z.array(z.string()).optional(),
+      writes: z
+        .array(
+          z.object({
+            tagName: z.string().min(1),
+            value: z.union([z.number(), z.boolean(), z.string()]),
+          })
+        )
+        .optional(),
+      dryRun: z.boolean().default(true),
+      confirmSafetyOverride: z.boolean().default(false),
+      reason: z.string().max(200).optional(),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      operation: 'READ',
+      tagNames: ['EStop_OK', 'Supply_Temp_C', 'Chiller_Setpoint_C', 'Pump1_Run_Cmd'],
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      if (input.operation === 'READ') {
+        const names = input.tagNames ?? Object.keys(project.tags);
+        const values: Record<string, unknown> = {};
+        const missing: string[] = [];
+        for (const n of names) {
+          const t = project.tags[n];
+          if (!t) missing.push(n);
+          else values[n] = { value: t.currentValue, unit: t.unit, quality: t.quality, type: t.dataType };
+        }
+        return { count: Object.keys(values).length, values, missing };
+      }
+
+      if (!input.writes || input.writes.length === 0) {
+        throw new Error('Batch WRITE requires non-empty writes array.');
+      }
+
+      // Phase 1: pre-flight ALL writes atomically
+      const rejections: { tagName: string; blockedBy: string; message: string }[] = [];
+      const validated: { tagName: string; normalizedValue: number | boolean | string; previousValue: number | boolean | string }[] = [];
+
+      for (const w of input.writes) {
+        const check = checkTagWriteSafety(project, w.tagName, w.value, input.confirmSafetyOverride);
+        if (!check.ok) {
+          rejections.push({ tagName: w.tagName, blockedBy: check.blockedBy, message: check.message });
+        } else {
+          validated.push({
+            tagName: w.tagName,
+            normalizedValue: check.normalizedValue,
+            previousValue: check.tag.currentValue,
+          });
+        }
+      }
+
+      if (rejections.length > 0) {
+        return {
+          atomicCommitted: false,
+          writtenCount: 0,
+          rejections,
+          message: 'Atomic batch write aborted: zero tags were modified.',
+        };
+      }
+
+      if (input.dryRun) {
+        return { atomicCommitted: false, dryRun: true, wouldPassGuards: true, plannedCount: validated.length, planned: validated };
+      }
+
+      // Phase 2: commit all
+      const now = new Date().toISOString();
+      for (const item of validated) {
+        const t = project.tags[item.tagName];
+        t.previousValue = t.currentValue;
+        t.currentValue = item.normalizedValue;
+        t.updatedAt = now;
+      }
+      store.saveProject(project);
+      store.appendAudit(project, {
+        actor: 'mcp-agent',
+        action: 'TAG_BATCH_WRITE',
+        target: validated.map((v) => v.tagName).join(','),
+        outcome: 'ALLOWED',
+        detail: `Atomically wrote ${validated.length} tags (${input.reason ?? 'batch control'}).`,
+      });
+      return { atomicCommitted: true, writtenCount: validated.length, committed: validated };
+    },
+  }),
+
   // =========================================================================
   // 4. IEC 61131-3 PLC LOGIC VALIDATION, POU MANAGEMENT & TRANSPILATION
   // =========================================================================
   defineTool({
     name: 'haiwell_iec61131_validate',
     domain: 'iec61131',
-    haiwellFeature: 'Strict IEC 61131-3 Validator (ST / LD / FBD)',
+    haiwellFeature: 'Hardened IEC 61131-3 Validator (ST / LD / FBD)',
     safetyTier: 'read',
     description:
-      'Strictly validate IEC 61131-3 Structured Text (ST), Ladder Diagram (LD JSON graph), or Function Block Diagram (FBD JSON network) against runtime safety rules: undeclared vars, division by zero, unbounded WHILE TRUE watchdog hazards, REAL exact equality, VAR_INPUT/%I writes, implicit narrowing, double-coil hazards, and balanced control flow.',
+      'Strictly validate IEC 61131-3 Structured Text (ST), Ladder Diagram (LD JSON graph), or Function Block Diagram (FBD JSON network) against runtime safety rules: multi-line/single-line blocks, ARRAYs, condition var resolution, unguarded division, unbounded WHILE/REPEAT watchdog hazards, REAL exact equality, CASE/ELSE completeness, VAR_INPUT/%I writes, implicit narrowing, LD double-coil hazards, and FBD cycle detection.',
     inputSchema: z.object({
       language: z.enum(['ST', 'LD', 'FBD']).default('ST'),
       pouName: z.string().default('Main'),
@@ -929,22 +1452,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     sampleInput: {
       language: 'ST',
       pouName: 'PumpSafetyInterlock',
-      source: [
-        'PROGRAM PumpSafetyInterlock',
-        'VAR_INPUT',
-        '  EStop_OK AT %IX0.0 : BOOL;',
-        '  FlowRate : REAL;',
-        'END_VAR',
-        'VAR_OUTPUT',
-        '  PumpCmd AT %QX0.0 : BOOL;',
-        'END_VAR',
-        'IF NOT EStop_OK THEN',
-        '  PumpCmd := FALSE;',
-        'ELSIF FlowRate > 15.0 THEN',
-        '  PumpCmd := TRUE;',
-        'END_IF;',
-        'END_PROGRAM',
-      ].join('\n'),
+      source:
+        'PROGRAM PumpSafetyInterlock\nVAR_INPUT\n  EStop_OK AT %IX0.0 : BOOL;\n  FlowRate : REAL;\nEND_VAR\nVAR_OUTPUT\n  PumpCmd AT %QX0.0 : BOOL;\nEND_VAR\nIF NOT EStop_OK THEN\n  PumpCmd := FALSE;\nELSIF FlowRate > 15.0 THEN\n  PumpCmd := TRUE;\nEND_IF;\nEND_PROGRAM',
     },
     handler: (input) => {
       if (input.language === 'ST') return validateStructuredText(input.source);
@@ -987,11 +1496,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             : validateFbdNetwork(input.name, input.source);
 
       if (!validation.valid) {
-        return {
-          saved: false,
-          reason: 'IEC_61131_3_VALIDATION_FAILED',
-          validation,
-        };
+        return { saved: false, reason: 'IEC_61131_3_VALIDATION_FAILED', validation };
       }
 
       const missingTags = input.boundTags.filter((t) => !project.tags[t]);
@@ -1019,7 +1524,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'IEC 61131-3 ST to Haiwell SCADA JavaScript Transpiler',
     safetyTier: 'design',
     description:
-      'Transpile validated IEC 61131-3 Structured Text into watchdog-safe Haiwell Cloud SCADA JavaScript (using Tag.Read/Tag.Write) and optionally register it as a cyclic SCADA script.',
+      'Transpile validated IEC 61131-3 Structured Text (including IF/CASE/FOR/LIMIT/SEL) into watchdog-safe Haiwell Cloud SCADA JavaScript and optionally register as a cyclic SCADA script.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       source: z.string().min(1),
@@ -1031,7 +1536,6 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       projectId: DEFAULT_PROJECT_ID,
       source:
         'PROGRAM DeltaCalc\nVAR_INPUT\n  Supply_Temp_C : REAL;\n  Return_Temp_C : REAL;\nEND_VAR\nVAR_OUTPUT\n  Plant_DeltaT_C : REAL;\nEND_VAR\nPlant_DeltaT_C := Return_Temp_C - Supply_Temp_C;\nEND_PROGRAM',
-      tagBindings: {},
     },
     handler: (input, store) => {
       const result = transpileStToHaiwellJs(input.source, input.tagBindings);
@@ -1040,7 +1544,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       }
       if (input.registerScriptId) {
         const project = store.getProject(input.projectId);
-        const scriptCheck = validateHaiwellScript(result.jsCode, project.tags);
+        const scriptCheck = validateHaiwellScript(result.jsCode, project.tags, {
+          trigger: 'CYCLIC',
+          intervalMs: input.cyclicIntervalMs,
+        });
         const entry = {
           id: input.registerScriptId,
           name: result.validation.pouName ?? input.registerScriptId,
@@ -1062,7 +1569,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   // =========================================================================
-  // 5. AUTOMATED HMI SCREEN & LAYOUT GENERATION
+  // 5. AUTOMATED ISA-101 HMI LAYOUTS & REUSABLE FACEPLATES
   // =========================================================================
   defineTool({
     name: 'haiwell_hmi_screen_generate',
@@ -1070,7 +1577,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Automated ISA-101 HMI Screen & Responsive Layout Generator',
     safetyTier: 'design',
     description:
-      'Generate a collision-free Haiwell Cloud SCADA / Cloud HMI screen following ISA-101 High-Performance HMI guidelines with automatic PC/Web/Mobile unified scaling, tag verification, and optional SVG export.',
+      'Generate a collision-free Haiwell Cloud SCADA / Cloud HMI screen using 2D occupancy auto-layout (zero silent drops), touch-target >=44px checks, navigation verification, and optional SVG export.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       screenId: z.string().regex(/^[a-z0-9_-]{2,48}$/),
@@ -1087,29 +1594,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         .array(
           z.object({
             id: z.string().optional(),
-            type: z.enum([
-              'NUMERIC_DISPLAY',
-              'NUMERIC_INPUT',
-              'BIT_BUTTON',
-              'BIT_LAMP',
-              'MULTI_STATE_INDICATOR',
-              'BAR_GRAPH',
-              'GAUGE',
-              'TANK',
-              'PUMP',
-              'VALVE',
-              'PIPELINE',
-              'TREND_CHART',
-              'ALARM_BANNER',
-              'RECIPE_SELECTOR',
-              'CAMERA_VIEW',
-              'DATA_TABLE',
-              'NAV_BAR',
-              'LABEL',
-            ]),
+            type: z.enum(WIDGET_TYPES),
             label: z.string().min(1).max(80),
             tagName: z.string().optional(),
             writeEnabled: z.boolean().default(false),
+            targetScreenId: z.string().optional(),
             unit: z.string().optional(),
             min: z.number().optional(),
             max: z.number().optional(),
@@ -1130,20 +1619,27 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         { type: 'NUMERIC_DISPLAY', label: 'Supply Temp', tagName: 'Supply_Temp_C', unit: '°C' },
         { type: 'BAR_GRAPH', label: 'Bypass Valve', tagName: 'Valve_Position_Pct', unit: '%', min: 0, max: 100 },
       ],
-      returnSvg: false,
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
-      const screen = generateAutoLayoutScreen(input);
-      const validation = validateHmiScreen(screen, project.tags);
+      const { screen, overflowWidgets } = generateAutoLayoutScreenDetailed(input);
+      const screenIds = new Set([...project.screens.map((s) => s.id), screen.id]);
+      const validation = validateHmiScreen(screen, project.tags, {
+        knownScreenIds: screenIds,
+        targetHardware: project.targetHardware,
+      });
       const idx = project.screens.findIndex((s) => s.id === screen.id);
       if (idx >= 0) project.screens[idx] = screen;
       else project.screens.push(screen);
       store.saveProject(project);
       return {
         generated: true,
+        overflowWidgets,
         screen,
-        validation,
+        validation: {
+          ...validation,
+          valid: validation.valid && overflowWidgets.length === 0,
+        },
         ...(input.returnSvg ? { svg: renderScreenToSvg(screen, project.tags) } : {}),
       };
     },
@@ -1152,35 +1648,16 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_hmi_widget_upsert',
     domain: 'hmi',
-    haiwellFeature: 'Granular HMI Widget Placement & Collision Check',
+    haiwellFeature: 'Granular HMI Widget Placement, Touch-Target & Collision Check',
     safetyTier: 'design',
     description:
-      'Add or update an individual HMI control widget on an existing Haiwell screen, validating bounds, overlap collisions, and bound tag access rights.',
+      'Add or update an individual HMI control widget on an existing Haiwell screen, validating bounds, collisions, touch-target dimensions, navigation links, and tag access rights.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       screenId: z.string().min(1),
       widget: z.object({
         id: z.string().min(1),
-        type: z.enum([
-          'NUMERIC_DISPLAY',
-          'NUMERIC_INPUT',
-          'BIT_BUTTON',
-          'BIT_LAMP',
-          'MULTI_STATE_INDICATOR',
-          'BAR_GRAPH',
-          'GAUGE',
-          'TANK',
-          'PUMP',
-          'VALVE',
-          'PIPELINE',
-          'TREND_CHART',
-          'ALARM_BANNER',
-          'RECIPE_SELECTOR',
-          'CAMERA_VIEW',
-          'DATA_TABLE',
-          'NAV_BAR',
-          'LABEL',
-        ]),
+        type: z.enum(WIDGET_TYPES),
         label: z.string().min(1),
         x: z.number().int().min(0),
         y: z.number().int().min(0),
@@ -1188,6 +1665,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         height: z.number().int().min(16),
         tagName: z.string().optional(),
         writeEnabled: z.boolean().default(false),
+        targetScreenId: z.string().optional(),
         unit: z.string().optional(),
       }),
     }),
@@ -1213,9 +1691,91 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const idx = screen.widgets.findIndex((w) => w.id === input.widget.id);
       if (idx >= 0) screen.widgets[idx] = input.widget;
       else screen.widgets.push(input.widget);
-      const validation = validateHmiScreen(screen, project.tags);
+      const validation = validateHmiScreen(screen, project.tags, {
+        knownScreenIds: new Set(project.screens.map((s) => s.id)),
+        targetHardware: project.targetHardware,
+      });
       store.saveProject(project);
       return { upserted: true, screenId: screen.id, widgetCount: screen.widgets.length, validation };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_hmi_faceplate_manage',
+    domain: 'hmi',
+    haiwellFeature: 'Reusable Parameterized HMI Faceplate Templates',
+    safetyTier: 'design',
+    description:
+      'Define reusable Haiwell HMI faceplate templates with {{PLACEHOLDER}} tag bindings or instantiate a faceplate onto a target screen with collision and tag validation.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      action: z.enum(['DEFINE', 'INSTANTIATE', 'LIST']),
+      faceplateId: z.string().optional(),
+      name: z.string().optional(),
+      width: z.number().int().min(40).default(240),
+      height: z.number().int().min(40).default(120),
+      tagPlaceholders: z.array(z.string()).default([]),
+      widgets: z
+        .array(
+          z.object({
+            type: z.enum(WIDGET_TYPES),
+            label: z.string().min(1),
+            x: z.number().int().min(0),
+            y: z.number().int().min(0),
+            width: z.number().int().min(16),
+            height: z.number().int().min(16),
+            tagName: z.string().optional(),
+            writeEnabled: z.boolean().default(false),
+          })
+        )
+        .optional(),
+      targetScreenId: z.string().optional(),
+      instanceId: z.string().optional(),
+      originX: z.number().int().min(0).default(20),
+      originY: z.number().int().min(0).default(460),
+      tagPrefix: z.string().default('Pump1'),
+      tagOverrides: z.record(z.string(), z.string()).default({}),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      action: 'LIST',
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      if (input.action === 'LIST') {
+        return { count: project.faceplates.length, faceplates: project.faceplates };
+      }
+      if (input.action === 'DEFINE') {
+        if (!input.faceplateId || !input.name || !input.widgets?.length) {
+          throw new Error('DEFINE requires faceplateId, name, and widgets.');
+        }
+        const tpl = {
+          id: input.faceplateId,
+          name: input.name,
+          width: input.width,
+          height: input.height,
+          tagPlaceholders: input.tagPlaceholders,
+          widgets: input.widgets,
+        };
+        const idx = project.faceplates.findIndex((f) => f.id === tpl.id);
+        if (idx >= 0) project.faceplates[idx] = tpl;
+        else project.faceplates.push(tpl);
+        store.saveProject(project);
+        return { defined: true, faceplate: tpl };
+      }
+      const tpl = project.faceplates.find((f) => f.id === input.faceplateId);
+      if (!tpl) throw new Error(`Faceplate "${input.faceplateId}" not found.`);
+      const scr = project.screens.find((s) => s.id === input.targetScreenId);
+      if (!scr) throw new Error(`Target screen "${input.targetScreenId}" not found.`);
+      const instId = input.instanceId ?? `${tpl.id}_${Date.now()}`;
+      const expanded = instantiateFaceplate(tpl, instId, input.originX, input.originY, input.tagPrefix, input.tagOverrides);
+      scr.widgets.push(...expanded);
+      const validation = validateHmiScreen(scr, project.tags, {
+        knownScreenIds: new Set(project.screens.map((s) => s.id)),
+        targetHardware: project.targetHardware,
+      });
+      store.saveProject(project);
+      return { instantiated: true, addedWidgets: expanded, validation };
     },
   }),
 
@@ -1245,18 +1805,21 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   // =========================================================================
-  // 6. HAIWELL JAVASCRIPT SCRIPTING ENGINE
+  // 6. HAIWELL JAVASCRIPT ENGINE & DECLARATIVE EVENT TRIGGERS
   // =========================================================================
   defineTool({
     name: 'haiwell_script_validate',
     domain: 'scripts',
-    haiwellFeature: 'Haiwell JavaScript Static Analyzer',
+    haiwellFeature: 'Lexer-Hardened Haiwell JavaScript Static Analyzer',
     safetyTier: 'read',
     description:
-      'Validate Haiwell Cloud SCADA JavaScript scripts for Tag.Read/Tag.Write bindings, read-only tag protection, syntax balance, and watchdog-safe non-blocking execution.',
+      'Validate Haiwell Cloud SCADA JavaScript scripts with string/comment-aware delimiter balancing, sandbox escape blocking, Tag.Read/Tag.Write cross-referencing, RO tag protection, and SIL interlock warnings.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       code: z.string().min(1),
+      trigger: z.enum(['STARTUP', 'SHUTDOWN', 'CYCLIC', 'TAG_CHANGE', 'SCREEN_EVENT', 'ALARM_EVENT']).optional(),
+      intervalMs: z.number().int().optional(),
+      triggerTag: z.string().optional(),
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
@@ -1264,7 +1827,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
-      return validateHaiwellScript(input.code, project.tags);
+      return validateHaiwellScript(input.code, project.tags, {
+        trigger: input.trigger,
+        intervalMs: input.intervalMs,
+        triggerTag: input.triggerTag,
+      });
     },
   }),
 
@@ -1274,13 +1841,13 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Haiwell JavaScript Script Registration',
     safetyTier: 'design',
     description:
-      'Validate and save a Haiwell Cloud SCADA JavaScript task (STARTUP, SHUTDOWN, CYCLIC, TAG_CHANGE, SCREEN_EVENT, ALARM_EVENT). Blocks saving on static validation errors.',
+      'Validate and save a Haiwell Cloud SCADA JavaScript task (STARTUP, SHUTDOWN, CYCLIC, TAG_CHANGE, SCREEN_EVENT, ALARM_EVENT). Blocks saving on static validation or trigger configuration errors.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
       name: z.string().min(2).max(80),
       trigger: z.enum(['STARTUP', 'SHUTDOWN', 'CYCLIC', 'TAG_CHANGE', 'SCREEN_EVENT', 'ALARM_EVENT']),
-      intervalMs: z.number().int().min(100).max(3600000).optional(),
+      intervalMs: z.number().int().min(50).max(3600000).optional(),
       triggerTag: z.string().optional(),
       code: z.string().min(1),
     }),
@@ -1294,10 +1861,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
-      const validation = validateHaiwellScript(input.code, project.tags);
-      if (!validation.valid) {
-        return { saved: false, validation };
-      }
+      const validation = validateHaiwellScript(input.code, project.tags, {
+        trigger: input.trigger,
+        intervalMs: input.intervalMs,
+        triggerTag: input.triggerTag,
+      });
+      if (!validation.valid) return { saved: false, validation };
       const script = {
         id: input.id,
         name: input.name,
@@ -1317,8 +1886,58 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
   }),
 
+  defineTool({
+    name: 'haiwell_event_trigger_configure',
+    domain: 'scripts',
+    haiwellFeature: 'Declarative Tag-to-Action Event Triggers',
+    safetyTier: 'design',
+    description:
+      'Configure non-script Haiwell Cloud SCADA Event Triggers (RISING_EDGE, FALLING_EDGE, ON_CHANGE, GT, LT, EQ) bound to OPEN_SCREEN, WRITE_TAG, RUN_SCRIPT, DOWNLOAD_RECIPE, or SEND_WEBHOOK with referential integrity validation.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+      name: z.string().min(2).max(80),
+      sourceTag: z.string().min(1),
+      condition: z.enum(['RISING_EDGE', 'FALLING_EDGE', 'ON_CHANGE', 'GT', 'LT', 'EQ']),
+      threshold: z.number().optional(),
+      actionType: z.enum(['OPEN_SCREEN', 'WRITE_TAG', 'RUN_SCRIPT', 'DOWNLOAD_RECIPE', 'SEND_WEBHOOK']),
+      targetId: z.string().min(1),
+      actionValue: z.union([z.number(), z.boolean(), z.string()]).optional(),
+      enabled: z.boolean().default(true),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      id: 'trg_high_temp_valve',
+      name: 'Open Bypass Valve On High Supply Temp',
+      sourceTag: 'Supply_Temp_C',
+      condition: 'GT',
+      threshold: 12.0,
+      actionType: 'WRITE_TAG',
+      targetId: 'Chiller_Setpoint_C',
+      actionValue: 6.5,
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      if (!project.tags[input.sourceTag]) throw new Error(`sourceTag "${input.sourceTag}" does not exist.`);
+      if (input.actionType === 'WRITE_TAG') {
+        const t = project.tags[input.targetId];
+        if (!t) throw new Error(`Target tag "${input.targetId}" does not exist.`);
+        if (t.access === 'RO') throw new Error(`Target tag "${input.targetId}" is read-only.`);
+      } else if (input.actionType === 'OPEN_SCREEN' && !project.screens.some((s) => s.id === input.targetId)) {
+        throw new Error(`Target screen "${input.targetId}" does not exist.`);
+      } else if (input.actionType === 'RUN_SCRIPT' && !project.scripts.some((s) => s.id === input.targetId)) {
+        throw new Error(`Target script "${input.targetId}" does not exist.`);
+      }
+      const idx = project.eventTriggers.findIndex((e) => e.id === input.id);
+      if (idx >= 0) project.eventTriggers[idx] = input;
+      else project.eventTriggers.push(input);
+      store.saveProject(project);
+      return { configured: true, eventTrigger: input };
+    },
+  }),
+
   // =========================================================================
-  // 7. ALARMS & MULTI-CHANNEL CLOUD NOTIFICATIONS
+  // 7. ISA-18.2 ALARMS & MULTI-CHANNEL CLOUD NOTIFICATIONS
   // =========================================================================
   defineTool({
     name: 'haiwell_alarm_configure',
@@ -1326,7 +1945,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'ISA-18.2 Alarm Rules & Cloud Multi-Channel Notifications',
     safetyTier: 'design',
     description:
-      'Create or update digital/analog alarms (HIHI, HI, LO, LOLO, ROC, DEV) with deadband, debounce delays, priority, and multi-channel Cloud routing (Screen Pop-up, Voice TTS, Mobile App Push, WeChat, SMS, Email).',
+      'Create or update digital/analog alarms (HIHI, HI, LO, LOLO, ROC, DEV) with deadband hysteresis, debounce delays, priority (1-4), and multi-channel Cloud routing (Screen Pop-up, Voice TTS, Mobile App Push, WeChat, SMS, Email).',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
@@ -1334,10 +1953,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       tagName: z.string().min(1),
       condition: z.enum(['DIGITAL_HIGH', 'DIGITAL_LOW', 'HIHI', 'HI', 'LO', 'LOLO', 'ROC', 'DEV']),
       threshold: z.number(),
+      referenceValue: z.number().optional(),
       deadband: z.number().min(0).default(0.2),
       delayOnMs: z.number().int().min(0).default(2000),
       delayOffMs: z.number().int().min(0).default(1000),
-      priority: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]).default(2),
+      priority: z.number().int().min(1).max(4).default(2),
       group: z.string().default('PROCESS'),
       messageTemplate: z.string().min(3).max(240),
       channels: z.array(z.enum(['SCREEN_POPUP', 'VOICE_TTS', 'MOBILE_PUSH', 'WECHAT', 'SMS', 'EMAIL'])).min(1),
@@ -1360,7 +1980,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (!project.tags[input.tagName]) {
         throw new Error(`Alarm tag "${input.tagName}" does not exist in project "${project.id}".`);
       }
-      const alarm = { ...input, enabled: true };
+      const alarm = { ...input, priority: input.priority as 1 | 2 | 3 | 4, enabled: true };
       const idx = project.alarms.findIndex((a) => a.id === alarm.id);
       if (idx >= 0) project.alarms[idx] = alarm;
       else project.alarms.push(alarm);
@@ -1372,62 +1992,47 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_alarm_manage',
     domain: 'alarms',
-    haiwellFeature: 'Alarm Evaluation, Active Buffer Query & Acknowledgment',
+    haiwellFeature: 'ISA-18.2 Deduplicating Alarm Evaluation, Shelving & Acknowledgment',
     safetyTier: 'control_guarded',
     description:
-      'Evaluate all configured alarm thresholds against current tag values, list active/historical alarms, or acknowledge active alarms with an audit record.',
+      'Run the deduplicating ISA-18.2 alarm state machine (deadband hysteresis, ROC/DEV, auto-clear to CLEARED_UNACK/NORMAL), list alarm history, acknowledge alarms, or temporarily shelve maintenance alarms.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
-      action: z.enum(['EVALUATE', 'LIST', 'ACKNOWLEDGE']),
+      action: z.enum(['EVALUATE', 'LIST', 'ACKNOWLEDGE', 'SHELVE']),
       eventId: z.string().optional(),
+      alarmId: z.string().optional(),
+      shelveMinutes: z.number().int().min(1).max(1440).default(30),
       operator: z.string().default('mcp-agent'),
     }),
     sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'EVALUATE' },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       if (input.action === 'EVALUATE') {
-        const triggered: typeof project.alarmHistory = [];
-        for (const alm of project.alarms) {
-          if (!alm.enabled) continue;
-          const tag = project.tags[alm.tagName];
-          if (!tag) continue;
-          const numVal = typeof tag.currentValue === 'boolean' ? (tag.currentValue ? 1 : 0) : Number(tag.currentValue);
-          const tripped =
-            (alm.condition === 'HIHI' || alm.condition === 'HI') ? numVal >= alm.threshold :
-            (alm.condition === 'LO' || alm.condition === 'LOLO') ? numVal <= alm.threshold :
-            alm.condition === 'DIGITAL_HIGH' ? numVal === 1 :
-            alm.condition === 'DIGITAL_LOW' ? numVal === 0 :
-            false;
-          if (tripped) {
-            const ev = {
-              eventId: `ev_${alm.id}_${Date.now()}`,
-              alarmId: alm.id,
-              tagName: alm.tagName,
-              value: tag.currentValue,
-              priority: alm.priority,
-              message: alm.messageTemplate,
-              state: 'ACTIVE_UNACK' as const,
-              triggeredAt: new Date().toISOString(),
-            };
-            project.alarmHistory.push(ev);
-            triggered.push(ev);
-          }
-        }
+        const summary = evaluateProjectAlarms(project);
         store.saveProject(project);
-        return { evaluatedRules: project.alarms.length, newlyTriggered: triggered.length, events: triggered };
+        return summary;
       }
-
       if (input.action === 'ACKNOWLEDGE') {
         if (!input.eventId) throw new Error('ACKNOWLEDGE requires eventId.');
         const ev = project.alarmHistory.find((e) => e.eventId === input.eventId);
         if (!ev) throw new Error(`Alarm event "${input.eventId}" not found.`);
-        ev.state = 'ACTIVE_ACK';
+        ev.state = ev.state === 'CLEARED_UNACK' ? 'NORMAL' : 'ACTIVE_ACK';
         ev.acknowledgedAt = new Date().toISOString();
         ev.acknowledgedBy = input.operator;
         store.saveProject(project);
         return { acknowledged: true, event: ev };
       }
-
+      if (input.action === 'SHELVE') {
+        if (!input.alarmId) throw new Error('SHELVE requires alarmId.');
+        const alm = project.alarms.find((a) => a.id === input.alarmId);
+        if (!alm) throw new Error(`Alarm "${input.alarmId}" not found.`);
+        if (alm.priority === 1) {
+          return { shelved: false, blockedBy: 'SIL_PRIORITY1_NO_SHELVE', message: 'ISA-18.2 safety policy forbids shelving Priority-1 alarms.' };
+        }
+        alm.shelvedUntil = new Date(Date.now() + input.shelveMinutes * 60000).toISOString();
+        store.saveProject(project);
+        return { shelved: true, alarmId: alm.id, shelvedUntil: alm.shelvedUntil };
+      }
       return {
         definedCount: project.alarms.length,
         activeCount: project.alarmHistory.filter((e) => e.state.startsWith('ACTIVE')).length,
@@ -1437,7 +2042,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   // =========================================================================
-  // 8. MQTT & HAIWELL CLOUD IOT INTEGRATION
+  // 8. MQTT 3.1.1/5.0, SPARKPLUG B & HAIWELL CLOUD IOT
   // =========================================================================
   defineTool({
     name: 'haiwell_mqtt_configure',
@@ -1468,6 +2073,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
+      if (input.lwtTopic) {
+        const lwtCheck = validateMqttTopic(input.lwtTopic, 'PUBLISH');
+        if (!lwtCheck.valid) throw new Error(`Invalid lwtTopic: ${lwtCheck.errors.join(' ')}`);
+      }
       project.mqtt = {
         ...project.mqtt,
         mode: input.mode,
@@ -1490,13 +2099,13 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'MQTT Sparkplug B / JSON Topic-to-Tag Binding',
     safetyTier: 'design',
     description:
-      'Bind Haiwell SCADA tags to an MQTT publish/subscribe topic with strict MQTT 3.1.1/5.0 wildcard validation, Sparkplug B or JSON serialization, QoS, and RBE deadband.',
+      'Bind Haiwell SCADA tags to an MQTT publish/subscribe topic with strict MQTT 3.1.1/5.0 per-level wildcard validation (+/#), $SYS guard, Sparkplug B or JSON serialization, QoS, and TLS write guards.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
       topic: z.string().min(1),
       direction: z.enum(['PUBLISH', 'SUBSCRIBE', 'BIDIRECTIONAL']),
-      qos: z.union([z.literal(0), z.literal(1), z.literal(2)]).default(1),
+      qos: z.number().int().min(0).max(2).default(1),
       retain: z.boolean().default(false),
       format: z.enum(['JSON', 'SPARKPLUG_B', 'RAW_VALUE']).default('SPARKPLUG_B'),
       tags: z.array(z.string()).min(1),
@@ -1517,37 +2126,28 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       const topicCheck = validateMqttTopic(input.topic, input.direction);
-      if (!topicCheck.valid) {
-        return { bound: false, topicValidation: topicCheck };
-      }
+      if (!topicCheck.valid) return { bound: false, topicValidation: topicCheck };
       const missingTags = input.tags.filter((t) => !project.tags[t]);
-      if (missingTags.length > 0) {
-        return { bound: false, error: `Unknown tags: ${missingTags.join(', ')}` };
-      }
+      if (missingTags.length > 0) return { bound: false, error: `Unknown tags: ${missingTags.join(', ')}` };
       if (input.allowRemoteWrite && !project.mqtt.tlsEnabled) {
         return { bound: false, error: 'SAFETY_BLOCK: Remote MQTT write requires TLS enabled on broker config.' };
       }
-      const binding = { ...input };
+      const binding = { ...input, qos: input.qos as 0 | 1 | 2 };
       const idx = project.mqtt.bindings.findIndex((b) => b.id === binding.id);
       if (idx >= 0) project.mqtt.bindings[idx] = binding;
       else project.mqtt.bindings.push(binding);
       store.saveProject(project);
-      return {
-        bound: true,
-        binding,
-        topicValidation: topicCheck,
-        samplePayload: buildMqttPayload(project, binding),
-      };
+      return { bound: true, binding, topicValidation: topicCheck, samplePayload: buildMqttPayload(project, binding) };
     },
   }),
 
   defineTool({
     name: 'haiwell_mqtt_exchange',
     domain: 'mqtt',
-    haiwellFeature: 'MQTT Publish / Loopback Inspect / Broker TCP Probe',
+    haiwellFeature: 'MQTT Publish / Loopback Inspect / SSRF-Safe Broker TCP Probe',
     safetyTier: 'protocol_io',
     description:
-      'Execute a deterministic MQTT publish (using configured Sparkplug B/JSON binding), read loopback broker messages by topic filter (+/#), or run a live TCP reachability probe against a broker host:port.',
+      'Execute a deterministic MQTT publish (Sparkplug B/JSON), inspect loopback broker messages by topic filter (+/#), or run an SSRF-safe TCP reachability probe against a broker host:port.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       action: z.enum(['PUBLISH_BINDING', 'READ_LOOPBACK', 'PROBE_BROKER']),
@@ -1556,11 +2156,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       probeHost: z.string().optional(),
       probePort: z.number().int().min(1).max(65535).optional(),
     }),
-    sampleInput: {
-      projectId: DEFAULT_PROJECT_ID,
-      action: 'PUBLISH_BINDING',
-      bindingId: 'mqtt_bind_telemetry',
-    },
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'PUBLISH_BINDING', bindingId: 'mqtt_bind_telemetry' },
     handler: async (input, store) => {
       const project = store.getProject(input.projectId);
       if (input.action === 'PUBLISH_BINDING') {
@@ -1571,19 +2167,27 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         return { published: true, topic: binding.topic, qos: binding.qos, format: binding.format, payload };
       }
       if (input.action === 'READ_LOOPBACK') {
+        if (input.topicFilter) {
+          const check = validateMqttTopic(input.topicFilter, 'SUBSCRIBE');
+          if (!check.valid) throw new Error(`Invalid topicFilter: ${check.errors.join(' ')}`);
+        }
         const messages = store.readMqttLoopback(input.topicFilter);
         return { count: messages.length, messages };
       }
-      const parsedUrl = new URL(project.mqtt.brokerUri);
-      const host = input.probeHost ?? parsedUrl.hostname;
-      const port = input.probePort ?? (Number(parsedUrl.port) || (project.mqtt.tlsEnabled ? 8883 : 1883));
+      let host = input.probeHost;
+      let port = input.probePort;
+      if (!host || !port) {
+        const parsedUrl = new URL(project.mqtt.brokerUri);
+        host = host ?? parsedUrl.hostname;
+        port = port ?? (Number(parsedUrl.port) || (project.mqtt.tlsEnabled ? 8883 : 1883));
+      }
       const probe = await probeTcpEndpoint(host, port, 1200);
       return { brokerUri: project.mqtt.brokerUri, host, port, ...probe };
     },
   }),
 
   // =========================================================================
-  // 9. OPC UA INTEROPERABILITY & NODESET2 XML
+  // 9. OPC UA INTEROPERABILITY & UANODESET2 XML
   // =========================================================================
   defineTool({
     name: 'haiwell_opcua_configure',
@@ -1636,7 +2240,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'OPC UA AddressSpace Mapping & UANodeSet2 XML Generation',
     safetyTier: 'design',
     description:
-      'Map Haiwell SCADA tags into OPC UA Variable nodes (validating read/write access alignment) and optionally export an OPC Foundation Part 6 compliant UANodeSet2 XML document.',
+      'Map Haiwell SCADA tags into OPC UA Variable nodes (deduplicated NodeIds, read/write access alignment) and optionally export OPC Foundation Part 6 UANodeSet2 XML.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       tagNames: z.array(z.string()).default([]),
@@ -1668,7 +2272,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           samplingIntervalMs: input.samplingIntervalMs,
           folderPath: input.folderPath,
         };
-        const idx = project.opcua.nodes.findIndex((n) => n.tagName === tag.name);
+        const idx = project.opcua.nodes.findIndex((n) => n.tagName === tag.name || n.nodeId === node.nodeId);
         if (idx >= 0) project.opcua.nodes[idx] = node;
         else project.opcua.nodes.push(node);
         mapped.push(node);
@@ -1686,15 +2290,16 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_opcua_browse_read_write',
     domain: 'opcua',
-    haiwellFeature: 'OPC UA AddressSpace Browse, Read & Guarded Write',
+    haiwellFeature: 'OPC UA AddressSpace Browse, Read & Interlock-Guarded Write',
     safetyTier: 'protocol_io',
     description:
-      'Browse mapped OPC UA AddressSpace nodes, read live node values with StatusCode/SourceTimestamp, or perform an access-level-checked write.',
+      'Browse mapped OPC UA AddressSpace nodes, read live node values with StatusCode/SourceTimestamp, or perform a binary-type, range, E-Stop, and interlock-guarded write.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       action: z.enum(['BROWSE', 'READ_NODE', 'WRITE_NODE']),
       nodeId: z.string().optional(),
       value: z.union([z.number(), z.boolean(), z.string()]).optional(),
+      confirmSafetyOverride: z.boolean().default(false),
     }),
     sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'BROWSE' },
     handler: (input, store) => {
@@ -1715,31 +2320,34 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const node = project.opcua.nodes.find((n) => n.nodeId === input.nodeId);
       if (!node) throw new Error(`OPC UA nodeId "${input.nodeId}" not found.`);
       const tag = project.tags[node.tagName];
+      if (!tag) throw new Error(`Bound SCADA tag "${node.tagName}" missing.`);
       if (input.action === 'READ_NODE') {
         return {
           nodeId: node.nodeId,
           statusCode: 'Good (0x00000000)',
           dataType: node.dataType,
-          value: tag?.currentValue,
-          sourceTimestamp: tag?.updatedAt,
+          value: tag.currentValue,
+          sourceTimestamp: tag.updatedAt,
         };
       }
-      if (node.accessLevel === 'CurrentRead' || tag.access === 'RO') {
-        return {
-          written: false,
-          statusCode: 'BadNotWritable (0x803B0000)',
-          message: `OPC UA Node ${node.nodeId} is read-only.`,
-        };
+      if (node.accessLevel === 'CurrentRead') {
+        return { written: false, statusCode: 'BadNotWritable (0x803B0000)', message: `OPC UA Node ${node.nodeId} is CurrentRead only.` };
       }
       if (input.value === undefined) throw new Error('WRITE_NODE requires value.');
-      if (typeof input.value === 'number' && ((tag.safeMin !== undefined && input.value < tag.safeMin) || (tag.safeMax !== undefined && input.value > tag.safeMax))) {
-        return {
-          written: false,
-          statusCode: 'BadOutOfRange (0x803C0000)',
-          message: `Value ${input.value} outside tag safety bounds [${tag.safeMin ?? '-inf'}, ${tag.safeMax ?? '+inf'}].`,
-        };
+      const guard = checkTagWriteSafety(project, tag.name, input.value, input.confirmSafetyOverride);
+      if (!guard.ok) {
+        const uaStatus =
+          guard.blockedBy === 'READ_ONLY_GUARD'
+            ? 'BadNotWritable (0x803B0000)'
+            : guard.blockedBy.startsWith('SAFE_RANGE') || guard.blockedBy.includes('OVERFLOW')
+              ? 'BadOutOfRange (0x803C0000)'
+              : guard.blockedBy.startsWith('TYPE_MISMATCH')
+                ? 'BadTypeMismatch (0x80740000)'
+                : 'BadUserAccessDenied (0x801F0000)';
+        return { written: false, statusCode: uaStatus, blockedBy: guard.blockedBy, message: guard.message };
       }
-      tag.currentValue = input.value;
+      tag.previousValue = tag.currentValue;
+      tag.currentValue = guard.normalizedValue;
       tag.updatedAt = new Date().toISOString();
       store.saveProject(project);
       return { written: true, statusCode: 'Good (0x00000000)', nodeId: node.nodeId, value: tag.currentValue };
@@ -1747,7 +2355,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   // =========================================================================
-  // 10. RECIPES & BATCH FORMULATION
+  // 10. RECIPES & ATOMIC INTERLOCK-GUARDED BATCH TRANSFER
   // =========================================================================
   defineTool({
     name: 'haiwell_recipe_define',
@@ -1755,7 +2363,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Recipe Group & Production Formula Management',
     safetyTier: 'design',
     description:
-      'Define a Haiwell SCADA recipe group bound to writable PLC/SCADA tags and upsert named production formula records with automatic safeMin/safeMax validation.',
+      'Define a Haiwell SCADA recipe group bound to writable PLC/SCADA tags and upsert named production formula records with strict binary-type and safeMin/safeMax validation.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       groupId: z.string().regex(/^[a-z0-9_-]{2,48}$/),
@@ -1785,12 +2393,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         if (!tag) throw new Error(`Recipe tag "${tagName}" does not exist.`);
         if (tag.access === 'RO') throw new Error(`Recipe tag "${tagName}" is read-only (RO).`);
         const val = input.record.values[tagName];
-        if (typeof val === 'number') {
-          if (tag.safeMin !== undefined && val < tag.safeMin) {
-            throw new Error(`Recipe value ${val} for "${tagName}" violates safeMin (${tag.safeMin}).`);
+        if (val === undefined) throw new Error(`Recipe record missing value for tag "${tagName}".`);
+        const tc = validateTagValueForType(tag.dataType, val);
+        if (!tc.valid) throw new Error(`Recipe value for "${tagName}": ${tc.error}`);
+        if (typeof tc.normalizedValue === 'number') {
+          if (tag.safeMin !== undefined && tc.normalizedValue < tag.safeMin) {
+            throw new Error(`Recipe value ${tc.normalizedValue} for "${tagName}" violates safeMin (${tag.safeMin}).`);
           }
-          if (tag.safeMax !== undefined && val > tag.safeMax) {
-            throw new Error(`Recipe value ${val} for "${tagName}" violates safeMax (${tag.safeMax}).`);
+          if (tag.safeMax !== undefined && tc.normalizedValue > tag.safeMax) {
+            throw new Error(`Recipe value ${tc.normalizedValue} for "${tagName}" violates safeMax (${tag.safeMax}).`);
           }
         }
       }
@@ -1811,16 +2422,17 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_recipe_transfer',
     domain: 'recipes',
-    haiwellFeature: 'Atomic Recipe Download (SCADA->PLC) / Upload (PLC->SCADA)',
+    haiwellFeature: 'Atomic Interlock-Guarded Recipe Download / Upload',
     safetyTier: 'control_guarded',
     description:
-      'Atomically download a recipe formula to PLC/SCADA tags (with pre-flight bounds check, rollback snapshot, and dryRun support) or upload current live tag values into a new recipe record.',
+      'Atomically download a recipe formula to PLC/SCADA tags (full pre-flight check of E-Stop, SIL interlocks, binary types, and safeMin/safeMax before writing a single tag!) or upload live PLC tag values.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       direction: z.enum(['DOWNLOAD_TO_PLC', 'UPLOAD_FROM_PLC']),
       groupId: z.string().min(1),
       recordId: z.string().min(1),
       recordName: z.string().optional(),
+      confirmSafetyOverride: z.boolean().default(false),
       dryRun: z.boolean().default(true),
     }),
     sampleInput: {
@@ -1828,6 +2440,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       direction: 'DOWNLOAD_TO_PLC',
       groupId: 'rcp_chiller_modes',
       recordId: 'eco_night',
+      confirmSafetyOverride: true,
       dryRun: true,
     },
     handler: (input, store) => {
@@ -1856,32 +2469,44 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const rec = group.records.find((r) => r.recordId === input.recordId);
       if (!rec) throw new Error(`Recipe record "${input.recordId}" not found in "${group.id}".`);
 
+      // Atomic pre-flight validation of ALL recipe tags before mutating ANY tag!
+      const rejections: { tagName: string; blockedBy: string; message: string }[] = [];
       const rollbackSnapshot: Record<string, number | boolean | string> = {};
       for (const [k, v] of Object.entries(rec.values)) {
-        const tag = project.tags[k];
-        if (!tag) throw new Error(`Tag "${k}" missing.`);
-        rollbackSnapshot[k] = tag.currentValue;
-        if (!input.dryRun) {
-          tag.currentValue = v;
-          tag.updatedAt = new Date().toISOString();
+        const check = checkTagWriteSafety(project, k, v, input.confirmSafetyOverride);
+        if (!check.ok) {
+          rejections.push({ tagName: k, blockedBy: check.blockedBy, message: check.message });
+        } else {
+          rollbackSnapshot[k] = check.tag.currentValue;
         }
       }
+      if (rejections.length > 0) {
+        return {
+          transferred: false,
+          atomicAborted: true,
+          rejections,
+          message: 'Recipe download aborted in pre-flight safety check; zero PLC tags modified.',
+        };
+      }
+
       if (!input.dryRun) {
+        const now = new Date().toISOString();
+        for (const [k, v] of Object.entries(rec.values)) {
+          const tag = project.tags[k];
+          tag.previousValue = tag.currentValue;
+          tag.currentValue = v;
+          tag.updatedAt = now;
+        }
         store.saveProject(project);
         store.appendAudit(project, {
           actor: 'mcp-agent',
           action: 'RECIPE_DOWNLOAD',
           target: `${group.id}:${rec.recordId}`,
           outcome: 'ALLOWED',
-          detail: `Downloaded ${Object.keys(rec.values).length} parameters.`,
+          detail: `Atomically downloaded ${Object.keys(rec.values).length} parameters.`,
         });
       }
-      return {
-        transferred: !input.dryRun,
-        dryRun: input.dryRun,
-        appliedValues: rec.values,
-        rollbackSnapshot,
-      };
+      return { transferred: !input.dryRun, dryRun: input.dryRun, appliedValues: rec.values, rollbackSnapshot };
     },
   }),
 
@@ -1906,15 +2531,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       deadbandPercent: z.number().min(0).max(50).default(0.2),
       storageTarget: z.enum(['LOCAL_HIST', 'CLOUD_HIST', 'SQL_DATALINK']).default('LOCAL_HIST'),
     }),
-    sampleInput: {
-      projectId: DEFAULT_PROJECT_ID,
-      action: 'QUERY_SAMPLES',
-      groupId: 'trd_thermal_01',
-    },
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'QUERY_SAMPLES', groupId: 'trd_thermal_01' },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       if (input.action === 'UPSERT_GROUP') {
         if (!input.name || !input.tagNames?.length) throw new Error('UPSERT_GROUP requires name and tagNames.');
+        for (const tn of input.tagNames) {
+          if (!project.tags[tn]) throw new Error(`Trend tag "${tn}" does not exist.`);
+        }
         const group = {
           id: input.groupId,
           name: input.name,
@@ -1946,7 +2570,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   // =========================================================================
-  // 12. HAIWELL DATA-LINK EXTERNAL DATABASES
+  // 12. HAIWELL DATA-LINK DATABASES & OUTBOUND WEBHOOKS
   // =========================================================================
   defineTool({
     name: 'haiwell_datalink_configure',
@@ -1954,7 +2578,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Haiwell Data-Link (MySQL / SQL Server / PostgreSQL / SQLite)',
     safetyTier: 'design',
     description:
-      'Configure Haiwell Data-Link connectors for ERP/MES database logging with identifier sanitization and parameterized SQL generation (prevents SQL injection).',
+      'Configure Haiwell Data-Link connectors for ERP/MES database logging with identifier sanitization, duplicate-column & SQL-reserved-word rejection, and parameterized SQL generation.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
@@ -1962,8 +2586,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       engine: z.enum(['MYSQL', 'SQL_SERVER', 'POSTGRESQL', 'SQLITE']),
       host: z.string().min(1),
       port: z.number().int().min(1).max(65535),
-      database: z.string().regex(/^[A-Za-z0-9_]+$/),
-      tableName: z.string().regex(/^[A-Za-z0-9_]+$/),
+      database: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
+      tableName: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
       syncMode: z.enum(['CYCLIC_INSERT', 'TAG_TRIGGER', 'UPSERT_LATEST']).default('CYCLIC_INSERT'),
       intervalMs: z.number().int().min(1000).max(86400000).default(60000),
       columnMappings: z
@@ -1992,7 +2616,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
+      if (SQL_RESERVED.has(input.tableName.toUpperCase())) {
+        throw new Error(`tableName "${input.tableName}" is a reserved SQL keyword.`);
+      }
+      const seenCols = new Set<string>();
       for (const m of input.columnMappings) {
+        if (SQL_RESERVED.has(m.column.toUpperCase())) throw new Error(`Column "${m.column}" is a reserved SQL keyword.`);
+        if (seenCols.has(m.column.toLowerCase())) throw new Error(`Duplicate column mapping "${m.column}".`);
+        seenCols.add(m.column.toLowerCase());
         if (!project.tags[m.tagName]) throw new Error(`Data-Link mapped tag "${m.tagName}" does not exist.`);
       }
       const cfg = { ...input, parameterizedOnly: true };
@@ -2002,12 +2633,56 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       store.saveProject(project);
 
       const cols = cfg.columnMappings.map((c) => c.column).join(', ');
-      const placeholders = cfg.columnMappings.map((_, i) => (cfg.engine === 'POSTGRESQL' ? `$${i + 1}` : '?')).join(', ');
+      const placeholders = cfg.columnMappings.map((_, i) => (cfg.engine === 'POSTGRESQL' ? `$${i + 2}` : '?')).join(', ');
       return {
         configured: true,
         dataLink: cfg,
-        generatedParameterizedSql: `INSERT INTO ${cfg.tableName} (recorded_at, ${cols}) VALUES (${cfg.engine === 'POSTGRESQL' ? '$0' : '?'}, ${placeholders});`,
+        generatedParameterizedSql: `INSERT INTO ${cfg.tableName} (recorded_at, ${cols}) VALUES (${cfg.engine === 'POSTGRESQL' ? '$1' : '?'}, ${placeholders});`,
       };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_webhook_configure',
+    domain: 'datalink',
+    haiwellFeature: 'Outbound HTTPS REST / Webhook Connector (ERP / MES / WeCom / DingTalk)',
+    safetyTier: 'protocol_io',
+    description:
+      'Configure outbound HTTPS webhooks for ERP/MES/notification pipelines with TLS enforcement, SSRF metadata-host blocking, and JSON payload template validation.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+      name: z.string().min(2).max(80),
+      url: z.string().url(),
+      method: z.enum(['POST', 'PUT']).default('POST'),
+      tlsRequired: z.boolean().default(true),
+      timeoutMs: z.number().int().min(500).max(30000).default(5000),
+      headers: z.record(z.string(), z.string()).default({ 'Content-Type': 'application/json' }),
+      payloadTemplate: z.string().default('{"project":"{{projectId}}","tag":"{{tagName}}","value":"{{value}}"}'),
+      enabled: z.boolean().default(true),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      id: 'wh_mes_alerts',
+      name: 'MES Critical Alarm Webhook',
+      url: 'https://mes.factory.example/api/v1/scada-events',
+      method: 'POST',
+      tlsRequired: true,
+    },
+    handler: (input, store) => {
+      const parsed = new URL(input.url);
+      if (input.tlsRequired && parsed.protocol !== 'https:') {
+        throw new Error('SAFETY_BLOCK: tlsRequired=true forbids non-HTTPS webhook URLs.');
+      }
+      if (/^(169\.254\.|metadata\.google\.internal$|100\.100\.100\.200$)/i.test(parsed.hostname)) {
+        throw new Error(`SSRF_BLOCK: Forbidden cloud metadata host "${parsed.hostname}".`);
+      }
+      const project = store.getProject(input.projectId);
+      const idx = project.webhooks.findIndex((w) => w.id === input.id);
+      if (idx >= 0) project.webhooks[idx] = input;
+      else project.webhooks.push(input);
+      store.saveProject(project);
+      return { configured: true, webhook: input };
     },
   }),
 
@@ -2017,15 +2692,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_schedule_configure',
     domain: 'operations',
-    haiwellFeature: 'Time-Based Plan & CRON Scheduler',
+    haiwellFeature: 'Validated POSIX CRON Plan & Shift Scheduler',
     safetyTier: 'design',
     description:
-      'Configure Haiwell SCADA scheduled tasks (CRON expression, timezone, target script/tag/recipe/report) for unattended shift and maintenance automation.',
+      'Configure Haiwell SCADA scheduled tasks with strict 5-field POSIX CRON bounds checking and target existence verification (script, writable tag, recipe, or report).',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       id: z.string().regex(/^[a-z0-9_-]{2,48}$/),
       name: z.string().min(2).max(80),
-      cron: z.string().regex(/^(\S+\s+){4}\S+$/, 'Standard 5-field CRON expression required (min hour dom mon dow)'),
+      cron: z.string().min(9),
       timezone: z.string().default('UTC'),
       actionType: z.enum(['RUN_SCRIPT', 'WRITE_TAG', 'DOWNLOAD_RECIPE', 'EXPORT_REPORT']),
       targetId: z.string().min(1),
@@ -2042,7 +2717,27 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       enabled: true,
     },
     handler: (input, store) => {
+      const cronCheck = validateCronExpression(input.cron);
+      if (!cronCheck.valid) throw new Error(cronCheck.error);
       const project = store.getProject(input.projectId);
+      if (input.actionType === 'RUN_SCRIPT' && !project.scripts.some((s) => s.id === input.targetId)) {
+        throw new Error(`Scheduled target script "${input.targetId}" does not exist.`);
+      }
+      if (input.actionType === 'WRITE_TAG') {
+        const t = project.tags[input.targetId];
+        if (!t) throw new Error(`Scheduled target tag "${input.targetId}" does not exist.`);
+        if (t.access === 'RO') throw new Error(`Scheduled target tag "${input.targetId}" is read-only.`);
+      }
+      if (input.actionType === 'DOWNLOAD_RECIPE') {
+        const [grpId, recId] = input.targetId.split(':');
+        const grp = project.recipes.find((r) => r.id === grpId);
+        if (!grp || !grp.records.some((r) => r.recordId === recId)) {
+          throw new Error(`Scheduled target recipe "${input.targetId}" not found (use format groupId:recordId).`);
+        }
+      }
+      if (input.actionType === 'EXPORT_REPORT' && !project.reports.some((r) => r.id === input.targetId)) {
+        throw new Error(`Scheduled target report "${input.targetId}" does not exist.`);
+      }
       const idx = project.schedules.findIndex((s) => s.id === input.id);
       if (idx >= 0) project.schedules[idx] = input;
       else project.schedules.push(input);
@@ -2130,6 +2825,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (input.screenId && !project.screens.some((s) => s.id === input.screenId)) {
         throw new Error(`Screen "${input.screenId}" not found.`);
       }
+      if (input.alarmSnapshotTriggerId && !project.alarms.some((a) => a.id === input.alarmSnapshotTriggerId)) {
+        throw new Error(`Alarm "${input.alarmSnapshotTriggerId}" not found.`);
+      }
       const idx = project.cameras.findIndex((c) => c.id === input.id);
       if (idx >= 0) project.cameras[idx] = input;
       else project.cameras.push(input);
@@ -2182,10 +2880,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'RBAC User Groups, 128/256-bit SSL & Haiwell A/B Key Access Control',
     safetyTier: 'control_guarded',
     description:
-      'Configure Haiwell Cloud SCADA security policy: SSL encryption strength, Haiwell A/B Key remote cloud authentication, output interlock enforcement, and RBAC privilege groups (0-15).',
+      'Configure Haiwell Cloud SCADA security policy: SSL encryption strength (128/256), Haiwell A/B Key remote cloud authentication, output interlock enforcement, and RBAC privilege groups (0-15).',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
-      sslBits: z.union([z.literal(128), z.literal(256)]).default(128),
+      sslBits: z.enum(['128', '256']).or(z.number().int()).default(128),
       abKeyEnabled: z.boolean().default(true),
       requireInterlockForOutputs: z.boolean().default(true),
       userGroups: z
@@ -2208,10 +2906,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       requireInterlockForOutputs: true,
     },
     handler: (input, store) => {
+      const bits = Number(input.sslBits);
+      if (bits !== 128 && bits !== 256) throw new Error('sslBits must be 128 or 256.');
       const project = store.getProject(input.projectId);
       project.security = {
         ...project.security,
-        sslBits: input.sslBits,
+        sslBits: bits as 128 | 256,
         abKeyEnabled: input.abKeyEnabled,
         requireInterlockForOutputs: input.requireInterlockForOutputs,
         userGroups: input.userGroups ?? project.security.userGroups,
@@ -2222,9 +2922,46 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         action: 'SECURITY_POLICY_UPDATE',
         target: project.id,
         outcome: 'ALLOWED',
-        detail: `SSL=${input.sslBits}-bit, abKey=${input.abKeyEnabled}, interlock=${input.requireInterlockForOutputs}`,
+        detail: `SSL=${bits}-bit, abKey=${input.abKeyEnabled}, interlock=${input.requireInterlockForOutputs}`,
       });
       return { updated: true, security: project.security };
+    },
+  }),
+
+  // =========================================================================
+  // 15. HEADLESS PLC/SCADA FAT SCAN-CYCLE SIMULATOR
+  // =========================================================================
+  defineTool({
+    name: 'haiwell_simulation_step',
+    domain: 'simulation',
+    haiwellFeature: 'Headless PLC/SCADA Scan-Cycle FAT Verification Simulator',
+    safetyTier: 'design',
+    description:
+      'Deterministically simulate N scan cycles with injected tag overrides or raw ADC sensor counts (with linear scaling), verifying E-Stop fail-safe output de-energization, declarative event triggers, and ISA-18.2 alarm state transitions.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      injectTagValues: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional(),
+      injectRawAdcValues: z.record(z.string(), z.number()).optional(),
+      steps: z.number().int().min(1).max(50).default(1),
+      enforceEStopSafeState: z.boolean().default(true),
+      persistState: z.boolean().default(false),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      injectTagValues: { EStop_OK: false },
+      steps: 1,
+      enforceEStopSafeState: true,
+      persistState: false,
+    },
+    handler: (input, store) => {
+      const liveProject = store.getProject(input.projectId);
+      // By default simulate on an isolated deep clone so FAT verification doesn't pollute live plant state!
+      const targetProject = input.persistState
+        ? liveProject
+        : (JSON.parse(JSON.stringify(liveProject)) as HaiwellProject);
+      const result = runSimulationSteps(targetProject, input);
+      if (input.persistState) store.saveProject(liveProject);
+      return { isolatedClone: !input.persistState, ...result };
     },
   }),
 ];
@@ -2263,12 +3000,13 @@ export async function invokeHaiwellTool(
       executionMs: Number((performance.now() - start).toFixed(3)),
       error: {
         code: 'TOOL_NOT_FOUND',
-        message: `Unknown MCP tool "${toolName}". Call tools/list to inspect available Haiwell tools.`,
+        message: `Unknown MCP tool "${toolName}". Call tools/list to inspect all ${HAIWELL_TOOLS.length} Haiwell tools.`,
       },
     };
   }
 
-  const parsed = tool.inputSchema.safeParse(rawArgs ?? {});
+  const normalizedArgs = normalizeAgentArgs(rawArgs);
+  const parsed = tool.inputSchema.safeParse(normalizedArgs);
   if (!parsed.success) {
     return {
       ok: false,

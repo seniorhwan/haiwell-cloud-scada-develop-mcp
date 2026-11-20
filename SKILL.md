@@ -1,24 +1,23 @@
 ---
 name: haiwell-cloud-scada-develop
-description: Production-grade headless Model Context Protocol (MCP) server and skill suite for Haiwell Cloud SCADA Develop. Enables AI agents in VS Code, Google Antigravity, Claude Code, and Codex to engineer PLC drivers, validate IEC 61131-3 ST/LD/FBD logic, auto-generate ISA-101 HMI layouts, manage tags/alarms/recipes/trends/Data-Link/schedules/reports/cameras/i18n/RBAC, and integrate MQTT Sparkplug B and OPC UA NodeSet2 XML.
+description: Zero-UI, production-grade headless Model Context Protocol (MCP 2025-03-26) server for Haiwell Cloud SCADA Develop. Exposes 42 strictly validated tools across 15 domains for AI agents in VS Code, Google Antigravity, Claude Code, and Codex.
 transports:
-  - streamable-http: http://localhost:3000/mcp
+  - streamable-http: POST http://localhost:3000/mcp
   - stdio: npx tsx src/mcp/stdio.ts
 ---
 
-# Haiwell Cloud SCADA Develop — MCP Agent Skill
+# Haiwell Cloud SCADA Develop — Headless MCP Agent Skill
 
-## Quick Connect
+## Endpoints (100% Headless — Zero UI)
+- `GET /` — Machine-readable JSON server discovery
+- `POST /mcp` — MCP 2025-03-26 Streamable HTTP (JSON-RPC 2.0)
+- `npx tsx src/mcp/stdio.ts` — Local stdio MCP subprocess transport
+- `POST /api/rpc` — Direct single or sequential batch tool invocation
+- `GET /llms.txt` | `GET /openapi.json` | `GET /api/manifest` | `GET /api/skills/{vscode|antigravity|claude-code|codex}`
 
-- **Streamable HTTP**: `POST http://localhost:3000/mcp` (JSON-RPC 2.0, MCP 2025-03-26)
-- **Local stdio**: `npx tsx src/mcp/stdio.ts`
-- **Machine-Readable Discovery**: `GET /llms.txt`, `GET /openapi.json`, `GET /api/manifest`
-- **Direct Batch RPC**: `POST /api/rpc`
-
-## Mandatory Industrial Safety Protocol
-
-1. **Validate every PLC address first** via `haiwell_device_validate_address`. Never write to read-only physical inputs (`X0..X1023`, `AI0..AI255`, `%IX`, `%IW`).
-2. **Dry-run all control writes** via `haiwell_tag_read_write` with `dryRun: true` before committing. Interlocked SIL2/SIL3 outputs require explicit `confirmSafetyOverride: true` and an audit `reason`.
-3. **Never deploy unvalidated PLC logic**: run `haiwell_iec61131_validate` (catches `WHILE TRUE` watchdog faults, division by zero, `REAL` exact equality, `VAR_INPUT`/`%I` writes, implicit narrowing, and Ladder double-coil hazards) before `haiwell_iec61131_pou_save`.
-4. **Enforce IIoT transport security**: enable TLS for MQTT remote writes, `Basic256Sha256` + `SignAndEncrypt` for OPC UA, and Haiwell A/B Key for Cloud Transparent Transmission.
-5. **Gate every export with `haiwell_project_audit_safety`**: ensure `deploymentReady: true` prior to `haiwell_project_export`.
+## Mandatory Safety & Reliability Protocol
+1. **Checkpoint before bulk edits**: call `haiwell_project_snapshot_rollback` (`CREATE`) before multi-step mutations; use `ROLLBACK` if audit fails.
+2. **Validate multi-vendor PLC addresses**: call `haiwell_device_validate_address` with the target device's protocol (Haiwell, Modbus, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, BACnet) before creating tags. Never overlap 32-bit/64-bit register word spans.
+3. **Dry-run physical control writes**: call `haiwell_tag_read_write` or `haiwell_tag_batch_io` with `dryRun: true` first. Interlocked `SIL2`/`SIL3` outputs require `confirmSafetyOverride: true` and an audit `reason`.
+4. **Gate PLC logic on IEC 61131-3 validation**: resolve all `ERROR` diagnostics from `haiwell_iec61131_validate` before `haiwell_iec61131_pou_save`.
+5. **Run FAT simulation + safety audit**: run `haiwell_simulation_step` (verify E-Stop fail-safe de-energization) and `haiwell_project_audit_safety` (`deploymentReady: true`) before `haiwell_project_export`.

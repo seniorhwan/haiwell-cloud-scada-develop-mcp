@@ -8,12 +8,26 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createHaiwellMcpServer } from './createMcpServer';
 import { HAIWELL_PROMPTS, HAIWELL_RESOURCES } from './resourcesAndPrompts';
-import { HAIWELL_TOOLS } from './toolRegistry';
+import { HAIWELL_TOOLS, normalizeAgentArgs } from './toolRegistry';
 
 async function main() {
   const server = createHaiwellMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  const origOnMessage = transport.onmessage;
+  if (origOnMessage) {
+    transport.onmessage = (message) => {
+      if (message && typeof message === 'object' && 'method' in message && message.method === 'tools/call') {
+        const req = message as { params?: { arguments?: unknown } };
+        if (req.params && req.params.arguments !== undefined) {
+          req.params = { ...req.params, arguments: normalizeAgentArgs(req.params.arguments) };
+        }
+      }
+      origOnMessage(message);
+    };
+  }
+
   console.error(
     `[haiwell-cloud-scada-mcp] stdio transport ready (${HAIWELL_TOOLS.length} tools, ${HAIWELL_RESOURCES.length} resources, ${HAIWELL_PROMPTS.length} prompts)`
   );

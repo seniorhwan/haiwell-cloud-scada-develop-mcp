@@ -1,6 +1,7 @@
 /**
  * Complete domain model for Haiwell Cloud SCADA Develop projects.
- * Covers all 14 functional domains of the Haiwell engineering environment.
+ * Covers all 15 functional domains including faceplates, declarative event triggers,
+ * outbound webhooks, multi-vendor PLC protocols, revisions, and snapshots.
  */
 
 export type HaiwellTargetHardware =
@@ -61,7 +62,8 @@ export type HaiwellDomain =
   | 'trends'
   | 'datalink'
   | 'operations'
-  | 'security';
+  | 'security'
+  | 'simulation';
 
 export interface DeviceConfig {
   id: string;
@@ -93,6 +95,14 @@ export interface CloudTransparentTunnel {
   sslBits: 128 | 256;
 }
 
+export interface TagScaling {
+  rawMin: number;
+  rawMax: number;
+  engMin: number;
+  engMax: number;
+  clamp?: boolean;
+}
+
 export interface TagDefinition {
   name: string;
   scope: TagScope;
@@ -100,22 +110,19 @@ export interface TagDefinition {
   address?: string;
   modbusOffset0Based?: number;
   modbusAddress1Based?: number;
+  wordSpan?: number;
   dataType: TagDataType;
   access: 'RO' | 'RW' | 'WO';
   unit?: string;
   description?: string;
-  scaling?: {
-    rawMin: number;
-    rawMax: number;
-    engMin: number;
-    engMax: number;
-  };
+  scaling?: TagScaling;
   deadband?: number;
   safeMin?: number;
   safeMax?: number;
   safetyClass: SafetyClass;
   requiresInterlock: boolean;
   currentValue: number | boolean | string;
+  previousValue?: number | boolean | string;
   quality: 'GOOD' | 'BAD' | 'UNCERTAIN' | 'SIMULATED';
   updatedAt: string;
 }
@@ -160,7 +167,8 @@ export type HmiWidgetType =
   | 'CAMERA_VIEW'
   | 'DATA_TABLE'
   | 'NAV_BAR'
-  | 'LABEL';
+  | 'LABEL'
+  | 'FACEPLATE_INSTANCE';
 
 export interface HmiWidget {
   id: string;
@@ -172,6 +180,8 @@ export interface HmiWidget {
   height: number;
   tagName?: string;
   writeEnabled?: boolean;
+  targetScreenId?: string;
+  faceplateId?: string;
   unit?: string;
   min?: number;
   max?: number;
@@ -188,8 +198,19 @@ export interface HmiScreen {
   backgroundColor: string;
   autoScaleMobile: boolean;
   autoScaleWeb: boolean;
+  isPopup?: boolean;
   widgets: HmiWidget[];
   createdAt: string;
+}
+
+export interface HmiFaceplateTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  width: number;
+  height: number;
+  tagPlaceholders: string[];
+  widgets: Omit<HmiWidget, 'id'>[];
 }
 
 export interface HaiwellScript {
@@ -204,12 +225,37 @@ export interface HaiwellScript {
   updatedAt: string;
 }
 
+export interface EventTriggerRule {
+  id: string;
+  name: string;
+  sourceTag: string;
+  condition: 'RISING_EDGE' | 'FALLING_EDGE' | 'ON_CHANGE' | 'GT' | 'LT' | 'EQ';
+  threshold?: number;
+  actionType: 'OPEN_SCREEN' | 'WRITE_TAG' | 'RUN_SCRIPT' | 'DOWNLOAD_RECIPE' | 'SEND_WEBHOOK';
+  targetId: string;
+  actionValue?: number | boolean | string;
+  enabled: boolean;
+}
+
+export interface WebhookConnector {
+  id: string;
+  name: string;
+  url: string;
+  method: 'POST' | 'PUT';
+  tlsRequired: boolean;
+  timeoutMs: number;
+  headers: Record<string, string>;
+  payloadTemplate: string;
+  enabled: boolean;
+}
+
 export interface AlarmDefinition {
   id: string;
   name: string;
   tagName: string;
   condition: 'DIGITAL_HIGH' | 'DIGITAL_LOW' | 'HIHI' | 'HI' | 'LO' | 'LOLO' | 'ROC' | 'DEV';
   threshold: number;
+  referenceValue?: number;
   deadband: number;
   delayOnMs: number;
   delayOffMs: number;
@@ -217,6 +263,7 @@ export interface AlarmDefinition {
   group: string;
   messageTemplate: string;
   channels: ('SCREEN_POPUP' | 'VOICE_TTS' | 'MOBILE_PUSH' | 'WECHAT' | 'SMS' | 'EMAIL')[];
+  shelvedUntil?: string;
   enabled: boolean;
 }
 
@@ -229,6 +276,7 @@ export interface ActiveAlarmEvent {
   message: string;
   state: 'ACTIVE_UNACK' | 'ACTIVE_ACK' | 'CLEARED_UNACK' | 'NORMAL';
   triggeredAt: string;
+  clearedAt?: string;
   acknowledgedAt?: string;
   acknowledgedBy?: string;
 }
@@ -387,6 +435,7 @@ export interface HaiwellProject {
   id: string;
   name: string;
   version: string;
+  revision: number;
   targetHardware: HaiwellTargetHardware;
   resolution: { width: number; height: number };
   defaultLanguage: string;
@@ -398,7 +447,10 @@ export interface HaiwellProject {
   tags: Record<string, TagDefinition>;
   pous: Iec61131Pou[];
   screens: HmiScreen[];
+  faceplates: HmiFaceplateTemplate[];
   scripts: HaiwellScript[];
+  eventTriggers: EventTriggerRule[];
+  webhooks: WebhookConnector[];
   alarms: AlarmDefinition[];
   alarmHistory: ActiveAlarmEvent[];
   mqtt: MqttConfig;

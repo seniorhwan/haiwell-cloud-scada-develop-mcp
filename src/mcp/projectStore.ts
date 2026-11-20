@@ -1,10 +1,15 @@
 /**
- * Deterministic in-memory workspace store for Haiwell Cloud SCADA Develop projects.
- * Ships with a realistic industrial Chiller Plant reference project so AI agents
- * can immediately inspect, query, validate, and extend a working SCADA project.
+ * Hardened Haiwell Cloud SCADA Project Store with:
+ * - Optimistic revision counter
+ * - Named atomic snapshots & instant rollback
+ * - Referential-integrity dependency analysis for safe deletion
+ * - Optional atomic disk persistence (HAIWELL_WORKSPACE_DIR) via temp-file rename
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { parseHaiwellRegister } from './haiwellRegisters';
+import { getWordSpanForType } from './plcAddressing';
 import { validateStructuredText } from './iec61131';
 import { generateAutoLayoutScreen } from './hmiGenerator';
 import type { AuditLogEntry, HaiwellProject, TagDefinition } from './types';
@@ -27,6 +32,7 @@ function makeSeedProject(): HaiwellProject {
       dataType,
       access,
       currentValue,
+      wordSpan: getWordSpanForType(dataType),
       safetyClass: opts.safetyClass ?? 'SIL0',
       requiresInterlock: opts.requiresInterlock ?? false,
       quality: 'GOOD',
@@ -62,17 +68,17 @@ function makeSeedProject(): HaiwellProject {
       address: 'AI0',
       unit: '°C',
       description: 'Chilled water supply header temperature',
-      scaling: { rawMin: 0, rawMax: 32000, engMin: 0, engMax: 50 },
+      scaling: { rawMin: 0, rawMax: 32000, engMin: 0, engMax: 50, clamp: true },
       deadband: 0.1,
       safeMin: 2,
       safeMax: 25,
     }),
     Return_Temp_C: makeTag('Return_Temp_C', 'PLC', 'FLOAT32', 'RO', 12.1, {
       deviceId: 'plc_chiller_01',
-      address: 'AI1',
+      address: 'AI2',
       unit: '°C',
       description: 'Chilled water return header temperature',
-      scaling: { rawMin: 0, rawMax: 32000, engMin: 0, engMax: 50 },
+      scaling: { rawMin: 0, rawMax: 32000, engMin: 0, engMax: 50, clamp: true },
       deadband: 0.1,
     }),
     Chiller_Setpoint_C: makeTag('Chiller_Setpoint_C', 'PLC', 'FLOAT32', 'RW', 7.0, {
@@ -157,6 +163,7 @@ function makeSeedProject(): HaiwellProject {
     id: 'prj_chiller_plant_01',
     name: 'Chiller Plant Reference SCADA',
     version: '1.0.0',
+    revision: 1,
     targetHardware: 'PC_SCADA',
     resolution: { width: 1280, height: 800 },
     defaultLanguage: 'en-US',
@@ -202,6 +209,20 @@ function makeSeedProject(): HaiwellProject {
       },
     ],
     screens: [mainScreen],
+    faceplates: [
+      {
+        id: 'fp_pump_std',
+        name: 'Standard Pump Faceplate',
+        description: 'Reusable ISA-101 pump control block',
+        width: 240,
+        height: 120,
+        tagPlaceholders: ['Run_Cmd'],
+        widgets: [
+          { type: 'PUMP', label: 'Pump Control', x: 0, y: 0, width: 110, height: 56, tagName: '{{Run_Cmd}}', writeEnabled: true },
+          { type: 'BIT_LAMP', label: 'Run Status', x: 120, y: 0, width: 110, height: 56, tagName: '{{Run_Cmd}}' },
+        ],
+      },
+    ],
     scripts: [
       {
         id: 'scr_js_deltat',
@@ -218,6 +239,8 @@ function makeSeedProject(): HaiwellProject {
         updatedAt: now,
       },
     ],
+    eventTriggers: [],
+    webhooks: [],
     alarms: [
       {
         id: 'alm_supply_hihi',
@@ -445,19 +468,57 @@ function makeSeedProject(): HaiwellProject {
   };
 }
 
+export interface ProjectSnapshot {
+  snapshotId: string;
+  projectId: string;
+  label: string;
+  revision: number;
+  createdAt: string;
+  payloadJson: string;
+}
+
 export class HaiwellProjectStore {
   private projects = new Map<string, HaiwellProject>();
+  private snapshots = new Map<string, ProjectSnapshot[]>();
   private mqttLoopbackBuffer: { topic: string; payload: unknown; qos: number; timestamp: string }[] = [];
+  private persistPath: string | null;
 
-  constructor() {
+  constructor(workspaceDir?: string) {
+    this.persistPath = workspaceDir ? path.join(workspaceDir, 'workspace.json') : null;
+    if (this.persistPath && fs.existsSync(this.persistPath)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(this.persistPath, 'utf8')) as {
+          projects?: HaiwellProject[];
+        };
+        if (Array.isArray(raw.projects) && raw.projects.length > 0) {
+          for (const p of raw.projects) this.projects.set(p.id, p);
+          return;
+        }
+      } catch {
+        // Corrupted file falls back cleanly to seed
+      }
+    }
     const seed = makeSeedProject();
     this.projects.set(seed.id, seed);
   }
 
-  listProjects(): { id: string; name: string; targetHardware: string; tagCount: number; screenCount: number; updatedAt: string }[] {
+  private persistIfEnabled(): void {
+    if (!this.persistPath) return;
+    try {
+      fs.mkdirSync(path.dirname(this.persistPath), { recursive: true });
+      const tmp = `${this.persistPath}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ projects: [...this.projects.values()] }, null, 2), 'utf8');
+      fs.renameSync(tmp, this.persistPath);
+    } catch {
+      // Never crash headless runtime on read-only FS
+    }
+  }
+
+  listProjects() {
     return [...this.projects.values()].map((p) => ({
       id: p.id,
       name: p.name,
+      revision: p.revision,
       targetHardware: p.targetHardware,
       tagCount: Object.keys(p.tags).length,
       screenCount: p.screens.length,
@@ -474,9 +535,92 @@ export class HaiwellProjectStore {
   }
 
   saveProject(project: HaiwellProject): HaiwellProject {
+    project.revision = (project.revision ?? 0) + 1;
     project.updatedAt = new Date().toISOString();
     this.projects.set(project.id, project);
+    this.persistIfEnabled();
     return project;
+  }
+
+  deleteProject(projectId: string): boolean {
+    const ok = this.projects.delete(projectId);
+    if (ok) {
+      this.snapshots.delete(projectId);
+      this.persistIfEnabled();
+    }
+    return ok;
+  }
+
+  createSnapshot(projectId: string, label: string): Omit<ProjectSnapshot, 'payloadJson'> {
+    const project = this.getProject(projectId);
+    const snap: ProjectSnapshot = {
+      snapshotId: `snap_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      projectId,
+      label,
+      revision: project.revision,
+      createdAt: new Date().toISOString(),
+      payloadJson: JSON.stringify(project),
+    };
+    const list = this.snapshots.get(projectId) ?? [];
+    list.push(snap);
+    if (list.length > 50) list.shift();
+    this.snapshots.set(projectId, list);
+    const { payloadJson: _omit, ...meta } = snap;
+    return meta;
+  }
+
+  listSnapshots(projectId: string): Omit<ProjectSnapshot, 'payloadJson'>[] {
+    return (this.snapshots.get(projectId) ?? []).map(({ payloadJson: _omit, ...meta }) => meta);
+  }
+
+  rollbackSnapshot(projectId: string, snapshotId: string): HaiwellProject {
+    const list = this.snapshots.get(projectId) ?? [];
+    const snap = list.find((s) => s.snapshotId === snapshotId);
+    if (!snap) throw new Error(`Snapshot "${snapshotId}" not found for project "${projectId}".`);
+    const restored = JSON.parse(snap.payloadJson) as HaiwellProject;
+    return this.saveProject(restored);
+  }
+
+  /**
+   * Computes referential-integrity dependents before deleting a tag, device, or screen.
+   */
+  findTagDependents(project: HaiwellProject, tagName: string): string[] {
+    const deps: string[] = [];
+    for (const s of project.screens) {
+      for (const w of s.widgets) {
+        if (w.tagName === tagName) deps.push(`screen:${s.id}/widget:${w.id}`);
+      }
+    }
+    for (const a of project.alarms) {
+      if (a.tagName === tagName) deps.push(`alarm:${a.id}`);
+    }
+    for (const sc of project.scripts) {
+      if (sc.referencedTags.includes(tagName) || sc.triggerTag === tagName) deps.push(`script:${sc.id}`);
+    }
+    for (const b of project.mqtt.bindings) {
+      if (b.tags.includes(tagName)) deps.push(`mqtt_binding:${b.id}`);
+    }
+    for (const n of project.opcua.nodes) {
+      if (n.tagName === tagName) deps.push(`opcua_node:${n.nodeId}`);
+    }
+    for (const r of project.recipes) {
+      if (r.tagNames.includes(tagName)) deps.push(`recipe:${r.id}`);
+    }
+    for (const tr of project.trends) {
+      if (tr.tagNames.includes(tagName)) deps.push(`trend:${tr.id}`);
+    }
+    for (const dl of project.dataLinks) {
+      if (dl.columnMappings.some((c) => c.tagName === tagName)) deps.push(`datalink:${dl.id}`);
+    }
+    for (const rp of project.reports) {
+      if (rp.columns.some((c) => c.tagName === tagName)) deps.push(`report:${rp.id}`);
+    }
+    for (const ev of project.eventTriggers) {
+      if (ev.sourceTag === tagName || (ev.actionType === 'WRITE_TAG' && ev.targetId === tagName)) {
+        deps.push(`event_trigger:${ev.id}`);
+      }
+    }
+    return deps;
   }
 
   appendAudit(
@@ -518,4 +662,4 @@ export class HaiwellProjectStore {
   }
 }
 
-export const defaultProjectStore = new HaiwellProjectStore();
+export const defaultProjectStore = new HaiwellProjectStore(process.env.HAIWELL_WORKSPACE_DIR);
