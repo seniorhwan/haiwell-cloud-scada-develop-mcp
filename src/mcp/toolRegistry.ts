@@ -1,6 +1,6 @@
 /**
  * Hardened Single-Source-of-Truth MCP Tool Registry:
- * 47 production-grade tools across 15 Haiwell Cloud SCADA Develop domains.
+ * 61 production-grade tools across 15 Haiwell Cloud SCADA Develop domains.
  * Features LLM-tolerant input normalization (prototype-pollution safe), strict Zod v4 validation,
  * multi-vendor PLC register & multi-word/byte overlap detection, binary type/range guards,
  * spatial HMI P&ID compilation & desktop bridge export, ISA-18.2 deduplicating alarm state machine,
@@ -192,6 +192,19 @@ function stripPrototypeKeysDeep(val: unknown): unknown {
  * - Converts explicit `null` on optional keys to `undefined`
  * - Parses stringified JSON arrays/objects when a client double-encodes complex arguments
  */
+const LITERAL_STRING_ARG_KEYS = new Set([
+  'code',
+  'source',
+  'description',
+  'messageTemplate',
+  'payloadTemplate',
+  'projectName',
+  'name',
+  'label',
+  'reason',
+  'filePathOrTtsText',
+]);
+
 export function normalizeAgentArgs(raw: unknown): Record<string, unknown> {
   if (typeof raw === 'string') {
     try {
@@ -211,7 +224,7 @@ export function normalizeAgentArgs(raw: unknown): Record<string, unknown> {
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
     if (v === null) continue;
-    if (typeof v === 'string') {
+    if (typeof v === 'string' && !LITERAL_STRING_ARG_KEYS.has(k)) {
       const trimmed = v.trim();
       if ((trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('{') && trimmed.endsWith('}'))) {
         try {
@@ -274,26 +287,26 @@ export function buildProjectExportBundle(project: HaiwellProject) {
       return '0X(Digital output,Function code 01 05)';
     }
     if (/^(3X|AI|IW|PIW)/.test(addr) || (t.modbusAddress1Based && t.modbusAddress1Based >= 30001 && t.modbusAddress1Based < 40000)) {
-      return '3X(Input register,Function code 04)';
+      return '3X(Analog input,Function code 04)';
     }
-    return '4X(Holding register,Function code 03 06 16)';
+    return '4X(Analog output,Function code 03 06)';
   };
   const formatHaiwellDataType = (dt: TagDefinition['dataType']): string => {
     switch (dt) {
       case 'BOOL':
         return 'Bool';
       case 'INT16':
-        return '16-bit Signed';
+        return 'Integer';
       case 'UINT16':
-        return '16-bit Unsigned';
+        return 'UInteger';
       case 'INT32':
-        return '32-bit Signed';
+        return 'Long';
       case 'UINT32':
-        return '32-bit Unsigned';
+        return 'ULong';
       case 'FLOAT32':
-        return '32-bit Float';
+        return 'Float';
       case 'FLOAT64':
-        return '64-bit Double';
+        return 'Double';
       case 'STRING':
         return 'String';
       case 'BCD16':
@@ -304,9 +317,11 @@ export function buildProjectExportBundle(project: HaiwellProject) {
   };
   const formatHaiwellAccess = (access: TagDefinition['access']): string =>
     access === 'RO' ? 'Read only' : access === 'WO' ? 'Write only' : 'Read and write';
+  const formatHaiwellFreq = (freq?: TagDefinition['collectFrequency']): string =>
+    freq === 'HIGH' ? 'High speed' : freq === 'LOW' ? 'Low speed' : 'Normal';
 
   const haiwellVarHeader =
-    'Variable name,Register type,Address format,Register address,Address length,Data type,The mode of reading and writing,Collect frequency,Always collect,Description';
+    'Variable name,Register type,Address format,Register address,Address length,Data type,Read-write mode,Acquisition frequency,Always Collect,Description';
   const haiwellVarRows = Object.values(project.tags).map((t) => {
     const rawAddr =
       t.modbusOffset0Based !== undefined
@@ -320,7 +335,7 @@ export function buildProjectExportBundle(project: HaiwellProject) {
       escapeCsvCell(Math.max(1, t.wordSpan ?? getWordSpanForType(t.dataType))),
       escapeCsvCell(formatHaiwellDataType(t.dataType)),
       escapeCsvCell(formatHaiwellAccess(t.access)),
-      escapeCsvCell('Normal'),
+      escapeCsvCell(formatHaiwellFreq(t.collectFrequency)),
       escapeCsvCell(t.alwaysCollect ? 'TRUE' : 'FALSE'),
       escapeCsvCell(t.description ?? '', true),
     ].join(',');
@@ -908,12 +923,13 @@ function checkTagWriteSafety(
       };
     }
   }
-  const estop = getOwnTag(project, 'EStop_OK');
-  if (tag.requiresInterlock && estop && estop.currentValue === false) {
+  const interlockName = (tag as TagDefinition & { interlockTag?: string }).interlockTag || 'EStop_OK';
+  const estop = getOwnTag(project, interlockName);
+  if (tag.requiresInterlock && estop && (estop.currentValue === false || estop.currentValue === 0)) {
     return {
       ok: false as const,
       blockedBy: 'ESTOP_INTERLOCK_ACTIVE',
-      message: `Write to "${tag.name}" blocked: EStop_OK is FALSE.`,
+      message: `Write to "${tag.name}" blocked: ${interlockName} is FALSE.`,
     };
   }
   if (tag.requiresInterlock && !confirmSafetyOverride) {
@@ -2777,7 +2793,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       screenId: z.string().default('scr_chiller_overview'),
-      windowTitleRegex: z.string().default('(?i).*Haiwell Cloud Scada.*'),
+      windowTitleRegex: z.string().default('(?i)^Haiwell Cloud Scada\\[.*'),
       uiaMap: z
         .object({
           windowTitleRegex: z.string().optional(),
@@ -2817,7 +2833,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       action: z.enum(['GENERATE_SCRIPT', 'VALIDATE_MAP']).default('GENERATE_SCRIPT'),
-      windowTitleRegex: z.string().default('(?i).*Haiwell Cloud Scada.*'),
+      windowTitleRegex: z.string().default('(?i)^Haiwell Cloud Scada\\[.*'),
       capturedMap: z
         .object({
           windowTitleRegex: z.string().optional(),
@@ -2831,7 +2847,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         })
         .optional(),
     }),
-    sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'GENERATE_SCRIPT', windowTitleRegex: '(?i).*Haiwell Cloud Scada.*' },
+    sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'GENERATE_SCRIPT', windowTitleRegex: '(?i)^Haiwell Cloud Scada\\[.*' },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       if (input.action === 'VALIDATE_MAP' && !input.capturedMap) {
@@ -2861,7 +2877,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         .array(z.enum(['devices', 'variables', 'tasks', 'events', 'displays']))
         .min(1)
         .default(['devices', 'variables', 'tasks', 'events', 'displays']),
-      windowTitleRegex: z.string().min(3).default('(?i).*Haiwell Cloud Scada.*'),
+      windowTitleRegex: z.string().min(3).default('(?i)^Haiwell Cloud Scada\\[.*'),
       uiaMap: z
         .object({
           windowTitleRegex: z.string().optional(),
@@ -3843,8 +3859,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (input.tlsRequired && parsed.protocol !== 'https:') {
         throw new Error('SAFETY_BLOCK: tlsRequired=true forbids non-HTTPS webhook URLs.');
       }
-      if (isBlockedSsrfHost(parsed.hostname)) {
-        throw new Error(`SSRF_BLOCK: Forbidden cloud metadata/link-local/unspecified host "${parsed.hostname}".`);
+      if (isBlockedSsrfHost(parsed.hostname, { blockLoopback: true })) {
+        throw new Error(`SSRF_BLOCK: Forbidden loopback/metadata/link-local/unspecified host "${parsed.hostname}".`);
       }
       const testRendered = input.payloadTemplate.replace(/\{\{[A-Za-z0-9_]+\}\}/g, 'sample');
       try {
@@ -4563,7 +4579,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       } catch {
         throw new Error(`Invalid endpointUrl "${input.endpointUrl}".`);
       }
-      if (isBlockedSsrfHost(parsedUrl.hostname)) {
+      if (isBlockedSsrfHost(parsedUrl.hostname, { blockLoopback: true })) {
         throw new Error(`SSRF_BLOCKED: Data reporting server host "${parsedUrl.hostname}" is blocked (loopback/metadata).`);
       }
       if (input.tlsRequired && input.protocol === 'HTTP_REST' && parsedUrl.protocol !== 'https:') {
@@ -4765,11 +4781,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     description:
       'Automate creating a new .hwdev project inside a running Haiwell Cloud Scada desktop window using UIA MenuItem traversal, adjacent-Label ComboBox selection (runtime platform, device model, resolution), network port configuration, and try/finally clipboard restoration. Supports dryRun=true and non-Windows script generation.',
     inputSchema: z.object({
-      projectName: z.string().min(1).max(120),
+      projectName: z
+        .string()
+        .min(1)
+        .max(50, 'Haiwell project name length limit is 50 characters.')
+        .refine((v) => !/[,|=]/.test(v), 'Haiwell project name cannot contain illegal characters (, | =).'),
       saveDirectory: z.string().max(300).optional(),
       runtimePlatform: z.string().min(1).max(64).default('Cloud HMI'),
       deviceModel: z.string().min(1).max(64).default('Haiwell HMI B7H'),
-      resolution: z.string().min(3).max(32).default('1024*600'),
+      resolution: z.string().min(3).max(32).default('1024x600'),
       networkProjectPort: z.number().int().min(1024).max(65535).default(8888),
       installDir: z.string().max(260).optional(),
       dryRun: z.boolean().default(false),
@@ -4778,7 +4798,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       projectName: 'Chiller_Plant_01',
       runtimePlatform: 'Cloud HMI',
       deviceModel: 'Haiwell HMI B7H',
-      resolution: '1024*600',
+      resolution: '1024x600',
       networkProjectPort: 8888,
       dryRun: true,
     },
@@ -4840,9 +4860,9 @@ const CORE_PROFILE_TOOLS = new Set([
 ]);
 
 const PROFILE_DOMAINS: Record<Exclude<ToolProfile, 'all' | 'core'>, Set<HaiwellDomain>> = {
-  hmi: new Set(['project', 'tags', 'hmi']),
-  plc: new Set(['project', 'devices', 'tags', 'iec61131', 'simulation']),
-  iiot: new Set(['project', 'tags', 'mqtt', 'opcua', 'datalink', 'alarms', 'security']),
+  hmi: new Set(['project', 'tags', 'hmi', 'trends', 'recipes']),
+  plc: new Set(['project', 'devices', 'tags', 'iec61131', 'scripts', 'simulation']),
+  iiot: new Set(['project', 'tags', 'mqtt', 'opcua', 'datalink', 'alarms', 'security', 'operations']),
 };
 
 export function resolveToolProfile(raw?: string): ToolProfile {

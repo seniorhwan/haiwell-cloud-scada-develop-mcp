@@ -6,6 +6,7 @@
  * - Optional atomic disk persistence (HAIWELL_WORKSPACE_DIR) via temp-file rename
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseHaiwellRegister } from './haiwellRegisters';
@@ -123,6 +124,7 @@ function makeSeedProject(): HaiwellProject {
     '  StartDelay : TON;',
     'END_VAR',
     'IF NOT EStop_OK THEN',
+    '  StartDelay(IN := FALSE, PT := T#3s);',
     '  Pump1_Run_Cmd := FALSE;',
     '  Valve_Position_Pct := 0.0;',
     'ELSE',
@@ -307,7 +309,7 @@ function makeSeedProject(): HaiwellProject {
     },
     opcua: {
       role: 'SERVER',
-      endpointUrl: 'opc.tcp://0.0.0.0:4840/haiwell/chiller01',
+      endpointUrl: 'opc.tcp://localhost:4840/haiwell/chiller01',
       namespaceUri: 'urn:haiwell:scada:chiller01',
       namespaceIndex: 2,
       securityPolicy: 'Basic256Sha256',
@@ -539,6 +541,136 @@ export interface ProjectSnapshot {
   payloadJson: string;
 }
 
+const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function sanitizeJsonProtoKeys<T>(val: T): T {
+  if (Array.isArray(val)) {
+    return val.map(sanitizeJsonProtoKeys) as unknown as T;
+  }
+  if (val && typeof val === 'object') {
+    const clean: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+      if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+      clean[k] = sanitizeJsonProtoKeys(v);
+    }
+    return clean as T;
+  }
+  return val;
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // Fallback if SharedArrayBuffer is unavailable
+  }
+}
+
+function normalizeLoadedProject(rawProj: Partial<HaiwellProject>): HaiwellProject {
+  const p = sanitizeJsonProtoKeys(rawProj) as HaiwellProject;
+  const id = p.id || 'prj_restored';
+  return {
+    ...p,
+    id,
+    name: p.name ?? id,
+    version: p.version ?? '1.0.0',
+    revision: typeof p.revision === 'number' ? p.revision : 1,
+    targetHardware: p.targetHardware ?? 'PC_SCADA',
+    resolution: p.resolution ?? { width: 1280, height: 800 },
+    defaultLanguage: p.defaultLanguage ?? 'en-US',
+    cloudEnabled: p.cloudEnabled ?? true,
+    networkProjectEnabled: p.networkProjectEnabled ?? true,
+    networkProjectPort: p.networkProjectPort ?? 8888,
+    hwdevFileName: p.hwdevFileName ?? `${id}.hwdev`,
+    devices: Array.isArray(p.devices) ? p.devices : [],
+    tags: p.tags && typeof p.tags === 'object' ? p.tags : {},
+    screens: Array.isArray(p.screens) ? p.screens : [],
+    faceplates: Array.isArray(p.faceplates) ? p.faceplates : [],
+    pous: Array.isArray(p.pous) ? p.pous : [],
+    scripts: Array.isArray(p.scripts) ? p.scripts : [],
+    eventTriggers: Array.isArray(p.eventTriggers) ? p.eventTriggers : [],
+    alarms: Array.isArray(p.alarms) ? p.alarms : [],
+    alarmHistory: Array.isArray(p.alarmHistory) ? p.alarmHistory : [],
+    mqtt: p.mqtt ?? {
+      enabled: false,
+      role: 'CLIENT',
+      brokerUri: 'mqtt://localhost:1883',
+      clientId: `${id}_mqtt`,
+      tlsEnabled: false,
+      keepAliveSec: 60,
+      cleanSession: true,
+      bindings: [],
+    },
+    opcua: p.opcua ?? {
+      role: 'SERVER',
+      endpointUrl: 'opc.tcp://localhost:4840/haiwell',
+      namespaceUri: `urn:haiwell:scada:${id}`,
+      namespaceIndex: 1,
+      securityPolicy: 'Basic256Sha256',
+      securityMode: 'SignAndEncrypt',
+      authMode: 'Username',
+      publishingIntervalMs: 500,
+      nodes: [],
+    },
+    recipes: Array.isArray(p.recipes) ? p.recipes : [],
+    trends: Array.isArray(p.trends) ? p.trends : [],
+    dataLinks: Array.isArray(p.dataLinks) ? p.dataLinks : [],
+    webhooks: Array.isArray(p.webhooks) ? p.webhooks : [],
+    schedules: Array.isArray(p.schedules) ? p.schedules : [],
+    reports: Array.isArray(p.reports) ? p.reports : [],
+    cameras: Array.isArray(p.cameras) ? p.cameras : [],
+    translations: p.translations && typeof p.translations === 'object' ? p.translations : {},
+    transparentTunnel: p.transparentTunnel ?? null,
+    security: p.security ?? {
+      abKeyEnabled: true,
+      requirePasswordForWrites: true,
+      minWriteLevel: 5,
+      httpsOnly: true,
+      auditTrailEnabled: true,
+      users: [],
+    },
+    auditLog: Array.isArray(p.auditLog) ? p.auditLog : [],
+    dataGroups: Array.isArray(p.dataGroups) ? p.dataGroups : [],
+    dataReportingServers: Array.isArray(p.dataReportingServers) ? p.dataReportingServers : [],
+    cloudMonitor: p.cloudMonitor ?? {
+      enabled: false,
+      platform: 'HAIWELL_CLOUD',
+      machineCode: '',
+      networkProjectPort: 8888,
+      webScadaEnabled: true,
+      mobileAppEnabled: true,
+      remoteAlarmPushEnabled: true,
+      monitoredTags: [],
+    },
+    operationRecordPolicy: p.operationRecordPolicy ?? {
+      enabled: true,
+      recordLogins: true,
+      recordVariableWrites: true,
+      recordScreenChanges: true,
+      recordRecipeTransfers: true,
+      recordAlarmAcks: true,
+      retentionDays: 180,
+      maxRecords: 100000,
+      storageTarget: 'LOCAL_SQLITE',
+    },
+    fonts: Array.isArray(p.fonts) ? p.fonts : [],
+    rfid: p.rfid ?? {
+      enabled: false,
+      transport: 'USB_HID',
+      portOrHost: 'USB0',
+      autoLoginEnabled: false,
+      autoLogoutOnRemoveSec: 30,
+      cards: [],
+    },
+    shapeLibrary: Array.isArray(p.shapeLibrary) ? p.shapeLibrary : [],
+    peripherals: Array.isArray(p.peripherals) ? p.peripherals : [],
+    audioClips: Array.isArray(p.audioClips) ? p.audioClips : [],
+    createdAt: p.createdAt ?? new Date().toISOString(),
+    updatedAt: p.updatedAt ?? new Date().toISOString(),
+  };
+}
+
 export class HaiwellProjectStore {
   private projects = new Map<string, HaiwellProject>();
   private snapshots = new Map<string, ProjectSnapshot[]>();
@@ -546,66 +678,42 @@ export class HaiwellProjectStore {
   private persistPath: string | null;
 
   constructor(workspaceDir?: string) {
-    this.persistPath = workspaceDir ? path.join(workspaceDir, 'workspace.json') : null;
+    const cleanDir = workspaceDir?.trim();
+    this.persistPath = cleanDir ? path.resolve(cleanDir, 'workspace.json') : null;
     if (this.persistPath && fs.existsSync(this.persistPath)) {
       try {
-        const raw = JSON.parse(fs.readFileSync(this.persistPath, 'utf8')) as {
-          projects?: HaiwellProject[];
+        const raw = sanitizeJsonProtoKeys(
+          JSON.parse(fs.readFileSync(this.persistPath, 'utf8'))
+        ) as {
+          initialized?: boolean;
+          projects?: Partial<HaiwellProject>[];
           snapshots?: Record<string, ProjectSnapshot[]>;
         };
-        if (raw.snapshots && typeof raw.snapshots === 'object') {
-          for (const [pid, snaps] of Object.entries(raw.snapshots)) {
-            if (Array.isArray(snaps)) this.snapshots.set(pid, snaps);
-          }
-        }
-        if (Array.isArray(raw.projects) && raw.projects.length > 0) {
+        if (Array.isArray(raw.projects) && (raw.projects.length > 0 || raw.initialized === true)) {
+          const validProjectIds = new Set<string>();
           for (const p of raw.projects) {
-            this.projects.set(p.id, {
-              ...p,
-              networkProjectEnabled: p.networkProjectEnabled ?? true,
-              networkProjectPort: p.networkProjectPort ?? 8888,
-              hwdevFileName: p.hwdevFileName ?? `${p.id}.hwdev`,
-              dataGroups: p.dataGroups ?? [],
-              dataReportingServers: p.dataReportingServers ?? [],
-              cloudMonitor: p.cloudMonitor ?? {
-                enabled: false,
-                platform: 'HAIWELL_CLOUD',
-                machineCode: '',
-                networkProjectPort: 8888,
-                webScadaEnabled: true,
-                mobileAppEnabled: true,
-                remoteAlarmPushEnabled: true,
-                monitoredTags: [],
-              },
-              operationRecordPolicy: p.operationRecordPolicy ?? {
-                enabled: true,
-                recordLogins: true,
-                recordVariableWrites: true,
-                recordScreenChanges: true,
-                recordRecipeTransfers: true,
-                recordAlarmAcks: true,
-                retentionDays: 180,
-                maxRecords: 100000,
-                storageTarget: 'LOCAL_SQLITE',
-              },
-              fonts: p.fonts ?? [],
-              rfid: p.rfid ?? {
-                enabled: false,
-                transport: 'USB_HID',
-                portOrHost: 'USB0',
-                autoLoginEnabled: false,
-                autoLogoutOnRemoveSec: 30,
-                cards: [],
-              },
-              shapeLibrary: p.shapeLibrary ?? [],
-              peripherals: p.peripherals ?? [],
-              audioClips: p.audioClips ?? [],
-            });
+            if (!p || typeof p.id !== 'string' || !p.id) continue;
+            const norm = normalizeLoadedProject(p);
+            this.projects.set(norm.id, norm);
+            validProjectIds.add(norm.id);
+          }
+          if (raw.snapshots && typeof raw.snapshots === 'object') {
+            for (const [pid, snaps] of Object.entries(raw.snapshots)) {
+              if (Array.isArray(snaps) && validProjectIds.has(pid)) {
+                this.snapshots.set(pid, snaps);
+              }
+            }
           }
           return;
         }
       } catch (err) {
-        console.warn('[HaiwellProjectStore] Failed to load workspace.json, falling back to seed:', err);
+        try {
+          const backupPath = `${this.persistPath}.corrupt.${Date.now()}`;
+          fs.copyFileSync(this.persistPath, backupPath);
+        } catch {
+          // Ignore backup error if filesystem is read-only
+        }
+        console.warn('[HaiwellProjectStore] Failed to load workspace.json (backed up corrupt file), falling back to seed:', err);
       }
     }
     const seed = makeSeedProject();
@@ -614,16 +722,26 @@ export class HaiwellProjectStore {
 
   private persistIfEnabled(): void {
     if (!this.persistPath) return;
+    fs.mkdirSync(path.dirname(this.persistPath), { recursive: true });
+    const tmp = `${this.persistPath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    const payload = {
+      initialized: true,
+      projects: [...this.projects.values()],
+      snapshots: Object.fromEntries(this.snapshots.entries()),
+    };
+    const json = JSON.stringify(payload, null, 2);
     try {
-      fs.mkdirSync(path.dirname(this.persistPath), { recursive: true });
-      const tmp = `${this.persistPath}.${process.pid}.${Date.now()}.tmp`;
-      const payload = {
-        projects: [...this.projects.values()],
-        snapshots: Object.fromEntries(this.snapshots.entries()),
-      };
-      fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      const fd = fs.openSync(tmp, 'w', 0o600);
+      try {
+        fs.writeSync(fd, json, 0, 'utf8');
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      const backoffs = [10, 20, 40, 80, 120];
       let lastErr: unknown;
-      for (let attempt = 1; attempt <= 5; attempt++) {
+      for (let attempt = 0; attempt < backoffs.length; attempt++) {
         try {
           fs.renameSync(tmp, this.persistPath);
           lastErr = null;
@@ -632,21 +750,21 @@ export class HaiwellProjectStore {
           const code = (err as NodeJS.ErrnoException)?.code;
           lastErr = err;
           if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
-            if (attempt === 5) {
-              fs.copyFileSync(tmp, this.persistPath);
-              try { fs.unlinkSync(tmp); } catch { /* ignore cleanup error */ }
-              lastErr = null;
-            }
+            sleepSync(backoffs[attempt]);
           } else {
             break;
           }
         }
       }
       if (lastErr) {
-        console.warn('[HaiwellProjectStore] Failed to persist workspace.json:', lastErr);
+        throw lastErr;
       }
-    } catch (err) {
-      console.warn('[HaiwellProjectStore] Persistence error (workspace unchanged on disk):', err);
+    } finally {
+      try {
+        if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+      } catch {
+        // Ignore temp cleanup error
+      }
     }
   }
 
@@ -670,8 +788,14 @@ export class HaiwellProjectStore {
     return project;
   }
 
-  saveProject(project: HaiwellProject): HaiwellProject {
-    project.revision = (project.revision ?? 0) + 1;
+  saveProject(project: HaiwellProject, expectedRevision?: number): HaiwellProject {
+    const current = this.projects.get(project.id);
+    if (expectedRevision !== undefined && current && current.revision !== expectedRevision) {
+      throw new Error(
+        `REVISION_CONFLICT: Expected revision ${expectedRevision} on "${project.id}", actual revision is ${current.revision}.`
+      );
+    }
+    project.revision = Math.max(current?.revision ?? 0, project.revision ?? 0) + 1;
     project.updatedAt = new Date().toISOString();
     this.projects.set(project.id, project);
     this.persistIfEnabled();
@@ -690,7 +814,7 @@ export class HaiwellProjectStore {
   createSnapshot(projectId: string, label: string): Omit<ProjectSnapshot, 'payloadJson'> {
     const project = this.getProject(projectId);
     const snap: ProjectSnapshot = {
-      snapshotId: `snap_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      snapshotId: `snap_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
       projectId,
       label,
       revision: project.revision,
@@ -714,7 +838,32 @@ export class HaiwellProjectStore {
     const list = this.snapshots.get(projectId) ?? [];
     const snap = list.find((s) => s.snapshotId === snapshotId);
     if (!snap) throw new Error(`Snapshot "${snapshotId}" not found for project "${projectId}".`);
-    const restored = JSON.parse(snap.payloadJson) as HaiwellProject;
+    const current = this.projects.get(projectId);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(snap.payloadJson);
+    } catch (err) {
+      throw new Error(`CORRUPT_SNAPSHOT: Snapshot "${snapshotId}" JSON is invalid (${err instanceof Error ? err.message : String(err)}).`);
+    }
+    const restored = normalizeLoadedProject(parsed as Partial<HaiwellProject>);
+    if (restored.id !== projectId) {
+      throw new Error(`Snapshot "${snapshotId}" belongs to "${restored.id}", not "${projectId}".`);
+    }
+    const preservedAudit = current?.auditLog ? [...current.auditLog] : [...restored.auditLog];
+    restored.auditLog = preservedAudit;
+    restored.revision = Math.max(current?.revision ?? 0, restored.revision ?? 0);
+    restored.auditLog.push({
+      id: `aud_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+      timestamp: new Date().toISOString(),
+      actor: 'mcp-agent',
+      action: 'SNAPSHOT_ROLLBACK',
+      target: snapshotId,
+      outcome: 'ALLOWED',
+      detail: `Rolled back project "${projectId}" to snapshot "${snap.label}" (snapshot rev ${snap.revision}).`,
+    });
+    if (restored.auditLog.length > 500) {
+      restored.auditLog.splice(0, restored.auditLog.length - 500);
+    }
     return this.saveProject(restored);
   }
 
@@ -744,7 +893,22 @@ export class HaiwellProjectStore {
       if (n.tagName === tagName) deps.push(`opcua_node:${n.nodeId}`);
     }
     for (const r of project.recipes) {
-      if (r.tagNames.includes(tagName)) deps.push(`recipe:${r.id}`);
+      if (
+        r.tagNames.includes(tagName) ||
+        r.records.some((rec) => Object.prototype.hasOwnProperty.call(rec.values ?? {}, tagName))
+      ) {
+        deps.push(`recipe:${r.id}`);
+      }
+    }
+    for (const fp of project.faceplates ?? []) {
+      if (fp.widgets.some((w) => w.tagName === tagName)) {
+        deps.push(`faceplate:${fp.id}`);
+      }
+    }
+    for (const wh of project.webhooks ?? []) {
+      if (wh.payloadTemplate && wh.payloadTemplate.includes(`{{${tagName}}}`)) {
+        deps.push(`webhook:${wh.id}`);
+      }
     }
     for (const tr of project.trends) {
       if (tr.tagNames.includes(tagName)) deps.push(`trend:${tr.id}`);
@@ -799,7 +963,7 @@ export class HaiwellProjectStore {
     entry: Omit<AuditLogEntry, 'id' | 'timestamp'>
   ): AuditLogEntry {
     const record: AuditLogEntry = {
-      id: `aud_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      id: `aud_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
       timestamp: new Date().toISOString(),
       ...entry,
     };
@@ -807,6 +971,7 @@ export class HaiwellProjectStore {
     if (project.auditLog.length > 500) {
       project.auditLog.splice(0, project.auditLog.length - 500);
     }
+    this.persistIfEnabled();
     return record;
   }
 
@@ -844,8 +1009,10 @@ export function matchMqttTopicFilter(filter: string, topic: string): boolean {
 
   for (let i = 0; i < fLevels.length; i++) {
     const f = fLevels[i];
+    if (f.includes('+') && f !== '+') return false;
+    if (f.includes('#') && (f !== '#' || i !== fLevels.length - 1)) return false;
     if (f === '#') {
-      return i === fLevels.length - 1;
+      return true;
     }
     if (i >= tLevels.length) {
       return false;
@@ -855,10 +1022,7 @@ export function matchMqttTopicFilter(filter: string, topic: string): boolean {
     }
   }
 
-  // MQTT §4.7.1.2: "sport/tennis/player1/#" matches "sport/tennis/player1"
-  if (fLevels.length === tLevels.length) return true;
-  if (fLevels.length === tLevels.length + 1 && fLevels[fLevels.length - 1] === '#') return true;
-  return false;
+  return fLevels.length === tLevels.length;
 }
 
 export const defaultProjectStore = new HaiwellProjectStore(process.env.HAIWELL_WORKSPACE_DIR);

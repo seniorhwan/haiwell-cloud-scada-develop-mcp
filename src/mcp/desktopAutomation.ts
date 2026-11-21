@@ -448,8 +448,19 @@ export function buildLaunchPowerShellScript(options: {
 
   return [
     `$ErrorActionPreference = 'Stop'`,
-    `$existing = Get-Process -Name 'Scada.Develop' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -match 'Haiwell Cloud Scada' } | Select-Object -First 1`,
+    `$existing = Get-Process -Name 'Scada.Develop' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match 'Haiwell Cloud Scada' } | Select-Object -First 1`,
     `if (-not $existing) {`,
+    `  $otherProc = Get-Process -Name 'Scada.Develop' -ErrorAction SilentlyContinue | Select-Object -First 1`,
+    `  if ($otherProc) {`,
+    `    $canReadPath = $false`,
+    `    try { $canReadPath = [bool]$otherProc.Path } catch { $canReadPath = $false }`,
+    `    if (-not $canReadPath) {`,
+    `      throw "DESKTOP_WINDOW_INACCESSIBLE: Scada.Develop (PID $($otherProc.Id)) is already running with higher Windows elevation (UIPI). Restart the MCP server / terminal as Administrator."`,
+    `    }`,
+    `    if ($otherProc.MainWindowHandle -eq 0) {`,
+    `      throw "DESKTOP_WINDOW_INACCESSIBLE: Scada.Develop (PID $($otherProc.Id)) is already running, but its UI window handle is 0 (inaccessible from this desktop session). Run the MCP server on the interactive WinSta0\\Default desktop."`,
+    `    }`,
+    `  }`,
     `  Start-Process -FilePath '${exeEsc}' ${argClause}`.trimEnd(),
     `}`,
     `$deadline = (Get-Date).AddSeconds(${timeoutSec})`,
@@ -493,10 +504,15 @@ export async function launchHaiwellDesktop(options: {
     };
   }
 
+  if (!info.exeExists) {
+    throw new Error(`DESKTOP_EXE_NOT_FOUND: Scada.Develop.exe was not found at "${info.exePath}".`);
+  }
+
   try {
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
     const { stdout } = await execFileAsync(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-STA', '-Command', psScript],
+      ['-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', encoded],
       { timeout: (timeoutSec + 10) * 1000 }
     );
     const parsed = JSON.parse(stdout.trim() || '{}');
@@ -536,7 +552,7 @@ export function buildNewProjectPowerShellScript(options: NewDesktopProjectOption
   const saveDir = options.saveDirectory ? escapePsSingleQuoted(options.saveDirectory) : '';
   const runtimePlatform = escapePsSingleQuoted(options.runtimePlatform ?? 'Cloud HMI');
   const deviceModel = escapePsSingleQuoted(options.deviceModel ?? 'Haiwell HMI B7H');
-  const resolution = escapePsSingleQuoted(options.resolution ?? '1024*600');
+  const resolution = escapePsSingleQuoted((options.resolution ?? '1024x600').replace(/\*/g, 'x'));
   const port = Number.isInteger(options.networkProjectPort) ? String(options.networkProjectPort) : '8888';
 
   const projMenuNorm = escapePsSingleQuoted(normalizeMatchText(labels.projectMenu).toLowerCase());
@@ -618,13 +634,29 @@ export function buildNewProjectPowerShellScript(options: NewDesktopProjectOption
     `    $ec.Expand()`,
     `    Start-Sleep -Milliseconds 120`,
     `  }`,
-    `  $items = $combo.FindAll([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)))`,
+    `  $listCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)`,
+    `  $items = $combo.FindAll([System.Windows.Automation.TreeScope]::Descendants, $listCond)`,
     `  foreach ($it in $items) {`,
     `    if ($it.Current.Name -and $it.Current.Name.ToLower().Contains($targetText.ToLower())) {`,
     `      $sel = $null`,
     `      if ($it.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sel)) {`,
     `        $sel.Select()`,
     `        return $true`,
+    `      }`,
+    `    }`,
+    `  }`,
+    `  $comboPid = $combo.Current.ProcessId`,
+    `  $rootChildren = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)`,
+    `  foreach ($rc in $rootChildren) {`,
+    `    if ($rc.Current.ProcessId -ne $comboPid) { continue }`,
+    `    $popItems = $rc.FindAll([System.Windows.Automation.TreeScope]::Descendants, $listCond)`,
+    `    foreach ($it in $popItems) {`,
+    `      if ($it.Current.Name -and $it.Current.Name.ToLower().Contains($targetText.ToLower())) {`,
+    `        $sel = $null`,
+    `        if ($it.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sel)) {`,
+    `          $sel.Select()`,
+    `          return $true`,
+    `        }`,
     `      }`,
     `    }`,
     `  }`,
@@ -645,13 +677,13 @@ export function buildNewProjectPowerShellScript(options: NewDesktopProjectOption
     `function Find-HaiwellDialog($parentWin, [int]$pidFilter, [IntPtr]$mainHandle, [string]$titleRegex, [int]$timeoutMs = 5000) {`,
     `  $winCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)`,
     `  $deadline = (Get-Date).AddMilliseconds($timeoutMs)`,
-    `  $mainHwndInt = $mainHandle.ToInt32()`,
+    `  $mainHwndLong = $mainHandle.ToInt64()`,
     `  while ((Get-Date) -lt $deadline) {`,
     `    foreach ($w in $parentWin.FindAll([System.Windows.Automation.TreeScope]::Children, $winCond)) {`,
     `      if ($w.Current.Name -and $w.Current.Name -match $titleRegex) { return $w }`,
     `    }`,
     `    foreach ($w in [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $winCond)) {`,
-    `      if ($w.Current.ProcessId -eq $pidFilter -and $w.Current.NativeWindowHandle -ne $mainHwndInt -and $w.Current.Name -and $w.Current.Name -match $titleRegex) { return $w }`,
+    `      if ($w.Current.ProcessId -eq $pidFilter -and [Int64]$w.Current.NativeWindowHandle -ne $mainHwndLong -and $w.Current.Name -and $w.Current.Name -match $titleRegex) { return $w }`,
     `    }`,
     `    Start-Sleep -Milliseconds 150`,
     `  }`,
@@ -659,7 +691,18 @@ export function buildNewProjectPowerShellScript(options: NewDesktopProjectOption
     `}`,
     ``,
     `$proc = Get-Process -Name 'Scada.Develop' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match 'Haiwell Cloud Scada' } | Select-Object -First 1`,
-    `if (-not $proc) { throw 'Haiwell Cloud Scada main window is not running. Call haiwell_desktop_launch first.' }`,
+    `if (-not $proc) {`,
+    `  $anyProc = Get-Process -Name 'Scada.Develop' -ErrorAction SilentlyContinue | Select-Object -First 1`,
+    `  if ($anyProc) {`,
+    `    $canReadPath = $false`,
+    `    try { $canReadPath = [bool]$anyProc.Path } catch { $canReadPath = $false }`,
+    `    if (-not $canReadPath) {`,
+    `      throw "DESKTOP_WINDOW_INACCESSIBLE: Scada.Develop (PID $($anyProc.Id)) is running with higher Windows elevation (UIPI). Restart the MCP server / terminal as Administrator."`,
+    `    }`,
+    `    throw "DESKTOP_WINDOW_INACCESSIBLE: Scada.Develop (PID $($anyProc.Id)) is running, but its main window handle is 0 (inaccessible from this desktop session). Ensure the MCP server runs on the interactive WinSta0\\Default desktop."`,
+    `  }`,
+    `  throw 'Haiwell Cloud Scada main window is not running. Call haiwell_desktop_launch first.'`,
+    `}`,
     `$mainWin = [System.Windows.Automation.AutomationElement]::FromHandle($proc.MainWindowHandle)`,
     ``,
     `# 1. Open Project -> New project via UIA MenuItem first (locale-safe), Start Page link second, Alt+P,W fallback`,
@@ -718,9 +761,15 @@ export function buildNewProjectPowerShellScript(options: NewDesktopProjectOption
     `  Set-EditSafe $nameEdit '${projectName}' | Out-Null`,
     `}`,
     `$platformCombo = Get-AdjacentControl $dlg '${platformLblNorm}' ([System.Windows.Automation.ControlType]::ComboBox)`,
-    `Select-ComboByText $platformCombo '${runtimePlatform}' | Out-Null`,
     `$modelCombo = Get-AdjacentControl $dlg '${modelLblNorm}' ([System.Windows.Automation.ControlType]::ComboBox)`,
-    `Select-ComboByText $modelCombo '${deviceModel}' | Out-Null`,
+    `if ($modelCombo) {`,
+    `  Select-ComboByText $platformCombo '${runtimePlatform}' | Out-Null`,
+    `  Select-ComboByText $modelCombo '${deviceModel}' | Out-Null`,
+    `} else {`,
+    `  if (-not (Select-ComboByText $platformCombo '${deviceModel}')) {`,
+    `    Select-ComboByText $platformCombo '${runtimePlatform}' | Out-Null`,
+    `  }`,
+    `}`,
     `$resCombo = Get-AdjacentControl $dlg '${resLblNorm}' ([System.Windows.Automation.ControlType]::ComboBox)`,
     `Select-ComboByText $resCombo '${resolution}' | Out-Null`,
     `$portEdit = Get-AdjacentControl $dlg '${portLblNorm}' ([System.Windows.Automation.ControlType]::Edit)`,
@@ -753,10 +802,15 @@ export async function createNewHaiwellProjectOnDesktop(options: NewDesktopProjec
     };
   }
 
+  if (!info.exeExists) {
+    throw new Error(`DESKTOP_EXE_NOT_FOUND: Scada.Develop.exe was not found at "${info.exePath}".`);
+  }
+
   try {
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
     const { stdout } = await execFileAsync(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-STA', '-Command', psScript],
+      ['-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', encoded],
       { timeout: 30_000 }
     );
     return {

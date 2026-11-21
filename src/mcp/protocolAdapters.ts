@@ -27,11 +27,14 @@ export function validateMqttTopic(topic: string, direction: MqttTopicBinding['di
   if (topic.includes('\u0000')) {
     errors.push('MQTT topic must not contain NULL (U+0000) character.');
   }
-  if (direction === 'PUBLISH' && (topic.includes('+') || topic.includes('#'))) {
-    errors.push(`Publish topic "${topic}" cannot contain wildcards (+ or #).`);
+  if ((direction === 'PUBLISH' || direction === 'BIDIRECTIONAL') && (topic.includes('+') || topic.includes('#'))) {
+    errors.push(`Publish/bidirectional topic "${topic}" cannot contain wildcards (+ or #).`);
   }
-  if ((direction === 'PUBLISH' || direction === 'BIDIRECTIONAL') && topic.startsWith('$SYS/')) {
-    errors.push(`Publishing to broker system namespace "$SYS/" ("${topic}") is forbidden by MQTT 3.1.1/5.0.`);
+  if (
+    (direction === 'PUBLISH' || direction === 'BIDIRECTIONAL') &&
+    (topic === '$SYS' || topic.startsWith('$SYS/') || topic.startsWith('$share/'))
+  ) {
+    errors.push(`Publishing to broker system/shared namespace ("${topic}") is forbidden by MQTT 3.1.1/5.0.`);
   }
 
   // Strict per-level wildcard validation (MQTT 3.1.1 §4.7.1.2 & §4.7.1.3)
@@ -59,21 +62,55 @@ export function validateMqttTopic(topic: string, direction: MqttTopicBinding['di
   return { valid: errors.length === 0, errors, warnings };
 }
 
+const sparkplugSeqByProject = new Map<string, number>();
+
+function nextSparkplugSeq(projectId: string): number {
+  const next = ((sparkplugSeqByProject.get(projectId) ?? -1) + 1) % 256;
+  sparkplugSeqByProject.set(projectId, next);
+  return next;
+}
+
+function mapTagTypeToSparkplugB(dt: TagDataType): string {
+  switch (dt) {
+    case 'BOOL':
+      return 'Boolean';
+    case 'INT16':
+      return 'Int16';
+    case 'UINT16':
+    case 'BCD16':
+      return 'UInt16';
+    case 'INT32':
+      return 'Int32';
+    case 'UINT32':
+    case 'BCD32':
+      return 'UInt32';
+    case 'FLOAT32':
+      return 'Float';
+    case 'FLOAT64':
+      return 'Double';
+    case 'STRING':
+      return 'String';
+  }
+}
+
 export function buildMqttPayload(
   project: HaiwellProject,
   binding: MqttTopicBinding
 ): Record<string, unknown> {
   const ts = Date.now();
+  const getTag = (name: string) =>
+    Object.prototype.hasOwnProperty.call(project.tags, name) ? project.tags[name] : undefined;
+
   if (binding.format === 'SPARKPLUG_B') {
     return {
       timestamp: ts,
-      seq: Math.floor((ts / 1000) % 256),
+      seq: nextSparkplugSeq(project.id),
       metrics: binding.tags.map((tagName) => {
-        const tag = project.tags[tagName];
+        const tag = getTag(tagName);
         return {
           name: tagName,
           timestamp: ts,
-          dataType: tag?.dataType ?? 'FLOAT32',
+          dataType: tag ? mapTagTypeToSparkplugB(tag.dataType) : 'Float',
           value: tag?.currentValue ?? null,
           properties: {
             quality: tag?.quality ?? 'UNCERTAIN',
@@ -84,14 +121,21 @@ export function buildMqttPayload(
     };
   }
 
-  if (binding.format === 'RAW_VALUE' && binding.tags.length === 1) {
-    const tag = project.tags[binding.tags[0]];
-    return { value: tag?.currentValue ?? null };
+  if (binding.format === 'RAW_VALUE') {
+    if (binding.tags.length === 1) {
+      const tag = getTag(binding.tags[0]);
+      return { value: tag?.currentValue ?? null };
+    }
+    const rawValues = Object.create(null) as Record<string, unknown>;
+    for (const tagName of binding.tags) {
+      rawValues[tagName] = getTag(tagName)?.currentValue ?? null;
+    }
+    return { rawValues };
   }
 
-  const values: Record<string, unknown> = {};
+  const values = Object.create(null) as Record<string, unknown>;
   for (const tagName of binding.tags) {
-    values[tagName] = project.tags[tagName]?.currentValue ?? null;
+    values[tagName] = getTag(tagName)?.currentValue ?? null;
   }
   return {
     projectId: project.id,
@@ -101,7 +145,7 @@ export function buildMqttPayload(
   };
 }
 
-const BLOCKED_METADATA_HOSTNAMES = /^metadata(\.google\.internal|\.goog)?$/i;
+const BLOCKED_METADATA_HOSTNAMES = /^(?:metadata(?:\.google\.internal|\.goog)?|instance-data(?:\.ec2\.internal)?)$/i;
 
 function parseIpv4Part(part: string): number | null {
   if (!/^(0x[0-9a-f]+|0[0-7]*|[1-9]\d*)$/i.test(part)) return null;
@@ -197,15 +241,23 @@ function expandIpv6ToHextets(raw: string): number[] | null {
 
 function extractEmbeddedIpv4FromIpv6(h: number[]): string | null {
   const isIpv4Mapped = h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0xffff;
+  const isIpv4Translated = h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0xffff && h[5] === 0;
   const isIpv4Compat =
     h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0 && !(h[6] === 0 && h[7] <= 1);
   const isNat64WellKnown = h[0] === 0x0064 && h[1] === 0xff9b && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0;
-  if (!isIpv4Mapped && !isIpv4Compat && !isNat64WellKnown) return null;
-  return [(h[6] >>> 8) & 0xff, h[6] & 0xff, (h[7] >>> 8) & 0xff, h[7] & 0xff].join('.');
+  const isNat64Local = h[0] === 0x0064 && h[1] === 0xff9b && h[2] === 0x0001;
+  if (isIpv4Mapped || isIpv4Translated || isIpv4Compat || isNat64WellKnown || isNat64Local) {
+    return [(h[6] >>> 8) & 0xff, h[6] & 0xff, (h[7] >>> 8) & 0xff, h[7] & 0xff].join('.');
+  }
+  // RFC 3056 6to4 (2002::/16): IPv4 is in h[1] and h[2]
+  if (h[0] === 0x2002) {
+    return [(h[1] >>> 8) & 0xff, h[1] & 0xff, (h[2] >>> 8) & 0xff, h[2] & 0xff].join('.');
+  }
+  return null;
 }
 
 function isLoopbackIp(ip: string): boolean {
-  const clean = ip.trim().replace(/^\[|\]$/g, '').split('%')[0];
+  const clean = ip.trim().replace(/^\[|\]$/g, '').split('%')[0].replace(/\.+$/, '');
   if (/^127\./.test(clean)) return true;
   const hextets = expandIpv6ToHextets(clean);
   if (!hextets) return false;
@@ -214,18 +266,28 @@ function isLoopbackIp(ip: string): boolean {
   return Boolean(embedded && /^127\./.test(embedded));
 }
 
-export function isBlockedSsrfHost(rawHost: string): boolean {
-  const host = rawHost.trim().replace(/^\[|\]$/g, '').replace(/\.+$/, '').split('%')[0];
+export function isBlockedSsrfHost(rawHost: string, options: { blockLoopback?: boolean } = {}): boolean {
+  const host = rawHost.trim().replace(/^\[|\]$/g, '').split('%')[0].replace(/\.+$/, '');
   if (!host) return true;
   if (BLOCKED_METADATA_HOSTNAMES.test(host)) return true;
 
+  if (options.blockLoopback) {
+    const lower = host.toLowerCase();
+    if (lower === 'localhost' || lower.endsWith('.localhost')) return true;
+  }
+
   const decodedIpv4 = decodeNumericIpv4(host);
-  if (decodedIpv4 && isBlockedIpv4Literal(decodedIpv4)) return true;
+  if (decodedIpv4) {
+    if (isBlockedIpv4Literal(decodedIpv4)) return true;
+    if (options.blockLoopback && /^127\./.test(decodedIpv4)) return true;
+  }
 
   const hextets = expandIpv6ToHextets(host);
   if (hextets) {
     // Unspecified :: (all zeros)
     if (hextets.every((v) => v === 0)) return true;
+    // Loopback ::1
+    if (options.blockLoopback && hextets.slice(0, 7).every((v) => v === 0) && hextets[7] === 1) return true;
     // IPv6 link-local fe80::/10
     if ((hextets[0] & 0xffc0) === 0xfe80) return true;
     // AWS IPv6 IMDS fd00:ec2::254
@@ -242,7 +304,10 @@ export function isBlockedSsrfHost(rawHost: string): boolean {
       return true;
     }
     const embeddedIpv4 = extractEmbeddedIpv4FromIpv6(hextets);
-    if (embeddedIpv4 && isBlockedIpv4Literal(embeddedIpv4)) return true;
+    if (embeddedIpv4) {
+      if (isBlockedIpv4Literal(embeddedIpv4)) return true;
+      if (options.blockLoopback && /^127\./.test(embeddedIpv4)) return true;
+    }
   }
 
   return false;
@@ -252,6 +317,29 @@ export type DnsLookupAllFn = (
   hostname: string,
   options: { all: true; verbatim?: boolean }
 ) => Promise<Array<{ address: string; family: number }>>;
+
+function connectSingleTcp(
+  targetIp: string,
+  port: number,
+  timeoutMs: number,
+  targetFamily?: number
+): Promise<{ reachable: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (reachable: boolean, error?: string) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ reachable, error });
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false, `TCP connect timed out after ${timeoutMs}ms`));
+    socket.once('error', (err) => finish(false, err.message));
+    socket.connect({ port, host: targetIp, ...(targetFamily ? { family: targetFamily } : {}) });
+  });
+}
 
 export async function probeTcpEndpoint(
   host: string,
@@ -270,24 +358,34 @@ export async function probeTcpEndpoint(
     return { reachable: false, latencyMs: 0, error: `Invalid TCP port ${port}.` };
   }
 
-  const cleanHost = host.trim().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+  const boundedTimeout = Number.isFinite(timeoutMs) ? Math.max(50, Math.min(timeoutMs, 30_000)) : 1500;
+  const cleanHost = host.trim().replace(/^\[|\]$/g, '').split('%')[0].replace(/\.+$/, '');
   const start = performance.now();
-  let targetIp = cleanHost;
-  let targetFamily: number | undefined;
+  const deadline = start + boundedTimeout;
+  const targets: Array<{ ip: string; family?: number }> = [];
 
-  if (net.isIP(cleanHost) === 0) {
+  if (net.isIP(cleanHost) !== 0) {
+    targets.push({ ip: cleanHost });
+  } else {
     const decoded = decodeNumericIpv4(cleanHost);
     if (decoded) {
-      targetIp = decoded;
-      targetFamily = 4;
+      if (/^127\./.test(decoded) && cleanHost !== decoded) {
+        return {
+          reachable: false,
+          latencyMs: 0,
+          error: `SSRF_BLOCK: Obfuscated numeric loopback alias "${host}" (${decoded}) is forbidden.`,
+        };
+      }
+      targets.push({ ip: decoded, family: 4 });
     } else {
       const lookup: DnsLookupAllFn = lookupFn ?? ((h, opts) => dns.promises.lookup(h, opts));
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
+        const remainingForDns = Math.max(25, Math.ceil(deadline - performance.now()));
         const records = await Promise.race([
           lookup(cleanHost, { all: true, verbatim: true }),
           new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error(`DNS lookup timed out after ${timeoutMs}ms`)), timeoutMs);
+            timer = setTimeout(() => reject(new Error(`DNS lookup timed out after ${boundedTimeout}ms`)), remainingForDns);
           }),
         ]);
         if (!records || records.length === 0) {
@@ -314,9 +412,8 @@ export async function probeTcpEndpoint(
               error: `SSRF_BLOCK: Host "${host}" resolved to loopback address "${rec.address}" (DNS rebinding blocked).`,
             };
           }
+          targets.push({ ip: rec.address, family: rec.family });
         }
-        targetIp = records[0].address;
-        targetFamily = records[0].family;
       } catch (err) {
         return {
           reachable: false,
@@ -329,27 +426,25 @@ export async function probeTcpEndpoint(
     }
   }
 
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    let settled = false;
-
-    const finish = (reachable: boolean, error?: string) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve({
-        reachable,
+  let lastError = 'TCP connect failed';
+  for (const tgt of targets) {
+    const remaining = Math.max(25, Math.ceil(deadline - performance.now()));
+    const attempt = await connectSingleTcp(tgt.ip, port, remaining, tgt.family);
+    if (attempt.reachable) {
+      return {
+        reachable: true,
         latencyMs: Number((performance.now() - start).toFixed(2)),
-        error,
-      });
-    };
+      };
+    }
+    lastError = attempt.error ?? lastError;
+    if (performance.now() >= deadline) break;
+  }
 
-    socket.setTimeout(timeoutMs);
-    socket.once('connect', () => finish(true));
-    socket.once('timeout', () => finish(false, `TCP connect timed out after ${timeoutMs}ms`));
-    socket.once('error', (err) => finish(false, err.message));
-    socket.connect({ port, host: targetIp, ...(targetFamily ? { family: targetFamily } : {}) });
-  });
+  return {
+    reachable: false,
+    latencyMs: Number((performance.now() - start).toFixed(2)),
+    error: lastError,
+  };
 }
 
 const TAG_TO_OPCUA_TYPE: Record<TagDataType, { name: string; nodeId: string }> = {
@@ -371,6 +466,7 @@ export function mapTagTypeToOpcUa(dataType: TagDataType): { name: string; nodeId
 
 function escapeXml(str: string): string {
   return str
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -380,9 +476,15 @@ function escapeXml(str: string): string {
 
 export function generateOpcUaNodeSet2Xml(project: HaiwellProject): string {
   const { opcua } = project;
-  const nsIdx = opcua.namespaceIndex;
+  const nsIdx = Math.max(1, opcua.namespaceIndex || 1);
   const folderNodeId = `ns=${nsIdx};s=${project.id}.Folder`;
-  const seenNodeIds = new Set<string>();
+  const seenNodeIds = new Set<string>([folderNodeId]);
+
+  const namespaceUrisXml: string[] = [];
+  for (let i = 1; i < nsIdx; i++) {
+    namespaceUrisXml.push(`    <Uri>urn:haiwell:scada:ns${i}</Uri>`);
+  }
+  namespaceUrisXml.push(`    <Uri>${escapeXml(opcua.namespaceUri)}</Uri>`);
 
   const variableXml = opcua.nodes
     .filter((node) => {
@@ -391,11 +493,15 @@ export function generateOpcUaNodeSet2Xml(project: HaiwellProject): string {
       return true;
     })
     .map((node: OpcUaNodeMapping) => {
-      const tag = project.tags[node.tagName];
-      const uaType = tag ? mapTagTypeToOpcUa(tag.dataType) : { name: 'Double', nodeId: 'i=11' };
+      const tag = Object.prototype.hasOwnProperty.call(project.tags, node.tagName)
+        ? project.tags[node.tagName]
+        : undefined;
+      const uaType = tag
+        ? mapTagTypeToOpcUa(tag.dataType)
+        : { name: node.dataType || 'Double', nodeId: 'i=11' };
       const accessBits = node.accessLevel === 'CurrentReadWrite' ? 3 : node.accessLevel === 'HistoryRead' ? 5 : 1;
       return [
-        `  <UAVariable NodeId="${escapeXml(node.nodeId)}" BrowseName="${nsIdx}:${escapeXml(node.browseName)}" ParentNodeId="${escapeXml(folderNodeId)}" DataType="${uaType.name}" AccessLevel="${accessBits}" UserAccessLevel="${accessBits}" MinimumSamplingInterval="${node.samplingIntervalMs}">`,
+        `  <UAVariable NodeId="${escapeXml(node.nodeId)}" BrowseName="${nsIdx}:${escapeXml(node.browseName)}" ParentNodeId="${escapeXml(folderNodeId)}" DataType="${escapeXml(uaType.name)}" AccessLevel="${accessBits}" UserAccessLevel="${accessBits}" MinimumSamplingInterval="${node.samplingIntervalMs}">`,
         `    <DisplayName>${escapeXml(node.displayName)}</DisplayName>`,
         `    <References>`,
         `      <Reference ReferenceType="HasTypeDefinition">i=63</Reference>`,
@@ -409,8 +515,20 @@ export function generateOpcUaNodeSet2Xml(project: HaiwellProject): string {
     `<?xml version="1.0" encoding="utf-8"?>`,
     `<UANodeSet xmlns="http://opcfoundation.org/UA/2011/03/UANodeSet.xsd" xmlns:uax="http://opcfoundation.org/UA/2008/02/Types.xsd">`,
     `  <NamespaceUris>`,
-    `    <Uri>${escapeXml(opcua.namespaceUri)}</Uri>`,
+    ...namespaceUrisXml,
     `  </NamespaceUris>`,
+    `  <Aliases>`,
+    `    <Alias Alias="Boolean">i=1</Alias>`,
+    `    <Alias Alias="Int16">i=4</Alias>`,
+    `    <Alias Alias="UInt16">i=5</Alias>`,
+    `    <Alias Alias="Int32">i=6</Alias>`,
+    `    <Alias Alias="UInt32">i=7</Alias>`,
+    `    <Alias Alias="Float">i=10</Alias>`,
+    `    <Alias Alias="Double">i=11</Alias>`,
+    `    <Alias Alias="String">i=12</Alias>`,
+    `    <Alias Alias="Organizes">i=35</Alias>`,
+    `    <Alias Alias="HasTypeDefinition">i=40</Alias>`,
+    `  </Aliases>`,
     `  <Models>`,
     `    <Model ModelUri="${escapeXml(opcua.namespaceUri)}" Version="${escapeXml(project.version)}" PublicationDate="${new Date().toISOString()}" />`,
     `  </Models>`,

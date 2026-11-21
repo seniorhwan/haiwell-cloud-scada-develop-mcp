@@ -119,3 +119,44 @@ END_PROGRAM
   assert.match(legacyJs.jsCode ?? '', /Tag\.Read\("Supply_Temp_C"\)/);
   assert.match(legacyJs.jsCode ?? '', /Tag\.Write\("Plant_DeltaT_C", DeltaT\)/);
 });
+
+test('Phase 3 ST/FBD regressions: $$ string, VAR_EXTERNAL, F_TRIG _prev, CTUD/PID, FOR BY 0, and FBD non-string blockType', () => {
+  const stWithStr = `
+PROGRAM StrProg
+VAR_EXTERNAL
+  Supply_Temp_C : REAL;
+END_VAR
+VAR
+  msg : STRING := 'cost $$10';
+  ft : F_TRIG;
+  ud : CTUD;
+  clk : BOOL := FALSE;
+END_VAR
+ft(CLK := clk);
+ud(CU := clk, CD := FALSE, R := FALSE, LD := FALSE, PV := 10);
+END_PROGRAM
+`;
+  const val = validateStructuredText(stWithStr);
+  assert.equal(val.valid, true);
+  const js = transpileStToHaiwellJs(stWithStr);
+  assert.equal(js.success, true);
+  assert.match(js.jsCode ?? '', /_prev/);
+  assert.match(js.jsCode ?? '', /__haiwellFbStore/);
+
+  const badFor = transpileStToHaiwellJs(`
+PROGRAM BadFor
+VAR i : INT; END_VAR
+FOR i := 1 TO 10 BY 0 DO
+  i := i;
+END_FOR;
+END_PROGRAM
+`);
+  assert.equal(badFor.success, true);
+  assert.match(badFor.jsCode ?? '', /=== 0/);
+
+  const badFbd = validateFbdNetwork(
+    'BadFbd',
+    JSON.stringify([{ id: 'b1', blockType: 123, inputs: {} }])
+  );
+  assert.equal(badFbd.valid, false);
+});

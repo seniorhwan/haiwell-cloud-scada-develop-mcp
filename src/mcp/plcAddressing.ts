@@ -82,9 +82,52 @@ export function getWordSpanForType(dataType: TagDataType): number {
   }
 }
 
+export function getByteWidthForType(dataType: TagDataType, wordSpanOverride?: number): number {
+  if (wordSpanOverride !== undefined && Number.isInteger(wordSpanOverride) && wordSpanOverride > 0) {
+    return Math.min(wordSpanOverride, 1024) * 2;
+  }
+  switch (dataType) {
+    case 'BOOL':
+      return 1;
+    case 'INT16':
+    case 'UINT16':
+    case 'BCD16':
+      return 2;
+    case 'INT32':
+    case 'UINT32':
+    case 'FLOAT32':
+    case 'BCD32':
+      return 4;
+    case 'FLOAT64':
+      return 8;
+    case 'STRING':
+      return 32;
+  }
+}
+
+function computeModbus1Based(area: 'COIL' | 'DI' | 'IR' | 'HR', offset0Based: number): number {
+  const extended = offset0Based >= 9999;
+  const prefix =
+    area === 'COIL'
+      ? 1
+      : area === 'DI'
+        ? extended
+          ? 100001
+          : 10001
+        : area === 'IR'
+          ? extended
+            ? 300001
+            : 30001
+          : extended
+            ? 400001
+            : 40001;
+  return prefix + offset0Based;
+}
+
 export function validatePlcAddress(
   protocol: PlcDriverProtocol,
-  rawAddress: string
+  rawAddress: string,
+  options: { addressOffset?: 'BASE_0' | 'BASE_1' } = {}
 ): ValidatedPlcAddress | InvalidPlcAddress {
   const trimmed = rawAddress.trim();
   if (!trimmed) {
@@ -97,8 +140,56 @@ export function validatePlcAddress(
     };
   }
 
-  // 1. Haiwell Native PLC
+  // 1. Haiwell Native PLC (plus Haiwell HMI internal W0..W65535)
   if (protocol === 'HAIWELL_PLC_TCP' || protocol === 'HAIWELL_PLC_RTU') {
+    const upper = trimmed.toUpperCase();
+    const internalWMatch = /^W(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
+    if (internalWMatch) {
+      const idx = Number.parseInt(internalWMatch[1], 10);
+      const bitStr = internalWMatch[2];
+      if (idx < 0 || idx > 65535) {
+        return {
+          valid: false,
+          protocol,
+          input: rawAddress,
+          error: `Internal word offset W${idx} out of range (0..65535).`,
+          hint: 'Use W0..W65535.',
+        };
+      }
+      if (bitStr !== undefined) {
+        const bit = Number.parseInt(bitStr, 10);
+        if (bit < 0 || bit > 15) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Word bit offset .${bit} out of range (0..15) for W${idx}.`,
+            hint: `Use W${idx}.0 through W${idx}.15.`,
+          };
+        }
+        return {
+          valid: true,
+          protocol,
+          normalized: `W${idx}.${bit}`,
+          canonicalKey: `HAIWELL_INTERNAL_W:${idx}.${bit}`,
+          kind: 'BIT',
+          readOnly: false,
+          maxAddressIndex: 65535,
+          enclosingWordSlot: { space: 'HAIWELL_INTERNAL_W', index: idx, unit: 'WORD', bitOffset: bit },
+        };
+      }
+      return {
+        valid: true,
+        protocol,
+        normalized: `W${idx}`,
+        canonicalKey: `HAIWELL_INTERNAL_W:${idx}`,
+        kind: 'WORD',
+        readOnly: false,
+        maxAddressIndex: 65535,
+        wordAddressKey: { space: 'HAIWELL_INTERNAL_W', startIndex: idx },
+      };
+    }
+
     const parsed = parseHaiwellRegister(trimmed);
     if (!parsed.valid) {
       return {
@@ -141,11 +232,14 @@ export function validatePlcAddress(
     protocol === 'SCHNEIDER_MODBUS'
   ) {
     const upper = trimmed.toUpperCase();
-    // Typed form: COIL:0, DI:0, IR:0, HR:100
-    const typedMatch = /^(COIL|DI|IR|HR):(\d+)$/.exec(upper);
+    const isBase1 = options.addressOffset === 'BASE_1';
+
+    // Typed form: COIL:0, DI:0, IR:0, HR:100, optional .0..15 on IR/HR
+    const typedMatch = /^(COIL|DI|IR|HR):(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
     if (typedMatch) {
-      const area = typedMatch[1];
+      const area = typedMatch[1] as 'COIL' | 'DI' | 'IR' | 'HR';
       const idx = Number.parseInt(typedMatch[2], 10);
+      const bitStr = typedMatch[3];
       if (idx < 0 || idx > 65535) {
         return {
           valid: false,
@@ -155,29 +249,56 @@ export function validatePlcAddress(
           hint: 'Use offset 0..65535.',
         };
       }
-      const isBit = area === 'COIL' || area === 'DI';
+      const isCoilOrDi = area === 'COIL' || area === 'DI';
+      let parsedBit: number | undefined;
+      if (bitStr !== undefined) {
+        const bit = Number.parseInt(bitStr, 10);
+        if (isCoilOrDi) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Bit register ${area}:${idx} cannot have a bit suffix .${bitStr}.`,
+            hint: `Use ${area}:${idx} directly.`,
+          };
+        }
+        if (bit < 0 || bit > 15) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Word bit offset .${bit} out of range (0..15).`,
+            hint: `Use ${area}:${idx}.0 through ${area}:${idx}.15.`,
+          };
+        }
+        parsedBit = bit;
+      }
+      const isBit = isCoilOrDi || parsedBit !== undefined;
       const isRo = area === 'DI' || area === 'IR';
-      const prefix = area === 'COIL' ? 1 : area === 'DI' ? 10001 : area === 'IR' ? 30001 : 40001;
       const space = `MODBUS_${area}`;
       return {
         valid: true,
         protocol,
-        normalized: `${area}:${idx}`,
-        canonicalKey: `${space}:${idx}`,
+        normalized: parsedBit !== undefined ? `${area}:${idx}.${parsedBit}` : `${area}:${idx}`,
+        canonicalKey: parsedBit !== undefined ? `${space}:${idx}.${parsedBit}` : `${space}:${idx}`,
         kind: isBit ? 'BIT' : 'WORD',
         readOnly: isRo,
         modbusOffset0Based: idx,
-        modbusAddress1Based: prefix + idx,
+        modbusAddress1Based: computeModbus1Based(area, idx),
         maxAddressIndex: 65535,
         wordAddressKey: !isBit ? { space, startIndex: idx } : undefined,
+        enclosingWordSlot:
+          parsedBit !== undefined ? { space, index: idx, unit: 'WORD', bitOffset: parsedBit } : undefined,
       };
     }
 
-    // Classic 5/6-digit Modbus notation: 00001, 10001, 30001, 40001 (or 400001)
-    const numericMatch = /^(\d{5,6})$/.exec(upper);
+    // Classic 5/6-digit Modbus notation: 00001, 10001, 30001, 40001 (or 6-digit 000001..465536, optional .0..15 on 3x/4x)
+    const numericMatch = /^(\d{5,6})(?:\.(\d{1,2}))?$/.exec(upper);
     if (numericMatch) {
-      const num = Number.parseInt(numericMatch[1], 10);
-      const is6Digit = upper.length === 6;
+      const numStr = numericMatch[1];
+      const num = Number.parseInt(numStr, 10);
+      const bitStr = numericMatch[2];
+      const is6Digit = numStr.length === 6;
       const baseUnit = is6Digit ? 100000 : 10000;
       const areaDigit = Math.floor(num / baseUnit);
       const offset = num - areaDigit * baseUnit - 1;
@@ -187,10 +308,34 @@ export function validatePlcAddress(
           protocol,
           input: rawAddress,
           error: `Invalid Modbus register "${rawAddress}".`,
-          hint: 'Use 00001..09999 (Coils), 10001..19999 (Discrete Inputs), 30001..39999 (Input Regs), 40001..49999 (Holding Regs), or HR:0 / IR:0 / COIL:0 / DI:0.',
+          hint: 'Use 00001..09999 (Coils), 10001..19999 (Discrete Inputs), 30001..39999 (Input Regs), 40001..49999 (Holding Regs), 6-digit extended (400001..465536), or HR:0 / IR:0 / COIL:0 / DI:0.',
         };
       }
-      const isBit = areaDigit === 0 || areaDigit === 1;
+      const isCoilOrDi = areaDigit === 0 || areaDigit === 1;
+      let parsedBit: number | undefined;
+      if (bitStr !== undefined) {
+        const bit = Number.parseInt(bitStr, 10);
+        if (isCoilOrDi) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Bit register ${numStr} cannot have a bit suffix .${bitStr}.`,
+            hint: `Use ${numStr} directly.`,
+          };
+        }
+        if (bit < 0 || bit > 15) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Word bit offset .${bit} out of range (0..15).`,
+            hint: `Use ${numStr}.0 through ${numStr}.15.`,
+          };
+        }
+        parsedBit = bit;
+      }
+      const isBit = isCoilOrDi || parsedBit !== undefined;
       const isRo = areaDigit === 1 || areaDigit === 3;
       const space =
         areaDigit === 0
@@ -204,13 +349,15 @@ export function validatePlcAddress(
         valid: true,
         protocol,
         normalized: upper,
-        canonicalKey: `${space}:${offset}`,
+        canonicalKey: parsedBit !== undefined ? `${space}:${offset}.${parsedBit}` : `${space}:${offset}`,
         kind: isBit ? 'BIT' : 'WORD',
         readOnly: isRo,
         modbusOffset0Based: offset,
         modbusAddress1Based: num,
         maxAddressIndex: 65535,
         wordAddressKey: !isBit ? { space, startIndex: offset } : undefined,
+        enclosingWordSlot:
+          parsedBit !== undefined ? { space, index: offset, unit: 'WORD', bitOffset: parsedBit } : undefined,
       };
     }
 
@@ -218,15 +365,16 @@ export function validatePlcAddress(
     const haiwellModbusMatch = /^(0X|1X|3X|4X)(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
     if (haiwellModbusMatch) {
       const prefixArea = haiwellModbusMatch[1];
-      const idx = Number.parseInt(haiwellModbusMatch[2], 10);
+      const rawIdx = Number.parseInt(haiwellModbusMatch[2], 10);
+      const idx = isBase1 ? rawIdx - 1 : rawIdx;
       const bitStr = haiwellModbusMatch[3];
       if (idx < 0 || idx > 65535) {
         return {
           valid: false,
           protocol,
           input: rawAddress,
-          error: `Haiwell Modbus offset ${idx} out of 16-bit range (0..65535).`,
-          hint: `Use ${prefixArea}0..${prefixArea}65535.`,
+          error: `Haiwell Modbus offset ${rawIdx} out of 16-bit range (${isBase1 ? '1..65536' : '0..65535'}).`,
+          hint: `Use ${prefixArea}${isBase1 ? '1' : '0'}..${prefixArea}${isBase1 ? '65536' : '65535'}.`,
         };
       }
       const isCoilOrDi = prefixArea === '0X' || prefixArea === '1X';
@@ -238,8 +386,8 @@ export function validatePlcAddress(
             valid: false,
             protocol,
             input: rawAddress,
-            error: `Bit register ${prefixArea}${idx} cannot have a bit suffix .${bitStr}.`,
-            hint: `Use ${prefixArea}${idx} directly.`,
+            error: `Bit register ${prefixArea}${rawIdx} cannot have a bit suffix .${bitStr}.`,
+            hint: `Use ${prefixArea}${rawIdx} directly.`,
           };
         }
         if (bit < 0 || bit > 15) {
@@ -248,22 +396,16 @@ export function validatePlcAddress(
             protocol,
             input: rawAddress,
             error: `Word bit offset .${bit} out of range (0..15).`,
-            hint: `Use ${prefixArea}${idx}.0 through ${prefixArea}${idx}.15.`,
+            hint: `Use ${prefixArea}${rawIdx}.0 through ${prefixArea}${rawIdx}.15.`,
           };
         }
         parsedBit = bit;
       }
       const isRo = prefixArea === '1X' || prefixArea === '3X';
       const isBit = isCoilOrDi || parsedBit !== undefined;
-      const base1 = prefixArea === '0X' ? 1 : prefixArea === '1X' ? 10001 : prefixArea === '3X' ? 30001 : 40001;
-      const space =
-        prefixArea === '0X'
-          ? 'MODBUS_COIL'
-          : prefixArea === '1X'
-            ? 'MODBUS_DI'
-            : prefixArea === '3X'
-              ? 'MODBUS_IR'
-              : 'MODBUS_HR';
+      const areaKey =
+        prefixArea === '0X' ? 'COIL' : prefixArea === '1X' ? 'DI' : prefixArea === '3X' ? 'IR' : 'HR';
+      const space = `MODBUS_${areaKey}`;
       return {
         valid: true,
         protocol,
@@ -272,7 +414,7 @@ export function validatePlcAddress(
         kind: isBit ? 'BIT' : 'WORD',
         readOnly: isRo,
         modbusOffset0Based: idx,
-        modbusAddress1Based: base1 + idx,
+        modbusAddress1Based: computeModbus1Based(areaKey, idx),
         maxAddressIndex: 65535,
         wordAddressKey: !isBit ? { space, startIndex: idx } : undefined,
         enclosingWordSlot:
@@ -282,10 +424,133 @@ export function validatePlcAddress(
       };
     }
 
-    // Haiwell HMI internal word memory (e.g. W0..W65535)
-    const internalWMatch = /^W(\d+)$/.exec(upper);
+    // Native Delta DVP-ES2/SS2 Modbus mapping (X=octal 1X1024+, Y=octal 0X1280+, M=0X2048+, D=4X4096+)
+    if (protocol === 'DELTA_DVP_MODBUS') {
+      const deltaMatch = /^(X|Y|M|D)(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
+      if (deltaMatch) {
+        const dArea = deltaMatch[1];
+        const rawNum = deltaMatch[2];
+        const bitStr = deltaMatch[3];
+        if ((dArea === 'X' || dArea === 'Y') && !/^[0-7]+$/.test(rawNum)) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Delta DVP ${dArea} I/O uses octal addressing, got "${rawNum}".`,
+            hint: `Use octal index such as ${dArea}0..${dArea}377.`,
+          };
+        }
+        const idx = Number.parseInt(rawNum, dArea === 'X' || dArea === 'Y' ? 8 : 10);
+        if (idx > 9999) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Delta DVP register ${dArea}${rawNum} out of range.`,
+            hint: 'Use valid Delta DVP register bounds.',
+          };
+        }
+        if (bitStr !== undefined && dArea !== 'D') {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Delta bit register ${dArea}${rawNum} cannot have a bit suffix .${bitStr}.`,
+            hint: `Use ${dArea}${rawNum} directly.`,
+          };
+        }
+        const parsedBit = bitStr !== undefined ? Number.parseInt(bitStr, 10) : undefined;
+        if (parsedBit !== undefined && (parsedBit < 0 || parsedBit > 15)) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Word bit offset .${parsedBit} out of range (0..15).`,
+            hint: `Use D${idx}.0..D${idx}.15.`,
+          };
+        }
+        const modbusOff =
+          dArea === 'X' ? 1024 + idx : dArea === 'Y' ? 1280 + idx : dArea === 'M' ? 2048 + idx : 4096 + idx;
+        const areaKey = dArea === 'X' ? 'DI' : dArea === 'Y' || dArea === 'M' ? 'COIL' : 'HR';
+        const space = `MODBUS_${areaKey}`;
+        const isBit = dArea !== 'D' || parsedBit !== undefined;
+        return {
+          valid: true,
+          protocol,
+          normalized: parsedBit !== undefined ? `${dArea}${rawNum}.${parsedBit}` : `${dArea}${rawNum}`,
+          canonicalKey: parsedBit !== undefined ? `${space}:${modbusOff}.${parsedBit}` : `${space}:${modbusOff}`,
+          kind: isBit ? 'BIT' : 'WORD',
+          readOnly: dArea === 'X',
+          modbusOffset0Based: modbusOff,
+          modbusAddress1Based: computeModbus1Based(areaKey, modbusOff),
+          maxAddressIndex: 65535,
+          wordAddressKey: !isBit ? { space, startIndex: modbusOff } : undefined,
+          enclosingWordSlot:
+            parsedBit !== undefined ? { space, index: modbusOff, unit: 'WORD', bitOffset: parsedBit } : undefined,
+        };
+      }
+    }
+
+    // Native Schneider Modbus (%MWn, %Mn, %IWn, %QWn)
+    if (protocol === 'SCHNEIDER_MODBUS') {
+      const schMatch = /^%(MW|IW|QW|M)(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
+      if (schMatch) {
+        const sArea = schMatch[1];
+        const idx = Number.parseInt(schMatch[2], 10);
+        const bitStr = schMatch[3];
+        if (idx < 0 || idx > 65535) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Schneider Modbus offset ${idx} out of 16-bit range (0..65535).`,
+            hint: `Use %${sArea}0..%${sArea}65535.`,
+          };
+        }
+        if (bitStr !== undefined && sArea === 'M') {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Bit register %M${idx} cannot have a bit suffix .${bitStr}.`,
+            hint: `Use %M${idx} directly.`,
+          };
+        }
+        const parsedBit = bitStr !== undefined ? Number.parseInt(bitStr, 10) : undefined;
+        if (parsedBit !== undefined && (parsedBit < 0 || parsedBit > 15)) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Word bit offset .${parsedBit} out of range (0..15).`,
+            hint: `Use %${sArea}${idx}.0..15.`,
+          };
+        }
+        const areaKey = sArea === 'M' ? 'COIL' : sArea === 'IW' ? 'IR' : 'HR';
+        const space = `MODBUS_${areaKey}`;
+        const isBit = sArea === 'M' || parsedBit !== undefined;
+        return {
+          valid: true,
+          protocol,
+          normalized: parsedBit !== undefined ? `%${sArea}${idx}.${parsedBit}` : `%${sArea}${idx}`,
+          canonicalKey: parsedBit !== undefined ? `${space}:${idx}.${parsedBit}` : `${space}:${idx}`,
+          kind: isBit ? 'BIT' : 'WORD',
+          readOnly: sArea === 'IW',
+          modbusOffset0Based: idx,
+          modbusAddress1Based: computeModbus1Based(areaKey, idx),
+          maxAddressIndex: 65535,
+          wordAddressKey: !isBit ? { space, startIndex: idx } : undefined,
+          enclosingWordSlot:
+            parsedBit !== undefined ? { space, index: idx, unit: 'WORD', bitOffset: parsedBit } : undefined,
+        };
+      }
+    }
+
+    // Haiwell HMI/SCADA internal word memory (W0..W65535)
+    const internalWMatch = /^W(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
     if (internalWMatch) {
       const idx = Number.parseInt(internalWMatch[1], 10);
+      const bitStr = internalWMatch[2];
       if (idx < 0 || idx > 65535) {
         return {
           valid: false,
@@ -293,6 +558,28 @@ export function validatePlcAddress(
           input: rawAddress,
           error: `Internal word offset W${idx} out of range (0..65535).`,
           hint: 'Use W0..W65535.',
+        };
+      }
+      if (bitStr !== undefined) {
+        const bit = Number.parseInt(bitStr, 10);
+        if (bit < 0 || bit > 15) {
+          return {
+            valid: false,
+            protocol,
+            input: rawAddress,
+            error: `Word bit offset .${bit} out of range (0..15) for W${idx}.`,
+            hint: `Use W${idx}.0..W${idx}.15.`,
+          };
+        }
+        return {
+          valid: true,
+          protocol,
+          normalized: `W${idx}.${bit}`,
+          canonicalKey: `HAIWELL_INTERNAL_W:${idx}.${bit}`,
+          kind: 'BIT',
+          readOnly: false,
+          maxAddressIndex: 65535,
+          enclosingWordSlot: { space: 'HAIWELL_INTERNAL_W', index: idx, unit: 'WORD', bitOffset: bit },
         };
       }
       return {
@@ -312,7 +599,7 @@ export function validatePlcAddress(
       protocol,
       input: rawAddress,
       error: `Unrecognized Modbus address "${rawAddress}".`,
-      hint: 'Use Haiwell notation (0X0, 1X1024, 3X0, 4X4096), 5/6-digit (40001, 30001, 10001, 00001), or HR:100 / IR:10 / COIL:0 / DI:0.',
+      hint: 'Use Haiwell notation (0X0, 1X1024, 3X0, 4X4096), 5/6-digit (40001, 30001, 10001, 00001, 400001), or HR:100 / IR:10 / COIL:0 / DI:0.',
     };
   }
 
@@ -322,9 +609,27 @@ export function validatePlcAddress(
     const dbMatch = /^DB(\d+)\.(DBX(\d+)\.([0-7])|DB([BWD])(\d+))$/.exec(upper);
     if (dbMatch) {
       const dbNum = Number.parseInt(dbMatch[1], 10);
+      if (dbNum < 1 || dbNum > 65535) {
+        return {
+          valid: false,
+          protocol,
+          input: rawAddress,
+          error: `Siemens S7 Data Block DB${dbNum} out of valid range (DB1..DB65535).`,
+          hint: 'Use DB1..DB65535 (DB0 does not exist in Siemens S7).',
+        };
+      }
       const isBit = upper.includes('.DBX');
       const sizeChar = dbMatch[5];
       const byteOffset = Number.parseInt(dbMatch[3] ?? dbMatch[6], 10);
+      if (byteOffset < 0 || byteOffset > 65535) {
+        return {
+          valid: false,
+          protocol,
+          input: rawAddress,
+          error: `Siemens S7 DB byte offset ${byteOffset} out of range (0..65535).`,
+          hint: 'Use byte offset 0..65535.',
+        };
+      }
       const bitNum = dbMatch[4] !== undefined ? Number.parseInt(dbMatch[4], 10) : undefined;
       const byteWidth = sizeChar === 'D' ? 4 : sizeChar === 'W' ? 2 : 1;
       const space = `S7_DB${dbNum}_B`;
@@ -338,6 +643,7 @@ export function validatePlcAddress(
             : `S7_DB${dbNum}_${sizeChar}:${byteOffset}`,
         kind: isBit ? 'BIT' : 'WORD',
         readOnly: false,
+        maxAddressIndex: 65535,
         wordAddressKey: !isBit
           ? { space, startIndex: byteOffset, unit: 'BYTE', byteWidth }
           : undefined,
@@ -347,42 +653,57 @@ export function validatePlcAddress(
             : undefined,
       };
     }
-    const ioMatch = /^([IQM])([BWD])?(\d+)(?:\.([0-7]))?$/.exec(upper);
-    if (ioMatch) {
-      const area = ioMatch[1];
-      const size = ioMatch[2];
-      const byteIdx = Number.parseInt(ioMatch[3], 10);
-      const bitIdx = ioMatch[4];
-      const isBit = !size && bitIdx !== undefined;
-      if (!size && bitIdx === undefined) {
+    const ioBitMatch = /^([IQM])(\d+)\.([0-7])$/.exec(upper);
+    if (ioBitMatch) {
+      const area = ioBitMatch[1];
+      const byteIdx = Number.parseInt(ioBitMatch[2], 10);
+      const bitNum = Number.parseInt(ioBitMatch[3], 10);
+      if (byteIdx < 0 || byteIdx > 65535) {
         return {
           valid: false,
           protocol,
           input: rawAddress,
-          error: `Siemens S7 address "${rawAddress}" requires either a bit (.0..7) or width (B/W/D).`,
-          hint: 'Use I0.0, Q0.1, M10.2, IW64, MW100, MD200, or DB1.DBD0.',
+          error: `Siemens S7 byte offset ${byteIdx} out of range (0..65535).`,
+          hint: 'Use byte offset 0..65535.',
         };
       }
-      const bitNum = bitIdx !== undefined ? Number.parseInt(bitIdx, 10) : undefined;
+      const space = `S7_${area}_B`;
+      return {
+        valid: true,
+        protocol,
+        normalized: `${area}${byteIdx}.${bitNum}`,
+        canonicalKey: `S7_${area}_X:${byteIdx}.${bitNum}`,
+        kind: 'BIT',
+        readOnly: area === 'I',
+        maxAddressIndex: 65535,
+        enclosingWordSlot: { space, index: byteIdx, unit: 'BYTE', bitOffset: bitNum },
+      };
+    }
+    const ioWordMatch = /^([IQM])([BWD])(\d+)$/.exec(upper);
+    if (ioWordMatch) {
+      const area = ioWordMatch[1];
+      const size = ioWordMatch[2];
+      const byteIdx = Number.parseInt(ioWordMatch[3], 10);
+      if (byteIdx < 0 || byteIdx > 65535) {
+        return {
+          valid: false,
+          protocol,
+          input: rawAddress,
+          error: `Siemens S7 byte offset ${byteIdx} out of range (0..65535).`,
+          hint: 'Use byte offset 0..65535.',
+        };
+      }
       const byteWidth = size === 'D' ? 4 : size === 'W' ? 2 : 1;
       const space = `S7_${area}_B`;
       return {
         valid: true,
         protocol,
-        normalized: upper,
-        canonicalKey:
-          isBit && bitNum !== undefined
-            ? `S7_${area}_X:${byteIdx}.${bitNum}`
-            : `S7_${area}_${size}:${byteIdx}`,
-        kind: isBit ? 'BIT' : 'WORD',
+        normalized: `${area}${size}${byteIdx}`,
+        canonicalKey: `S7_${area}_${size}:${byteIdx}`,
+        kind: 'WORD',
         readOnly: area === 'I',
-        wordAddressKey: !isBit
-          ? { space, startIndex: byteIdx, unit: 'BYTE', byteWidth }
-          : undefined,
-        enclosingWordSlot:
-          isBit && bitNum !== undefined
-            ? { space, index: byteIdx, unit: 'BYTE', bitOffset: bitNum }
-            : undefined,
+        maxAddressIndex: 65535,
+        wordAddressKey: { space, startIndex: byteIdx, unit: 'BYTE', byteWidth },
       };
     }
     return {
@@ -409,7 +730,8 @@ export function validatePlcAddress(
     }
     const area = m[1];
     const hexAreas = new Set(['X', 'Y', 'B', 'W']);
-    if (!hexAreas.has(area) && !/^\d+$/.test(m[2])) {
+    const isHex = hexAreas.has(area);
+    if (!isHex && !/^\d+$/.test(m[2])) {
       return {
         valid: false,
         protocol,
@@ -418,32 +740,55 @@ export function validatePlcAddress(
         hint: `Use decimal index such as ${area}100.`,
       };
     }
-    const idx = Number.parseInt(m[2], hexAreas.has(area) ? 16 : 10);
+    const idx = Number.parseInt(m[2], isHex ? 16 : 10);
+    const maxIdx = isHex ? 0xffff : 65535;
+    if (!Number.isSafeInteger(idx) || idx < 0 || idx > maxIdx) {
+      return {
+        valid: false,
+        protocol,
+        input: rawAddress,
+        error: `Mitsubishi address ${upper} out of range (0..${isHex ? maxIdx.toString(16).toUpperCase() : maxIdx}).`,
+        hint: `Keep index within 0..${isHex ? 'FFFF' : '65535'}.`,
+      };
+    }
     const isBit = ['X', 'Y', 'M', 'B', 'L', 'F'].includes(area);
+    const space = `MITSU_${area}`;
     return {
       valid: true,
       protocol,
-      normalized: upper,
+      normalized: isHex ? `${area}${idx.toString(16).toUpperCase()}` : `${area}${idx}`,
+      canonicalKey: `${space}:${idx}`,
       kind: isBit ? 'BIT' : 'WORD',
       readOnly: area === 'X',
-      wordAddressKey: !isBit ? { space: `MITSU_${area}`, startIndex: idx } : undefined,
+      maxAddressIndex: maxIdx,
+      wordAddressKey: !isBit ? { space, startIndex: idx } : undefined,
     };
   }
 
   // 5. Omron FINS TCP
   if (protocol === 'OMRON_FINS_TCP') {
     const upper = trimmed.toUpperCase();
-    const m = /^(CIO|W|H|A|D|DM|EM\d+\.)(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
+    const m = /^(CIO|W|H|A|D|DM|EM(\d+)\.)(\d+)(?:\.(\d{1,2}))?$/.exec(upper);
     if (!m) {
       return {
         valid: false,
         protocol,
         input: rawAddress,
         error: `Invalid Omron FINS address "${rawAddress}".`,
-        hint: 'Use CIO0.00, W10.05, H0.00, D100, or DM100.',
+        hint: 'Use CIO0.00, W10.05, H0.00, D100, DM100, or EM0.100.',
       };
     }
-    const bit = m[3] !== undefined ? Number.parseInt(m[3], 10) : undefined;
+    const emBank = m[2] !== undefined ? Number.parseInt(m[2], 10) : undefined;
+    if (emBank !== undefined && (emBank < 0 || emBank > 255)) {
+      return {
+        valid: false,
+        protocol,
+        input: rawAddress,
+        error: `Omron EM bank ${emBank} out of range (0..255).`,
+        hint: 'Use EM0..EM255.',
+      };
+    }
+    const bit = m[4] !== undefined ? Number.parseInt(m[4], 10) : undefined;
     if (bit !== undefined && (bit < 0 || bit > 15)) {
       return {
         valid: false,
@@ -453,8 +798,17 @@ export function validatePlcAddress(
         hint: 'Use bit offset .00 through .15.',
       };
     }
-    const idx = Number.parseInt(m[2], 10);
-    const areaNorm = m[1] === 'DM' ? 'D' : m[1];
+    const idx = Number.parseInt(m[3], 10);
+    if (idx < 0 || idx > 65535) {
+      return {
+        valid: false,
+        protocol,
+        input: rawAddress,
+        error: `Omron FINS index ${idx} out of range (0..65535).`,
+        hint: 'Use word index 0..65535.',
+      };
+    }
+    const areaNorm = m[1] === 'DM' ? 'D' : emBank !== undefined ? `EM${emBank}` : m[1];
     const space = `OMRON_${areaNorm}`;
     return {
       valid: true,
@@ -463,13 +817,14 @@ export function validatePlcAddress(
       canonicalKey: bit !== undefined ? `${space}:${idx}.${bit}` : `${space}:${idx}`,
       kind: bit !== undefined ? 'BIT' : 'WORD',
       readOnly: false,
+      maxAddressIndex: 65535,
       wordAddressKey: bit === undefined ? { space, startIndex: idx } : undefined,
       enclosingWordSlot:
         bit !== undefined ? { space, index: idx, unit: 'WORD', bitOffset: bit } : undefined,
     };
   }
 
-  // 6. BACnet/IP
+  // 6. BACnet/IP (ASHRAE 135 22-bit instance ID: 0..4194302; 4194303 reserved)
   if (protocol === 'BACNET_IP') {
     const upper = trimmed.toUpperCase();
     const m = /^(AI|AO|AV|BI|BO|BV|MSI|MSO|MSV):(\d+)$/.exec(upper);
@@ -483,21 +838,80 @@ export function validatePlcAddress(
       };
     }
     const obj = m[1];
+    const inst = Number.parseInt(m[2], 10);
+    if (!Number.isSafeInteger(inst) || inst < 0 || inst > 4194302) {
+      return {
+        valid: false,
+        protocol,
+        input: rawAddress,
+        error: `BACnet instance ${inst} out of ASHRAE 135 22-bit range (0..4194302).`,
+        hint: 'Use instance number between 0 and 4194302.',
+      };
+    }
     return {
       valid: true,
       protocol,
-      normalized: upper,
+      normalized: `${obj}:${inst}`,
+      canonicalKey: `BACNET_${obj}:${inst}`,
       kind: obj.startsWith('B') ? 'BIT' : 'WORD',
       readOnly: obj.endsWith('I'),
     };
   }
 
-  // 7. Allen-Bradley EtherNet/IP, OPC UA Client, MQTT Client (Symbolic)
-  if (/^[A-Za-z_][A-Za-z0-9_.:/\-[\]]{0,127}$/.test(trimmed)) {
+  // 7. OPC UA Client (Part 6 NodeId: ns=2;s=..., i=..., g=..., b=...)
+  if (protocol === 'OPC_UA_CLIENT') {
+    const opcMatch = /^(?:ns=(\d+);)?(i=\d+|s=[^\r\n]{1,200}|g=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|b=[A-Za-z0-9+/=]{1,256})$/.exec(
+      trimmed
+    );
+    if (opcMatch) {
+      const ns = opcMatch[1] ? Number.parseInt(opcMatch[1], 10) : 0;
+      const body = opcMatch[2];
+      return {
+        valid: true,
+        protocol,
+        normalized: trimmed,
+        canonicalKey: `OPCUA:ns=${ns};${body}`,
+        kind: 'SYMBOLIC',
+        readOnly: false,
+      };
+    }
+    return {
+      valid: false,
+      protocol,
+      input: rawAddress,
+      error: `Invalid OPC UA NodeId "${rawAddress}".`,
+      hint: 'Use OPC UA Part 6 NodeId syntax such as ns=2;s=Chiller01.Supply_Temp_C or i=2258.',
+    };
+  }
+
+  // 8. MQTT Client (non-empty UTF-8 topic without NUL/CR/LF)
+  if (protocol === 'MQTT_CLIENT') {
+    if (trimmed.length <= 256 && !/[\u0000\r\n]/.test(trimmed)) {
+      return {
+        valid: true,
+        protocol,
+        normalized: trimmed,
+        canonicalKey: `MQTT:${trimmed}`,
+        kind: 'SYMBOLIC',
+        readOnly: false,
+      };
+    }
+    return {
+      valid: false,
+      protocol,
+      input: rawAddress,
+      error: `Invalid MQTT topic address "${rawAddress}".`,
+      hint: 'Use a non-empty UTF-8 MQTT topic path up to 256 characters.',
+    };
+  }
+
+  // 9. Allen-Bradley EtherNet/IP (Logix CIP symbolic tags, optional Program:Name. prefix, case-insensitive, 1D/2D/3D arrays)
+  if (/^(?:Program:[A-Za-z_][A-Za-z0-9_]{0,39}\.)?(?:[A-Za-z_][A-Za-z0-9_]{0,39}(?:\[\d+(?:,\d+){0,2}\])?)(?:\.[A-Za-z_][A-Za-z0-9_]{0,39}(?:\[\d+(?:,\d+){0,2}\])?)*$/.test(trimmed)) {
     return {
       valid: true,
       protocol,
       normalized: trimmed,
+      canonicalKey: `EIP:${trimmed.toLowerCase()}`,
       kind: 'SYMBOLIC',
       readOnly: false,
     };
@@ -508,7 +922,7 @@ export function validatePlcAddress(
     protocol,
     input: rawAddress,
     error: `Invalid symbolic tag address "${rawAddress}" for ${protocol}.`,
-    hint: 'Use valid symbolic identifier characters (A-Z, 0-9, _, ., :, /, -, []).',
+    hint: 'Use valid CIP symbolic tag syntax (e.g., Motor1.Speed, Matrix[0,1]).',
   };
 }
 
@@ -518,7 +932,8 @@ export function validatePlcAddress(
  */
 export function validateTagValueForType(
   dataType: TagDataType,
-  value: unknown
+  value: unknown,
+  maxBytes = 255
 ): { valid: true; normalizedValue: number | boolean | string } | { valid: false; code: string; error: string } {
   switch (dataType) {
     case 'BOOL':
@@ -527,14 +942,21 @@ export function validateTagValueForType(
       }
       return { valid: true, normalizedValue: value };
 
-    case 'STRING':
+    case 'STRING': {
       if (typeof value !== 'string') {
         return { valid: false, code: 'TYPE_MISMATCH_STRING', error: `STRING tag requires string, received ${typeof value}.` };
       }
-      if (value.length > 255) {
-        return { valid: false, code: 'STRING_LENGTH_EXCEEDED', error: `STRING tag exceeds 255-character SCADA buffer limit (${value.length} chars).` };
+      const byteLen = Buffer.byteLength(value, 'utf8');
+      const limit = Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : 255;
+      if (byteLen > limit) {
+        return {
+          valid: false,
+          code: 'STRING_LENGTH_EXCEEDED',
+          error: `STRING tag exceeds ${limit}-byte SCADA buffer limit (${byteLen} UTF-8 bytes).`,
+        };
       }
       return { valid: true, normalizedValue: value };
+    }
 
     case 'INT16':
     case 'UINT16':
@@ -574,12 +996,20 @@ export function validateTagValueForType(
       }
       return { valid: true, normalizedValue: value };
     }
+
+    default:
+      return {
+        valid: false,
+        code: 'UNSUPPORTED_DATA_TYPE',
+        error: `Unsupported PLC tag dataType "${String(dataType)}".`,
+      };
   }
 }
 
 export function applyLinearScaling(rawValue: number, scaling: TagScaling): number {
+  if (!Number.isFinite(rawValue)) return scaling.engMin;
   const rawSpan = scaling.rawMax - scaling.rawMin;
-  if (rawSpan === 0) return scaling.engMin;
+  if (!Number.isFinite(rawSpan) || rawSpan === 0) return scaling.engMin;
   const ratio = (rawValue - scaling.rawMin) / rawSpan;
   let eng = scaling.engMin + ratio * (scaling.engMax - scaling.engMin);
   if (scaling.clamp) {
@@ -587,7 +1017,16 @@ export function applyLinearScaling(rawValue: number, scaling: TagScaling): numbe
     const hi = Math.max(scaling.engMin, scaling.engMax);
     eng = Math.max(lo, Math.min(hi, eng));
   }
-  return Number(eng.toFixed(4));
+  const decimals = Math.abs(scaling.engMax - scaling.engMin) < 10 ? 6 : 4;
+  return Number(eng.toFixed(decimals));
+}
+
+function resolvePositiveSpan(dataType: TagDataType, wordSpanOverride?: number): number {
+  const rawSpan =
+    wordSpanOverride !== undefined && Number.isInteger(wordSpanOverride) && wordSpanOverride > 0
+      ? wordSpanOverride
+      : getWordSpanForType(dataType);
+  return Math.max(1, Math.min(rawSpan, 1024));
 }
 
 export function validateAddressSpanBounds(
@@ -595,15 +1034,18 @@ export function validateAddressSpanBounds(
   dataType: TagDataType,
   wordSpanOverride?: number
 ): { valid: true } | { valid: false; error: string } {
-  if (!parsed.wordAddressKey || parsed.wordAddressKey.unit === 'BYTE' || parsed.maxAddressIndex === undefined) {
+  if (!parsed.wordAddressKey || parsed.maxAddressIndex === undefined) {
     return { valid: true };
   }
-  const span = Math.max(1, wordSpanOverride ?? getWordSpanForType(dataType));
+  const span =
+    parsed.wordAddressKey.unit === 'BYTE'
+      ? Math.max(parsed.wordAddressKey.byteWidth ?? 1, getByteWidthForType(dataType, wordSpanOverride))
+      : resolvePositiveSpan(dataType, wordSpanOverride);
   const endIndex = parsed.wordAddressKey.startIndex + span - 1;
   if (endIndex > parsed.maxAddressIndex) {
     return {
       valid: false,
-      error: `${dataType} (${span} words) starting at ${parsed.normalized} (index ${parsed.wordAddressKey.startIndex}) overflows register space upper bound ${parsed.maxAddressIndex} (requires up to ${endIndex}).`,
+      error: `${dataType} (${span} ${parsed.wordAddressKey.unit === 'BYTE' ? 'bytes' : 'words'}) starting at ${parsed.normalized} (index ${parsed.wordAddressKey.startIndex}) overflows register space upper bound ${parsed.maxAddressIndex} (requires up to ${endIndex}).`,
     };
   }
   return { valid: true };
@@ -629,8 +1071,16 @@ export function detectWordOverlapConflicts(
   deviceProtocols: Map<string, PlcDriverProtocol>
 ): WordOverlapConflict[] {
   const conflicts: WordOverlapConflict[] = [];
+  const reportedPairs = new Set<string>();
+  const pushUniqueConflict = (c: WordOverlapConflict) => {
+    const pairKey = [c.tagA, c.tagB].sort().join('\0') + ':' + c.deviceId;
+    if (reportedPairs.has(pairKey)) return;
+    reportedPairs.add(pairKey);
+    conflicts.push(c);
+  };
+
   const exactSeen = new Map<string, TagDefinition>();
-  const wordOccupancy = new Map<string, TagDefinition>();
+  const wordOccupancy = new Map<string, TagDefinition[]>();
   const bitSlotOccupancy = new Map<string, TagDefinition[]>();
 
   for (const tag of Object.values(tags)) {
@@ -642,7 +1092,7 @@ export function detectWordOverlapConflicts(
     const exactKey = `${tag.deviceId}:${parsed.canonicalKey ?? parsed.normalized}`;
     const existingExact = exactSeen.get(exactKey);
     if (existingExact && existingExact.name !== tag.name) {
-      conflicts.push({
+      pushUniqueConflict({
         tagA: existingExact.name,
         tagB: tag.name,
         deviceId: tag.deviceId,
@@ -650,59 +1100,68 @@ export function detectWordOverlapConflicts(
         addressB: tag.address,
         reason: `Exact PLC address collision on ${exactKey}.`,
       });
-      continue;
+    } else {
+      exactSeen.set(exactKey, tag);
     }
-    exactSeen.set(exactKey, tag);
 
     if (parsed.wordAddressKey) {
       const isByteUnit = parsed.wordAddressKey.unit === 'BYTE';
+      const baseByteWidth = parsed.wordAddressKey.byteWidth ?? 1;
       const span = isByteUnit
-        ? Math.max(1, parsed.wordAddressKey.byteWidth ?? 1)
-        : Math.max(1, tag.wordSpan ?? getWordSpanForType(tag.dataType));
+        ? tag.dataType === 'FLOAT64' || tag.dataType === 'STRING' || (tag.wordSpan !== undefined && tag.wordSpan > 0)
+          ? Math.max(baseByteWidth, getByteWidthForType(tag.dataType, tag.wordSpan))
+          : baseByteWidth === 2 && tag.dataType === 'FLOAT32'
+            ? 4
+            : baseByteWidth
+        : resolvePositiveSpan(tag.dataType, tag.wordSpan);
       for (let offset = 0; offset < span; offset++) {
         const slotKey = `${tag.deviceId}:${parsed.wordAddressKey.space}:${parsed.wordAddressKey.startIndex + offset}`;
-        const occupant = wordOccupancy.get(slotKey);
-        if (occupant && occupant.name !== tag.name) {
-          conflicts.push({
-            tagA: occupant.name,
-            tagB: tag.name,
-            deviceId: tag.deviceId,
-            addressA: `${occupant.address} (${occupant.dataType})`,
-            addressB: `${tag.address} (${tag.dataType})`,
-            reason: `${isByteUnit ? 'Byte' : 'Multi-word'} register overlap at slot ${slotKey}.`,
-          });
-          break;
+        const occupants = wordOccupancy.get(slotKey) ?? [];
+        for (const occupant of occupants) {
+          if (occupant.name !== tag.name) {
+            pushUniqueConflict({
+              tagA: occupant.name,
+              tagB: tag.name,
+              deviceId: tag.deviceId,
+              addressA: `${occupant.address} (${occupant.dataType})`,
+              addressB: `${tag.address} (${tag.dataType})`,
+              reason: `${isByteUnit ? 'Byte' : 'Multi-word'} register overlap at slot ${slotKey}.`,
+            });
+          }
         }
-        const bitOccupants = bitSlotOccupancy.get(slotKey);
-        const firstBit = bitOccupants?.find((b) => b.name !== tag.name);
-        if (firstBit) {
-          conflicts.push({
-            tagA: firstBit.name,
-            tagB: tag.name,
-            deviceId: tag.deviceId,
-            addressA: `${firstBit.address} (${firstBit.dataType})`,
-            addressB: `${tag.address} (${tag.dataType})`,
-            reason: `Bit-in-${isByteUnit ? 'byte' : 'word'} register overlap at slot ${slotKey}.`,
-          });
-          break;
+        const bitOccupants = bitSlotOccupancy.get(slotKey) ?? [];
+        for (const bitOcc of bitOccupants) {
+          if (bitOcc.name !== tag.name) {
+            pushUniqueConflict({
+              tagA: bitOcc.name,
+              tagB: tag.name,
+              deviceId: tag.deviceId,
+              addressA: `${bitOcc.address} (${bitOcc.dataType})`,
+              addressB: `${tag.address} (${tag.dataType})`,
+              reason: `Bit-in-${isByteUnit ? 'byte' : 'word'} register overlap at slot ${slotKey}.`,
+            });
+          }
         }
-        wordOccupancy.set(slotKey, tag);
+        occupants.push(tag);
+        wordOccupancy.set(slotKey, occupants);
       }
     }
 
     if (parsed.enclosingWordSlot) {
       const isByteUnit = parsed.enclosingWordSlot.unit === 'BYTE';
       const slotKey = `${tag.deviceId}:${parsed.enclosingWordSlot.space}:${parsed.enclosingWordSlot.index}`;
-      const occupant = wordOccupancy.get(slotKey);
-      if (occupant && occupant.name !== tag.name) {
-        conflicts.push({
-          tagA: occupant.name,
-          tagB: tag.name,
-          deviceId: tag.deviceId,
-          addressA: `${occupant.address} (${occupant.dataType})`,
-          addressB: `${tag.address} (${tag.dataType})`,
-          reason: `Bit-in-${isByteUnit ? 'byte' : 'word'} register overlap at slot ${slotKey}.`,
-        });
+      const occupants = wordOccupancy.get(slotKey) ?? [];
+      for (const occupant of occupants) {
+        if (occupant.name !== tag.name) {
+          pushUniqueConflict({
+            tagA: occupant.name,
+            tagB: tag.name,
+            deviceId: tag.deviceId,
+            addressA: `${occupant.address} (${occupant.dataType})`,
+            addressB: `${tag.address} (${tag.dataType})`,
+            reason: `Bit-in-${isByteUnit ? 'byte' : 'word'} register overlap at slot ${slotKey}.`,
+          });
+        }
       }
       const list = bitSlotOccupancy.get(slotKey) ?? [];
       list.push(tag);

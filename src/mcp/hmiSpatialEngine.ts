@@ -93,7 +93,7 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
       'Text input/display',
       'Real time data input/display',
       'Function button',
-      'Picture operation',
+      'Picture operation button',
     ],
     namingNote: 'Core interactive and display elements; double-click or right-click -> Property to configure modal dialog.',
     docSources: [
@@ -105,11 +105,11 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
   },
   Switch: {
     category: 'Switch',
-    completeness: 'PARTIAL_NUMBERED_ICON_PACK',
-    requiresLiveCatalogCalibration: true,
-    verifiedItems: ['Switch 1'],
-    namingNote: 'Numbered switch symbol pack (e.g., "Switch 1" verified in official programmingProcess doc). Run calibrate_haiwell_uia.py to enumerate all numbered icons.',
-    docSources: ['https://help.haiwell.com/docs/programmingProcess'],
+    completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
+    requiresLiveCatalogCalibration: false,
+    verifiedItems: Array.from({ length: 19 }, (_, i) => `Switch${i + 1}`),
+    namingNote: 'Verified from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll (Switch1..Switch19).',
+    docSources: ['Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll'],
   },
   Lamp: {
     category: 'Lamp',
@@ -121,11 +121,11 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
   },
   Valve: {
     category: 'Valve',
-    completeness: 'PARTIAL_NUMBERED_ICON_PACK',
-    requiresLiveCatalogCalibration: true,
-    verifiedItems: [],
-    namingNote: 'Numbered valve symbol pack; exact icon names are discovered live via calibrate_haiwell_uia.py (not guessed).',
-    docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
+    completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
+    requiresLiveCatalogCalibration: false,
+    verifiedItems: ['Valve1', 'Valve2'],
+    namingNote: 'Verified from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll (Valve1, Valve2).',
+    docSources: ['Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll'],
   },
   Tank: {
     category: 'Tank',
@@ -158,19 +158,21 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
       'Tendency chart',
       'XY tendency chart',
       'XY trend',
-      'Alarm table-new',
+      'New alarm table',
+      'Alarm table',
       'Marquee',
-      'Historical data view table',
-      'Historical data view report',
-      'Camera display',
+      'Historical data table',
+      'Historical data report table',
+      'Camera View',
       'Media player',
-      'File list',
-      'Operation record',
-      'Bar chart',
-      'Pie chart',
+      'Filelist',
+      'Operation Log',
+      'Bar Chart',
+      'Pie Chart',
     ],
-    namingNote: 'Top 10 verified directly from 3.50.1.19 UI; scrolled entries verified from official help.haiwell.com SCADA docs (alarmView, graphicofHistoryRecord, RTSP, media, Scanner1, tuyuan6..13).',
+    namingNote: 'Verified directly from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll and en.lng.',
     docSources: [
+      'Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll',
       'https://help.haiwell.com/docs/trend',
       'https://help.haiwell.com/docs/XYtrend',
       'https://help.haiwell.com/docs/alarmView',
@@ -201,19 +203,19 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
   },
   'Traceless·Pipe': {
     category: 'Traceless·Pipe',
-    completeness: 'PARTIAL_NUMBERED_ICON_PACK',
-    requiresLiveCatalogCalibration: true,
-    verifiedItems: [],
-    namingNote: 'Static pipe graphics pack; exact numbered item names are discovered live via calibrate_haiwell_uia.py (not guessed).',
-    docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
+    completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
+    requiresLiveCatalogCalibration: false,
+    verifiedItems: Array.from({ length: 30 }, (_, i) => `Pipe ${i + 1}`),
+    namingNote: 'Verified from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll (Pipe 1..Pipe 30).',
+    docSources: ['Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll'],
   },
   'Trace·Pipe': {
     category: 'Trace·Pipe',
-    completeness: 'PARTIAL_NUMBERED_ICON_PACK',
-    requiresLiveCatalogCalibration: true,
-    verifiedItems: [],
-    namingNote: 'Animated flow pipe graphics pack; exact numbered item names are discovered live via calibrate_haiwell_uia.py (not guessed).',
-    docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
+    completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
+    requiresLiveCatalogCalibration: false,
+    verifiedItems: Array.from({ length: 30 }, (_, i) => `Pipe ${i + 1}`),
+    namingNote: 'Verified from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll (Pipe 1..Pipe 30).',
+    docSources: ['Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll'],
   },
   'Shape·Panel': {
     category: 'Shape·Panel',
@@ -299,7 +301,7 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
     minSize: { width: 96, height: 48 },
     interactive: false,
     allowedTagTypes: ['INT16', 'UINT16', 'INT32', 'UINT32', 'FLOAT32', 'FLOAT64', 'BCD16', 'BCD32'],
-    documentedModalFields: { tagName: 'Read variable', precision: 'Decimal places', integerDigits: 'Integer digits' },
+    documentedModalFields: { tagName: 'Read variable', precision: 'Decimal digits', integerDigits: 'Integer digits' },
   },
   {
     type: 'NUMERIC_INPUT',
@@ -320,7 +322,7 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
       min: 'Minimum',
       max: 'Maximum',
       integerDigits: 'Integer digits',
-      precision: 'Decimal places',
+      precision: 'Decimal digits',
     },
   },
   {
@@ -434,8 +436,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
     type: 'VALVE',
     category: 'PID_EQUIPMENT',
     graphicsLibraryCategory: 'Valve',
-    haiwellToolboxName: '(select from Valve category after live calibration)',
-    toolboxNameVerified: false,
+    haiwellToolboxName: 'Valve1',
+    toolboxNameVerified: true,
     configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
     placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
     officialDocUrl: 'https://en.haiwell.com/download/list-631.html',
@@ -450,8 +452,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
     type: 'PIPELINE',
     category: 'PID_EQUIPMENT',
     graphicsLibraryCategory: 'Trace·Pipe',
-    haiwellToolboxName: '(select from Trace·Pipe category after live calibration)',
-    toolboxNameVerified: false,
+    haiwellToolboxName: 'Pipe 1',
+    toolboxNameVerified: true,
     configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
     placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
     officialDocUrl: 'https://en.haiwell.com/download/list-631.html',
@@ -483,7 +485,7 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
     type: 'ALARM_BANNER',
     category: 'ALARM_RECIPE',
     graphicsLibraryCategory: 'Advanced controls',
-    haiwellToolboxName: 'Alarm table-new',
+    haiwellToolboxName: 'New alarm table',
     toolboxNameVerified: true,
     configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
     placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
@@ -516,7 +518,7 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
     type: 'CAMERA_VIEW',
     category: 'DISPLAY',
     graphicsLibraryCategory: 'Advanced controls',
-    haiwellToolboxName: 'Camera display',
+    haiwellToolboxName: 'Camera View',
     toolboxNameVerified: true,
     configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
     placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
@@ -532,7 +534,7 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
     type: 'DATA_TABLE',
     category: 'CHART_HISTORIAN',
     graphicsLibraryCategory: 'Advanced controls',
-    haiwellToolboxName: 'Historical data view report',
+    haiwellToolboxName: 'Historical data report table',
     toolboxNameVerified: true,
     configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
     placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
@@ -707,36 +709,52 @@ export function compilePidScreen(
   const visited = new Set<string>();
   const queue: string[] = [];
 
-  // Start from roots (inDeg === 0); if pure cycle, start from first declared node (primary equipment)
+  const runBfs = () => {
+    while (queue.length > 0) {
+      const u = queue.shift()!;
+      const rU = rank.get(u) ?? 0;
+      for (const v of adj.get(u) ?? []) {
+        if (!visited.has(v)) {
+          visited.add(v);
+          rank.set(v, rU + 1);
+          queue.push(v);
+        }
+      }
+    }
+  };
+
+  // Start from connected roots (inDeg === 0 and outDeg > 0) first
+  const isolatedNodes: PidNodeInput[] = [];
   for (const n of input.nodes) {
-    if ((inDeg.get(n.id) ?? 0) === 0) {
+    const inD = inDeg.get(n.id) ?? 0;
+    const outD = (adj.get(n.id) ?? []).length;
+    if (inD === 0 && outD === 0) {
+      isolatedNodes.push(n);
+      continue;
+    }
+    if (inD === 0) {
       rank.set(n.id, 0);
       visited.add(n.id);
       queue.push(n.id);
     }
   }
-  if (queue.length === 0 && input.nodes.length > 0) {
-    const first = input.nodes[0].id;
-    rank.set(first, 0);
-    visited.add(first);
-    queue.push(first);
+  runBfs();
+
+  // Seed any unvisited cyclic components (e.g., closed P&ID loops alongside standalone control widgets)
+  for (const n of input.nodes) {
+    if (isolatedNodes.includes(n) || visited.has(n.id)) continue;
+    rank.set(n.id, 0);
+    visited.add(n.id);
+    queue.push(n.id);
+    runBfs();
   }
 
-  while (queue.length > 0) {
-    const u = queue.shift()!;
-    const rU = rank.get(u) ?? 0;
-    for (const v of adj.get(u) ?? []) {
-      if (!visited.has(v)) {
-        visited.add(v);
-        rank.set(v, rU + 1);
-        queue.push(v);
-      }
-    }
-  }
-  // Assign any disconnected islands
-  for (const n of input.nodes) {
-    if (!rank.has(n.id)) rank.set(n.id, 0);
-  }
+  // Distribute isolated standalone control/status widgets evenly across columns
+  const baseMaxRank = rank.size > 0 ? Math.max(0, ...rank.values()) : 0;
+  const targetCols = Math.max(1, baseMaxRank + 1);
+  isolatedNodes.forEach((n, idx) => {
+    rank.set(n.id, idx % targetCols);
+  });
 
   // Group nodes by column rank
   const maxRank = Math.max(0, ...rank.values());
@@ -815,7 +833,7 @@ export function compilePidScreen(
             width: calloutW,
             height: calloutH,
             tagName: node.calloutTagName,
-            unit: node.calloutUnit ?? knownTags[node.calloutTagName]?.unit,
+            unit: node.calloutUnit ?? (Object.prototype.hasOwnProperty.call(knownTags, node.calloutTagName) ? knownTags[node.calloutTagName]?.unit : undefined),
             precision: 2,
           });
         }
@@ -841,8 +859,14 @@ export function compilePidScreen(
   let returnLaneIdx = 0;
 
   input.edges.forEach((edge, idx) => {
-    const src = nodeWidgetMap.get(edge.from)!;
-    const dst = nodeWidgetMap.get(edge.to)!;
+    const src = nodeWidgetMap.get(edge.from);
+    const dst = nodeWidgetMap.get(edge.to);
+    if (!src) {
+      throw new Error(`P&ID edge "${edge.id ?? idx + 1}" references unknown source node "${edge.from}".`);
+    }
+    if (!dst) {
+      throw new Error(`P&ID edge "${edge.id ?? idx + 1}" references unknown target node "${edge.to}".`);
+    }
     const pipeId = edge.id ?? `pipe_${idx + 1}_${edge.from}_to_${edge.to}`;
     const srcRank = rank.get(edge.from) ?? 0;
     const dstRank = rank.get(edge.to) ?? 0;
@@ -874,7 +898,8 @@ export function compilePidScreen(
       toPort = 'bottom';
       const p1 = getPortPoint(src, fromPort);
       const p2 = getPortPoint(dst, toPort);
-      const laneY = snap(bottomSafe - 12 - (returnLaneIdx % 3) * 10);
+      const rawLaneY = snap(bottomSafe - 12 - (returnLaneIdx % 3) * 10);
+      const laneY = Math.max(topSafe + 8, Math.min(bottomSafe - 8, rawLaneY));
       returnLaneIdx++;
       waypoints = [p1, { x: p1.x, y: laneY }, { x: p2.x, y: laneY }, p2];
     }
@@ -954,7 +979,8 @@ function reanchorScreenPipes(screen: HmiScreen): void {
       const midX = snap(Math.round((p1.x + p2.x) / 2));
       pipe.waypoints = p1.y === p2.y ? [p1, p2] : [p1, { x: midX, y: p1.y }, { x: midX, y: p2.y }, p2];
     } else if (pipe.fromPort === 'bottom' && pipe.toPort === 'bottom') {
-      const laneY = pipe.waypoints[1]?.y ?? snap(Math.max(p1.y, p2.y) + 24);
+      const rawLaneY = pipe.waypoints[1]?.y ?? snap(Math.max(p1.y, p2.y) + 24);
+      const laneY = Math.max(16, Math.min(screen.height - 16, rawLaneY));
       pipe.waypoints = [p1, { x: p1.x, y: laneY }, { x: p2.x, y: laneY }, p2];
     } else {
       const midY = snap(Math.round((p1.y + p2.y) / 2));
@@ -993,6 +1019,16 @@ export function solveAndRepairScreenLayout(
 
   const alarmBanner = screen.widgets.find((w) => w.type === 'ALARM_BANNER');
   const navBar = screen.widgets.find((w) => w.type === 'NAV_BAR');
+  if (alarmBanner) {
+    alarmBanner.width = Math.min(alarmBanner.width, screen.width - pad * 2);
+    alarmBanner.x = snap(Math.max(pad, Math.min(alarmBanner.x, screen.width - pad - alarmBanner.width)));
+    alarmBanner.y = snap(Math.max(pad, Math.min(alarmBanner.y, screen.height - pad - alarmBanner.height)));
+  }
+  if (navBar) {
+    navBar.width = Math.min(navBar.width, screen.width - pad * 2);
+    navBar.x = snap(Math.max(pad, Math.min(navBar.x, screen.width - pad - navBar.width)));
+    navBar.y = snap(Math.max(pad, Math.min(navBar.y, screen.height - pad - navBar.height)));
+  }
   const minY = alarmBanner ? alarmBanner.y + alarmBanner.height + gap : pad;
   const maxY = navBar ? navBar.y - gap : screen.height - pad;
 
@@ -1030,20 +1066,27 @@ export function solveAndRepairScreenLayout(
 
     if (overlapsAny(w)) {
       // Deterministic spiral / scanline search for nearest non-overlapping 8px-aligned slot
-      let best: { x: number; y: number; dist: number } | null = null;
-      for (let y = snap(minY); y <= maxY - w.height; y += GRID_STEP * 2) {
-        for (let x = pad; x <= screen.width - pad - w.width; x += GRID_STEP * 2) {
-          if (!overlapsAny({ x, y, width: w.width, height: w.height })) {
-            const dist = Math.hypot(x - origX, y - origY);
-            if (!best || dist < best.dist) {
-              best = { x, y, dist };
+      let bestX = w.x;
+      let bestY = w.y;
+      let bestDist = Infinity;
+      for (const stepPx of [GRID_STEP * 2, GRID_STEP]) {
+        for (let y = snap(minY); y <= maxY - w.height; y += stepPx) {
+          for (let x = pad; x <= screen.width - pad - w.width; x += stepPx) {
+            if (!overlapsAny({ x, y, width: w.width, height: w.height })) {
+              const dist = Math.hypot(x - origX, y - origY);
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestX = x;
+                bestY = y;
+              }
             }
           }
         }
+        if (bestDist < Infinity) break;
       }
-      if (best) {
-        w.x = best.x;
-        w.y = best.y;
+      if (bestDist < Infinity) {
+        w.x = bestX;
+        w.y = bestY;
       }
     }
 
@@ -1143,8 +1186,15 @@ export function auditScreenSpatially(
         ? '='
         : w.type === 'NAV_BAR'
           ? '_'
-          : syms[symIdx++ % syms.length];
-    legend[ch] = `${w.id} (${w.type}${w.tagName ? ' -> ' + w.tagName : ''}) [${w.x},${w.y} ${w.width}x${w.height}]`;
+          : syms[symIdx % syms.length];
+    const legendKey =
+      w.type === 'ALARM_BANNER' || w.type === 'NAV_BAR'
+        ? ch
+        : symIdx < syms.length
+          ? ch
+          : `${ch}_${symIdx}`;
+    if (w.type !== 'ALARM_BANNER' && w.type !== 'NAV_BAR') symIdx++;
+    legend[legendKey] = `${w.id} (${w.type}${w.tagName ? ' -> ' + w.tagName : ''}) [${w.x},${w.y} ${w.width}x${w.height}]`;
 
     const c0 = Math.max(0, Math.min(cols - 1, Math.floor((w.x / screen.width) * cols)));
     const c1 = Math.max(c0, Math.min(cols - 1, Math.floor(((w.x + w.width - 1) / screen.width) * cols)));
@@ -1162,9 +1212,13 @@ export function auditScreenSpatially(
   const asciiMap = [border, ...grid.map((row) => '|' + row.join('') + '|'), border].join('\n');
 
   const maxPipePortGapPx = computeMaxPipePortGap(screen);
+  const widgetIds = new Set(screen.widgets.map((w) => w.id));
+  const hasDanglingPipes = (screen.pipes ?? []).some(
+    (p) => !widgetIds.has(p.fromWidgetId) || !widgetIds.has(p.toWidgetId)
+  );
 
   return {
-    valid: validation.valid && maxPipePortGapPx <= 1,
+    valid: validation.valid && maxPipePortGapPx <= 1 && !hasDanglingPipes,
     screenId: screen.id,
     viewport: { width: screen.width, height: screen.height },
     widgetCount: screen.widgets.length,
@@ -1323,7 +1377,7 @@ export function compileDesktopAutomationBridge(
     if (w.unit) modalFieldWrites['Unit'] = w.unit;
     if (w.min !== undefined) modalFieldWrites['Minimum'] = w.min;
     if (w.max !== undefined) modalFieldWrites['Maximum'] = w.max;
-    if (w.precision !== undefined) modalFieldWrites['Decimal places'] = w.precision;
+    if (w.precision !== undefined) modalFieldWrites['Decimal digits'] = w.precision;
     if (w.targetScreenId) modalFieldWrites['Target display'] = w.targetScreenId;
 
     return {
@@ -1365,7 +1419,7 @@ export function compileDesktopAutomationBridge(
   }));
 
   // Real Haiwell Cloud Scada 3.50.x title bar: "Haiwell Cloud Scada[3.50.x] - C:\...\<Project>.hwdev"
-  const winRegex = options.windowTitleRegex ?? options.uiaMap?.windowTitleRegex ?? '(?i).*Haiwell Cloud Scada.*';
+  const winRegex = options.windowTitleRegex ?? options.uiaMap?.windowTitleRegex ?? '(?i)^Haiwell Cloud Scada\\[.*';
   const defaultUiaMap = {
     windowTitleRegex: winRegex,
     projectBrowserAutoId: options.uiaMap?.projectBrowserAutoId ?? '',
@@ -1509,13 +1563,19 @@ export function compileDesktopAutomationBridge(
     `    if unresolved:`,
     `        raise RuntimeError("Unverified Graphics Library placeholder items detected: " + ", ".join(unresolved) + ". Pass catalogOverrides or add overrides to haiwell_graphics_catalog_dump.json.")`,
     ``,
-    `def draw_pipes(toolbox, canvas_rect, pipe_steps):`,
+    `def draw_pipes(toolbox, canvas_rect, pipe_steps, win=None):`,
     `    if not pipe_steps:`,
     `        return`,
-    `    cat_link = toolbox.child_window(title_re="(?i).*Trace.*Pipe.*")`,
+    `    cat_link = toolbox.child_window(title_re=r"(?i)^Trace[·.]Pipe$", control_type="Hyperlink", found_index=0)`,
     `    if cat_link.exists(timeout=1.5):`,
     `        cat_link.click_input()`,
     `        time.sleep(0.15)`,
+    `    pipe_item = toolbox.child_window(title_re=r"(?i)^Pipe 1$", control_type="ListItem", found_index=0)`,
+    `    if not pipe_item.exists(timeout=0.8) and win is not None:`,
+    `        pipe_item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=r"(?i).*Pipe 1.*", control_type="Button", found_index=0)`,
+    `    if pipe_item.exists(timeout=0.8):`,
+    `        pipe_item.click_input()`,
+    `        time.sleep(0.1)`,
     `    for pipe in pipe_steps:`,
     `        pts = pipe.get("waypoints", [])`,
     `        for idx in range(len(pts) - 1):`,
@@ -1534,8 +1594,8 @@ export function compileDesktopAutomationBridge(
     `    app = Application(backend="uia").connect(title_re=uia["windowTitleRegex"])`,
     `    win = app.window(title_re=uia["windowTitleRegex"])`,
     `    win.set_focus()`,
-    `    toolbox = resolve_pane(win, uia.get("toolboxAutoId", ""), uia.get("toolboxTitle", "Graphics library"), "Graphics library")`,
-    `    canvas = resolve_pane(win, uia.get("canvasAutoId", ""), "${screen.name}", "Display Canvas")`,
+    `    toolbox = resolve_pane(win, uia.get("toolboxAutoId", "") or "SymbolPanel", uia.get("toolboxTitle", "Graphics library"), "Graphics library")`,
+    `    canvas = resolve_pane(win, uia.get("canvasAutoId", "") or "vectorControl1", "${screen.name}", "Display Canvas")`,
     `    canvas_rect = canvas.rectangle()`,
     ``,
     `    active_cat = None`,
@@ -1574,7 +1634,7 @@ export function compileDesktopAutomationBridge(
     `            if ok_btn.exists(timeout=1.5):`,
     `                ok_btn.click_input()`,
     `        print(f"[OK] Step {step['step']}/{len(STEPS)}: {step['widgetId']} placed & configured via Property modal")`,
-    `    draw_pipes(toolbox, canvas_rect, PIPE_STEPS)`,
+    `    draw_pipes(toolbox, canvas_rect, PIPE_STEPS, win)`,
     `    win.type_keys("^s")`,
     `    if run_offline_sim:`,
     `        win.type_keys("{F6}")`,
@@ -1626,7 +1686,7 @@ export function generateDesktopUiaCalibrator(options: {
   windowTitleRegex?: string;
   capturedMap?: DesktopUiaMap;
 } = {}) {
-  const winRegex = options.windowTitleRegex ?? '(?i).*Haiwell Cloud Scada.*';
+  const winRegex = options.windowTitleRegex ?? '(?i)^Haiwell Cloud Scada\\[.*';
   const captured = options.capturedMap;
   const missingSelectors: string[] = [];
   if (captured) {
@@ -1678,13 +1738,21 @@ export function generateDesktopUiaCalibrator(options: {
     `            if name in EXPECTED_TREE_NODES and name not in detected["matchedTreeNodes"]:`,
     `                detected["matchedTreeNodes"].append(name)`,
     `            lower = f"{name} {auto_id}".lower()`,
+    `            if not detected["projectBrowserAutoId"] and auto_id in ("treeView1", "ProjectPanel"):`,
+    `                detected["projectBrowserAutoId"] = auto_id`,
+    `            if not detected["toolboxAutoId"] and auto_id in ("SymbolPanel", "tbrSymbolControl"):`,
+    `                detected["toolboxAutoId"] = auto_id`,
+    `            if not detected["canvasAutoId"] and auto_id in ("vectorControl1", "FrmWindow"):`,
+    `                detected["canvasAutoId"] = auto_id`,
+    `            if not detected["propertyGridAutoId"] and auto_id in ("fg", "FrmVariableEditor"):`,
+    `                detected["propertyGridAutoId"] = auto_id`,
     `            if not detected["projectBrowserAutoId"] and ("project browser" in lower or ctype == "Tree"):`,
     `                detected["projectBrowserAutoId"] = auto_id`,
     `            if not detected["propertyGridAutoId"] and ("property" in lower and ctype in ("Table", "Tree", "Pane", "Custom")):`,
     `                detected["propertyGridAutoId"] = auto_id`,
-    `            if not detected["toolboxAutoId"] and ("graphics library" in lower or "toolbox" in lower or "component" in lower or "shape" in lower):`,
+    `            if not detected["toolboxAutoId"] and ("graphics library" in lower or "symbolpanel" in lower or "toolbox" in lower or "component" in lower or "shape" in lower):`,
     `                detected["toolboxAutoId"] = auto_id`,
-    `            if not detected["canvasAutoId"] and ("canvas" in lower or "display" in lower and ctype in ("Pane", "Document", "Custom")):`,
+    `            if not detected["canvasAutoId"] and ("vectorcontrol" in lower or "canvas" in lower or ("display" in lower and ctype in ("Pane", "Document", "Custom"))):`,
     `                detected["canvasAutoId"] = auto_id`,
     `        except Exception:`,
     `            continue`,
@@ -1693,13 +1761,18 @@ export function generateDesktopUiaCalibrator(options: {
     `    with open("haiwell_uia_dump.json", "w", encoding="utf-8") as fh:`,
     `        json.dump(controls[:2000], fh, indent=2)`,
     `    graphics_items = []`,
-    `    if detected["toolboxAutoId"]:`,
+    `    for tb_id in [detected["toolboxAutoId"], "SymbolPanel", "tbrSymbolControl"]:`,
+    `        if not tb_id:`,
+    `            continue`,
     `        try:`,
-    `            tb = win.child_window(auto_id=detected["toolboxAutoId"])`,
-    `            for child in tb.descendants():`,
-    `                cname = (child.element_info.name or "").strip()`,
-    `                if cname and cname not in graphics_items:`,
-    `                    graphics_items.append(cname)`,
+    `            tb = win.child_window(auto_id=tb_id, found_index=0)`,
+    `            if not tb.exists(timeout=0.5):`,
+    `                continue`,
+    `            for ctype_name in ("ListItem", "Button", "Hyperlink"):`,
+    `                for child in tb.descendants(control_type=ctype_name):`,
+    `                    cname = (child.element_info.name or "").strip()`,
+    `                    if cname and cname not in graphics_items:`,
+    `                        graphics_items.append(cname)`,
     `        except Exception:`,
     `            pass`,
     `    with open("haiwell_graphics_catalog_dump.json", "w", encoding="utf-8") as fh:`,
@@ -1763,23 +1836,23 @@ function mapHaiwellDataTypeLabel(dt: TagDefinition['dataType']): string {
     case 'BOOL':
       return 'Bool';
     case 'INT16':
-      return '16-bit Signed';
+      return 'Integer';
     case 'UINT16':
-      return '16-bit Unsigned';
+      return 'UInteger';
     case 'INT32':
-      return '32-bit Signed';
+      return 'Long';
     case 'UINT32':
-      return '32-bit Unsigned';
+      return 'ULong';
     case 'FLOAT32':
-      return '32-bit Float';
+      return 'Float';
     case 'FLOAT64':
-      return '64-bit Float';
+      return 'Double';
     case 'STRING':
       return 'String';
     case 'BCD16':
-      return '16-bit BCD';
+      return 'Integer';
     case 'BCD32':
-      return '32-bit BCD';
+      return 'Long';
   }
 }
 
@@ -1799,7 +1872,7 @@ export function compileFullOpenProjectBridge(
 ) {
   const sections = options.sections ?? ['devices', 'variables', 'tasks', 'events', 'displays'];
   const sectionSet = new Set(sections);
-  const winRegex = options.windowTitleRegex ?? options.uiaMap?.windowTitleRegex ?? '(?i).*Haiwell Cloud Scada.*';
+  const winRegex = options.windowTitleRegex ?? options.uiaMap?.windowTitleRegex ?? '(?i)^Haiwell Cloud Scada\\[.*';
 
   const devicePlans = sectionSet.has('devices')
     ? project.devices.map((d) => ({
@@ -1871,10 +1944,10 @@ export function compileFullOpenProjectBridge(
             'Register address': reg.registerAddress,
             'Address length': Math.max(1, t.wordSpan ?? 1),
             'Data type': mapHaiwellDataTypeLabel(t.dataType),
-            'The mode of reading and writing': t.access === 'RO' ? 'Read only' : 'Read and write',
-            'Collect frequency':
+            'Read-write mode': t.access === 'RO' ? 'Read only' : 'Read and write',
+            'Acquisition frequency':
               t.collectFrequency === 'HIGH' ? 'High' : t.collectFrequency === 'LOW' ? 'Low' : 'Normal',
-            alwaysCollect: Boolean(t.alwaysCollect),
+            'Always Collect': Boolean(t.alwaysCollect),
           },
         };
       })
@@ -2010,9 +2083,18 @@ export function compileFullOpenProjectBridge(
     ``,
     `def navigate_tree(win, path_expr: str):`,
     `    parts = [p.strip() for p in path_expr.split("->") if p.strip()]`,
+    `    tree_root = win`,
+    `    try:`,
+    `        tv = win.child_window(auto_id="treeView1", found_index=0)`,
+    `        if tv.exists(timeout=0.8):`,
+    `            tree_root = tv`,
+    `    except Exception:`,
+    `        pass`,
     `    last = None`,
     `    for idx, part in enumerate(parts):`,
-    `        item = win.child_window(title_re=f"(?i).*{re.escape(part)}.*", control_type="TreeItem")`,
+    `        item = tree_root.child_window(title_re=f"(?i).*{re.escape(part)}.*", control_type="TreeItem")`,
+    `        if not item.exists(timeout=1.5) and tree_root is not win:`,
+    `            item = win.child_window(title_re=f"(?i).*{re.escape(part)}.*", control_type="TreeItem")`,
     `        if item.exists(timeout=2.0):`,
     `            if idx < len(parts) - 1:`,
     `                item.double_click_input()`,
@@ -2109,33 +2191,45 @@ export function compileFullOpenProjectBridge(
     `        "Register address",`,
     `        "Address length",`,
     `        "Data type",`,
-    `        "The mode of reading and writing",`,
-    `        "Collect frequency",`,
+    `        "Read-write mode",`,
+    `        "Acquisition frequency",`,
     `    ]`,
     `    last_scope = None`,
     `    for v in PLAN["variables"]:`,
     `        row = v["gridRow"]`,
     `        if dry_run:`,
-    `            print(f"  - {v['variableName']} [{v['scopeNode']}]: {row['Register type']} @ {row['Register address']} ({row['Data type']}, {row['The mode of reading and writing']})")`,
+    `            print(f"  - {v['variableName']} [{v['scopeNode']}]: {row['Register type']} @ {row['Register address']} ({row['Data type']}, {row['Read-write mode']})")`,
     `            continue`,
     `        if v["scopeNode"] != last_scope:`,
     `            navigate_tree(win, v["scopeNode"])`,
     `            last_scope = v["scopeNode"]`,
-    `        add_btn = win.child_window(title_re="(?i)^Add$", control_type="Button")`,
+    `        var_host = win`,
+    `        try:`,
+    `            frm_var = win.child_window(auto_id="FrmVariableEditor", found_index=0)`,
+    `            if frm_var.exists(timeout=0.5):`,
+    `                var_host = frm_var`,
+    `        except Exception:`,
+    `            pass`,
+    `        add_btn = var_host.child_window(title_re="(?i)^Add$", control_type="Button")`,
+    `        if not add_btn.exists(timeout=1.5) and var_host is not win:`,
+    `            add_btn = win.child_window(title_re="(?i)^Add$", control_type="Button")`,
     `        if add_btn.exists(timeout=2.0):`,
     `            add_btn.click_input()`,
     `            time.sleep(0.15)`,
-    `        # Check if a modal Property dialog opened or inline DataGridView row became active`,
+    `        # Check if a modal Property dialog opened or inline C1FlexGrid (fg) row became active`,
     `        dlg = app.window(title_re="(?i).*(Variable|Property|Add).*")`,
     `        if dlg.exists(timeout=0.6):`,
     `            for col in grid_column_order:`,
     `                set_dialog_field(dlg, col, row[col])`,
-    `            if row.get("alwaysCollect"):`,
-    `                set_dialog_field(dlg, "Always collect", True)`,
+    `            if row.get("Always Collect"):`,
+    `                set_dialog_field(dlg, "Always Collect", True)`,
     `            ok_btn = dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button")`,
     `            if ok_btn.exists(timeout=1.0):`,
     `                ok_btn.click_input()`,
     `        else:`,
+    `            fg = var_host.child_window(auto_id="fg", found_index=0)`,
+    `            if fg.exists(timeout=0.6):`,
+    `                fg.click_input()`,
     `            for idx, col in enumerate(grid_column_order):`,
     `                val = str(row[col])`,
     `                win.type_keys("^a{BACKSPACE}" + escape_send_keys(val) + ("{ENTER}" if idx == len(grid_column_order) - 1 else "{TAB}"), with_spaces=True)`,
@@ -2158,7 +2252,7 @@ export function compileFullOpenProjectBridge(
     `            if task_node is not None:`,
     `                task_node.right_click_input()`,
     `                time.sleep(0.2)`,
-    `            new_mi = app.top_window().child_window(title_re="(?i)^New.*", control_type="MenuItem")`,
+    `            new_mi = app.top_window().child_window(title_re=r"(?i)^(Add|New).*", control_type="MenuItem")`,
     `            if new_mi.exists(timeout=1.5):`,
     `                new_mi.click_input()`,
     `                time.sleep(0.2)`,
@@ -2197,7 +2291,7 @@ export function compileFullOpenProjectBridge(
     `        if node is not None:`,
     `            node.right_click_input()`,
     `            time.sleep(0.2)`,
-    `        new_mi = app.top_window().child_window(title_re="(?i)^New.*", control_type="MenuItem")`,
+    `        new_mi = app.top_window().child_window(title_re=r"(?i)^(Add|New).*", control_type="MenuItem")`,
     `        if new_mi.exists(timeout=1.5):`,
     `            new_mi.click_input()`,
     `            time.sleep(0.25)`,
@@ -2213,14 +2307,20 @@ export function compileFullOpenProjectBridge(
     `def map_canvas_point(canvas_rect, screen_w: int, screen_h: int, x: int, y: int):`,
     `    return (int(canvas_rect.left + x * (canvas_rect.width() / float(screen_w))), int(canvas_rect.top + y * (canvas_rect.height() / float(screen_h))))`,
     ``,
-    `def draw_pipes(toolbox, canvas_rect, screen_w: int, screen_h: int, pipe_steps):`,
+    `def draw_pipes(toolbox, canvas_rect, screen_w: int, screen_h: int, pipe_steps, win=None):`,
     `    from pywinauto import mouse`,
     `    if not pipe_steps:`,
     `        return`,
-    `    cat_link = toolbox.child_window(title_re="(?i).*Trace.*Pipe.*")`,
+    `    cat_link = toolbox.child_window(title_re=r"(?i)^Trace[·.]Pipe$", control_type="Hyperlink", found_index=0)`,
     `    if cat_link.exists(timeout=1.5):`,
     `        cat_link.click_input()`,
     `        time.sleep(0.15)`,
+    `    pipe_item = toolbox.child_window(title_re=r"(?i)^Pipe 1$", control_type="ListItem", found_index=0)`,
+    `    if not pipe_item.exists(timeout=0.8) and win is not None:`,
+    `        pipe_item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=r"(?i).*Pipe 1.*", control_type="Button", found_index=0)`,
+    `    if pipe_item.exists(timeout=0.8):`,
+    `        pipe_item.click_input()`,
+    `        time.sleep(0.1)`,
     `    for pipe in pipe_steps:`,
     `        pts = pipe.get("waypoints", [])`,
     `        for idx in range(len(pts) - 1):`,
@@ -2232,7 +2332,6 @@ export function compileFullOpenProjectBridge(
     `            time.sleep(0.08)`,
     ``,
     `def run_displays(app, win, uia: dict, dry_run: bool):`,
-    `    from pywinauto import mouse`,
     `    catalog_overrides = load_graphics_catalog_overrides()`,
     `    for scr in PLAN["displays"]:`,
     `        print(f"[DISPLAY] {scr['screenName']} ({scr['width']}x{scr['height']}, {len(scr['widgetSteps'])} widgets, {len(scr.get('pipeSteps', []))} pipes)")`,
@@ -2242,6 +2341,7 @@ export function compileFullOpenProjectBridge(
     `            for p in scr.get("pipeSteps", []):`,
     `                print(f"  - Pipe {p['pipeId']} ({p['fluid']}): {len(p['waypoints'])} waypoints")`,
     `            continue`,
+    `        from pywinauto import mouse`,
     `        unresolved = []`,
     `        for st in scr["widgetSteps"]:`,
     `            if not st.get("toolboxNameVerified"):`,
@@ -2260,25 +2360,29 @@ export function compileFullOpenProjectBridge(
     `        elif disp_node is not None:`,
     `            disp_node.right_click_input()`,
     `            time.sleep(0.2)`,
-    `            new_mi = app.top_window().child_window(title_re="(?i)^New.*", control_type="MenuItem")`,
+    `            new_mi = app.top_window().child_window(title_re=r"(?i)^(Add|New).*", control_type="MenuItem")`,
     `            if new_mi.exists(timeout=1.5):`,
     `                new_mi.click_input()`,
     `        time.sleep(0.3)`,
-    `        tb_id = uia.get("toolboxAutoId", "")`,
-    `        toolbox = win.child_window(auto_id=tb_id) if tb_id else win.child_window(title_re="(?i).*Graphics library.*")`,
-    `        cv_id = uia.get("canvasAutoId", "")`,
-    `        canvas = win.child_window(auto_id=cv_id) if cv_id else win.child_window(title_re=f"(?i).*{re.escape(scr['screenName'])}.*")`,
+    `        tb_id = uia.get("toolboxAutoId", "") or "SymbolPanel"`,
+    `        toolbox = win.child_window(auto_id=tb_id, found_index=0)`,
+    `        if not toolbox.exists(timeout=1.5):`,
+    `            toolbox = win.child_window(title_re="(?i).*Graphics library.*", found_index=0)`,
+    `        cv_id = uia.get("canvasAutoId", "") or "vectorControl1"`,
+    `        canvas = win.child_window(auto_id=cv_id, found_index=0)`,
     `        canvas_rect = canvas.rectangle()`,
     `        active_cat = None`,
     `        for st in scr["widgetSteps"]:`,
     `            cat = st.get("graphicsLibraryCategory")`,
     `            if cat and cat != active_cat:`,
-    `                cat_link = toolbox.child_window(title_re=f"(?i).*{re.escape(cat)}.*")`,
+    `                cat_link = toolbox.child_window(title_re=f"(?i).*{re.escape(cat)}.*", control_type="Hyperlink", found_index=0)`,
     `                if cat_link.exists(timeout=1.5):`,
     `                    cat_link.click_input()`,
-    `                    time.sleep(0.15)`,
+    `                    time.sleep(0.2)`,
     `                    active_cat = cat`,
-    `            item = toolbox.child_window(title_re=f"(?i).*{re.escape(st['toolboxItemName'])}.*")`,
+    `            item = toolbox.child_window(title_re=f"(?i).*{re.escape(st['toolboxItemName'])}.*", control_type="ListItem", found_index=0)`,
+    `            if not item.exists(timeout=1.0):`,
+    `                item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=f"(?i).*{re.escape(st['toolboxItemName'])}.*", control_type="Button", found_index=0)`,
     `            item.click_input()`,
     `            time.sleep(0.1)`,
     `            b = st["canvasBounds"]`,
@@ -2299,7 +2403,7 @@ export function compileFullOpenProjectBridge(
     `                if ok_btn.exists(timeout=1.5):`,
     `                    ok_btn.click_input()`,
     `            print(f"[OK] Placed {st['widgetId']} on {scr['screenName']}")`,
-    `        draw_pipes(toolbox, canvas_rect, scr["width"], scr["height"], scr.get("pipeSteps", []))`,
+    `        draw_pipes(toolbox, canvas_rect, scr["width"], scr["height"], scr.get("pipeSteps", []), win)`,
     ``,
     `def main():`,
     `    ap = argparse.ArgumentParser()`,

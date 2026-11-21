@@ -13,10 +13,10 @@ import { runSimulationSteps } from './simulationEngine';
 import { compileDesktopAutomationBridge, compileFullOpenProjectBridge, compilePidScreen } from './hmiSpatialEngine';
 import { parseHaiwellLngContent, detectHaiwellLanguageFromConfig, buildNewProjectPowerShellScript } from './desktopAutomation';
 import { isBlockedSsrfHost, probeTcpEndpoint } from './protocolAdapters';
-import { detectWordOverlapConflicts } from './plcAddressing';
+import { detectWordOverlapConflicts, validatePlcAddress } from './plcAddressing';
 import { parseHaiwellRegister } from './haiwellRegisters';
 import type { PlcDriverProtocol, TagDefinition } from './types';
-import { generateClientConfigs } from './resourcesAndPrompts';
+import { generateClientConfigs, readHaiwellResource } from './resourcesAndPrompts';
 import { SERVER_VERSION } from './version';
 
 async function executeHaiwellTool(name: string, args: unknown, store: HaiwellProjectStore): Promise<unknown> {
@@ -148,7 +148,7 @@ test('Audit #3: Real 3.50.1.19 CSV columns, PRO-series HMI RTSP compatibility, A
   const firstLine = csv.split('\n')[0];
   assert.equal(
     firstLine,
-    'Variable name,Register type,Address format,Register address,Address length,Data type,The mode of reading and writing,Collect frequency,Always collect,Description'
+    'Variable name,Register type,Address format,Register address,Address length,Data type,Read-write mode,Acquisition frequency,Always Collect,Description'
   );
   assert.ok(csv.includes('Read only') || csv.includes('Read and write'));
 
@@ -665,6 +665,7 @@ test('Audit #10b: Desktop XML .lng parsing, numeric config.ini lang mapping, and
   assert.ok(ps.includes('Project properties'));
   assert.ok(ps.includes('Runtime platform'));
   assert.ok(ps.includes('finally {'));
+  assert.ok(ps.includes('DESKTOP_WINDOW_INACCESSIBLE'));
 });
 
 test('Audit #10c: Safety audit enforces HIGH on touch-target/collision/bounds, startupScreenId, A8 COM/Printer, IPC audio, and dangling schedule/trigger targets', async () => {
@@ -917,4 +918,103 @@ test('Audit #10e: PLC mixed Modbus coils, bit-in-word/byte overlaps, multi-word 
   prj.tags.Manual_Overflow = mkTag('Manual_Overflow', 'plc_chiller_01', 'V14847', 'FLOAT32');
   const auditOverflow = runProjectSafetyAudit(prj);
   assert.ok(auditOverflow.findings.some((f) => f.code === 'AUD-TAG-BAD-ADDR' && f.target === 'Manual_Overflow'));
+});
+
+test('Audit #11: Phase 1-6 regressions (6-digit Modicon, SSRF %zone, scriptAnalyzer bypasses, simulation delays/persistState, 3.50.1.19 UIA & resources)', async () => {
+  // 1. 6-digit Modicon, addressOffset BASE_1, HR:10.3, OPC UA & MQTT addressing
+  const hwReg = parseHaiwellRegister('V100.12');
+  assert.equal(hwReg.valid && hwReg.iecDirectAddress, '%MX201.4');
+  assert.equal(validatePlcAddress('MODBUS_TCP', '400001', { addressOffset: 'BASE_1' }).valid, true);
+  assert.equal(validatePlcAddress('MODBUS_TCP', 'HR:10.3').valid, true);
+  assert.equal(validatePlcAddress('OPC_UA_CLIENT', 'ns=2;s=Chiller01.Temp').valid, true);
+  assert.equal(validatePlcAddress('MQTT_CLIENT', 'plant/line1/temp').valid, true);
+  assert.equal(validatePlcAddress('MQTT_CLIENT', 'plant/\n/temp').valid, false);
+  assert.equal(validatePlcAddress('SIEMENS_S7_1200', 'DB0.DBX0.0').valid, false);
+  assert.equal(validatePlcAddress('ALLEN_BRADLEY_EIP', 'Program:MainProgram.Array2D[1,2]').valid, true);
+
+  // 2. SSRF %zone / loopback alias guard
+  assert.equal(isBlockedSsrfHost('fe80::1%eth0'), true);
+  assert.equal(isBlockedSsrfHost('2130706433', { blockLoopback: true }), true);
+  assert.equal(isBlockedSsrfHost('2852039166'), true);
+
+  // 3. scriptAnalyzer bypasses & false-positive fixes
+  const store = new HaiwellProjectStore();
+  const prj = store.getProject('prj_chiller_plant_01');
+  assert.equal(
+    validateHaiwellScript('with (Math) { var x = sin(1); }', prj.tags).diagnostics.some((d) => d.code === 'HWJS-SEC-001'),
+    true
+  );
+  assert.equal(
+    validateHaiwellScript('var x = this.process;', prj.tags).diagnostics.some((d) => d.code === 'HWJS-SEC-001'),
+    true
+  );
+  assert.equal(
+    validateHaiwellScript('var p = Object.getPrototypeOf({});', prj.tags).diagnostics.some((d) => d.code === 'HWJS-SEC-001'),
+    true
+  );
+  assert.equal(
+    validateHaiwellScript('var k = "const" + "ructor"; var x = ({})[k];', prj.tags).diagnostics.some((d) => d.code === 'HWJS-SEC-001'),
+    true
+  );
+  assert.equal(
+    validateHaiwellScript('var x = $Supply_Temp_C.toFixed(1);', prj.tags).valid,
+    true
+  );
+  assert.equal(
+    validateHaiwellScript('while (true) { if ($EStop_OK) break; }', prj.tags).diagnostics.some((d) => d.code === 'HWJS-SAFE-001'),
+    false
+  );
+  assert.equal(
+    validateHaiwellScript(
+      'var cb = function() { Common.logger.info("%s", "ok"); }; Common.Ajax({ url: "https://example.com" }, function(err, res) { var done = true; });',
+      prj.tags
+    ).diagnostics.some((d) => d.code === 'HWJS-RT-003'),
+    false
+  );
+
+  // 4. SimulationEngine: missing explicit eStopTagName throws, delayOnMs + persistState + messageTemplate
+  const simPrj = JSON.parse(JSON.stringify(prj));
+  assert.throws(
+    () => runSimulationSteps(simPrj, { eStopTagName: 'NonExistent_EStop', steps: 1 }),
+    /NonExistent_EStop/
+  );
+  simPrj.alarms.push({
+    id: 'alm_delay_test',
+    name: 'Delayed High Temp',
+    tagName: 'Supply_Temp_C',
+    condition: 'HI',
+    threshold: 12.0,
+    deadband: 0.5,
+    delayOnMs: 2000,
+    delayOffMs: 1000,
+    priority: 2,
+    group: 'TEST',
+    messageTemplate: '{tag} at {value} >= {threshold}',
+    channels: ['SCREEN_POPUP'],
+    enabled: true,
+  });
+  const s1 = runSimulationSteps(simPrj, {
+    injectTagValues: { Supply_Temp_C: 13.0 },
+    steps: 1,
+    scanIntervalMs: 1000,
+    persistState: true,
+  });
+  assert.equal(s1.trace[0].newlyTriggeredAlarms.includes('alm_delay_test'), false);
+  const s2 = runSimulationSteps(simPrj, {
+    steps: 1,
+    scanIntervalMs: 1000,
+    persistState: true,
+  });
+  assert.equal(s2.trace[0].newlyTriggeredAlarms.includes('alm_delay_test'), true);
+  const ev = simPrj.alarmHistory.find((e: { alarmId: string }) => e.alarmId === 'alm_delay_test');
+  assert.ok(ev && ev.message.includes('Supply_Temp_C at 13 >= 12'));
+
+  // 5. Resource tags-csv returns 3.50.1.19 CSV
+  const csvRes = readHaiwellResource('haiwell://project/prj_chiller_plant_01/tags-csv', store);
+  assert.ok(csvRes.text.includes('Read-write mode,Acquisition frequency,Always Collect'));
+
+  // 6. 3.50.1.19 UIA bridge & open-project bridge specifics
+  const fullBridge = compileFullOpenProjectBridge(prj, { sections: ['variables', 'displays'] });
+  assert.match(fullBridge.pywinautoScript, /\^Trace\[·\.\]\?Pipe\$|\^Trace\[·\.\]Pipe\$/);
+  assert.match(fullBridge.pywinautoScript, /\^\(Add\|New\)/);
 });

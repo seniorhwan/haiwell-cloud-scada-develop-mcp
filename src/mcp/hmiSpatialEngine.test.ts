@@ -152,3 +152,68 @@ test('desktop bridge exports native screen manifest + closed-loop pywinauto prop
   broken.widgets[1].y = broken.widgets[2].y;
   assert.throws(() => compileDesktopAutomationBridge(broken, prj.tags), /Refusing to export desktop bridge/);
 });
+
+test('P&ID compiler places closed recirculation loop across horizontal columns even with standalone control widgets', () => {
+  const store = new HaiwellProjectStore();
+  const prj = store.getProject('prj_chiller_plant_01');
+
+  const res = compilePidScreen(
+    {
+      screenId: 'scr_mixed_loop_controls',
+      name: 'Mixed Loop + Controls',
+      width: 1024,
+      height: 600,
+      layoutStandard: 'ISA_101_HIGH_PERFORMANCE',
+      includeAlarmBanner: true,
+      includeNavBar: true,
+      nodes: [
+        { id: 'tank_1', type: 'TANK', label: 'Storage Tank' },
+        { id: 'pump_1', type: 'PUMP', label: 'Feed Pump 1', tagName: 'Pump1_Run_Cmd', writeEnabled: true },
+        { id: 'valve_1', type: 'VALVE', label: 'Outlet Valve', tagName: 'Valve_Position_Pct', writeEnabled: true },
+        { id: 'sp_1', type: 'NUMERIC_INPUT', label: 'Setpoint', tagName: 'Chiller_Setpoint_C', writeEnabled: true },
+        { id: 'btn_1', type: 'BIT_BUTTON', label: 'Auto Mode', tagName: 'Pump1_Run_Cmd', writeEnabled: true },
+        { id: 'lamp_1', type: 'BIT_LAMP', label: 'Running', tagName: 'Pump1_Run_Cmd' },
+      ],
+      edges: [
+        { from: 'tank_1', to: 'pump_1', fluid: 'PROCESS' },
+        { from: 'pump_1', to: 'valve_1', fluid: 'PROCESS' },
+        { from: 'valve_1', to: 'tank_1', fluid: 'RETURN' },
+      ],
+    },
+    prj.tags,
+    { targetHardware: 'CLOUD_HMI_B7H' }
+  );
+
+  assert.equal(res.spatialAudit.valid, true);
+  assert.equal(res.spatialAudit.validation.collisions.length, 0);
+  const wTank = res.screen.widgets.find((w) => w.id === 'tank_1')!;
+  const wPump = res.screen.widgets.find((w) => w.id === 'pump_1')!;
+  const wValve = res.screen.widgets.find((w) => w.id === 'valve_1')!;
+  assert.ok(wTank.x < wPump.x && wPump.x < wValve.x, 'Closed loop must span 3 left-to-right columns');
+});
+
+test('P&ID compiler rejects dangling edges and 3.50.1.19 catalog has Valve1/Pipe 1/Decimal digits', () => {
+  const store = new HaiwellProjectStore();
+  const prj = store.getProject('prj_chiller_plant_01');
+  assert.throws(
+    () =>
+      compilePidScreen(
+        {
+          screenId: 'scr_bad_edge',
+          name: 'BadEdge',
+          width: 1024,
+          height: 600,
+          layoutStandard: 'ISA_101_HIGH_PERFORMANCE',
+          nodes: [{ id: 'tank_1', type: 'TANK', label: 'Tank 1' }],
+          edges: [{ from: 'tank_1', to: 'missing_pump' }],
+        },
+        prj.tags
+      ),
+    /missing_pump/
+  );
+  const valveSpec = HAIWELL_HMI_TOOLBOX.find((c) => c.type === 'VALVE')!;
+  assert.equal(valveSpec.haiwellToolboxName, 'Valve1');
+  assert.equal(valveSpec.toolboxNameVerified, true);
+  const numSpec = HAIWELL_HMI_TOOLBOX.find((c) => c.type === 'NUMERIC_DISPLAY')!;
+  assert.equal(numSpec.documentedModalFields.precision, 'Decimal digits');
+});

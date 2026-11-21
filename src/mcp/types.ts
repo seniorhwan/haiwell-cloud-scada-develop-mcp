@@ -76,7 +76,7 @@ export interface DeviceConfig {
   id: string;
   name: string;
   protocol: PlcDriverProtocol;
-  transport: 'TCP' | 'RTU' | 'CLOUD_TUNNEL';
+  transport: 'TCP' | 'RTU' | 'UDP' | 'CLOUD_TUNNEL';
   host?: string;
   port?: number;
   serialPort?: string;

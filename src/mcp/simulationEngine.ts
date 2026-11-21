@@ -19,25 +19,45 @@ function toNumeric(val: number | boolean | string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function isAlarmTripped(alm: AlarmDefinition, currentVal: number, prevVal: number, alreadyActive: boolean): boolean {
+function isAlarmTripped(
+  alm: AlarmDefinition,
+  currentVal: number,
+  prevVal: number,
+  alreadyActive: boolean,
+  scanIntervalMs = 1000
+): boolean {
   const db = Math.max(0, alm.deadband);
   switch (alm.condition) {
     case 'HIHI':
     case 'HI':
-      return alreadyActive ? currentVal > alm.threshold - db : currentVal >= alm.threshold;
+      return alreadyActive
+        ? db > 0
+          ? currentVal > alm.threshold - db
+          : currentVal >= alm.threshold
+        : currentVal >= alm.threshold;
     case 'LO':
     case 'LOLO':
-      return alreadyActive ? currentVal < alm.threshold + db : currentVal <= alm.threshold;
+      return alreadyActive
+        ? db > 0
+          ? currentVal < alm.threshold + db
+          : currentVal <= alm.threshold
+        : currentVal <= alm.threshold;
     case 'DIGITAL_HIGH':
       return currentVal === 1;
     case 'DIGITAL_LOW':
       return currentVal === 0;
-    case 'ROC':
-      return Math.abs(currentVal - prevVal) >= alm.threshold;
+    case 'ROC': {
+      const dtSec = Math.max(0.001, scanIntervalMs / 1000);
+      return Math.abs(currentVal - prevVal) / dtSec >= alm.threshold;
+    }
     case 'DEV': {
       const ref = alm.referenceValue ?? 0;
       const delta = Math.abs(currentVal - ref);
-      return alreadyActive ? delta > alm.threshold - db : delta >= alm.threshold;
+      return alreadyActive
+        ? db > 0
+          ? delta > alm.threshold - db
+          : delta >= alm.threshold
+        : delta >= alm.threshold;
     }
   }
 }
@@ -49,14 +69,53 @@ export interface AlarmEvalSummary {
   activeCount: number;
 }
 
+const standaloneAlarmDelayMap = new WeakMap<HaiwellProject, Map<string, { onMs: number; offMs: number }>>();
+
+function formatAlarmMessage(alm: AlarmDefinition, tag: TagDefinition): string {
+  return alm.messageTemplate.replace(/\{(tag|tagName|value|threshold|unit|priority)\}/g, (_m, key: string) => {
+    switch (key) {
+      case 'tag':
+      case 'tagName':
+        return tag.name;
+      case 'value':
+        return String(tag.currentValue);
+      case 'threshold':
+        return String(alm.threshold);
+      case 'unit':
+        return tag.unit ?? '';
+      case 'priority':
+        return String(alm.priority);
+      default:
+        return '';
+    }
+  });
+}
+
 /**
  * Deduplicating ISA-18.2 state machine:
  * NORMAL -> ACTIVE_UNACK -> ACTIVE_ACK -> NORMAL (when cleared)
  * ACTIVE_UNACK -> CLEARED_UNACK (when cleared before ack) -> NORMAL (when acked)
  */
-export function evaluateProjectAlarms(project: HaiwellProject): AlarmEvalSummary {
-  const now = new Date().toISOString();
-  const nowMs = Date.now();
+export function evaluateProjectAlarms(
+  project: HaiwellProject,
+  simOptions?: {
+    simTimeMs?: number;
+    scanIntervalMs?: number;
+    delayState?: Map<string, { onMs: number; offMs: number }>;
+  }
+): AlarmEvalSummary {
+  const nowMs = simOptions?.simTimeMs ?? Date.now();
+  const now = new Date(nowMs).toISOString();
+  const scanIntervalMs = Math.max(1, simOptions?.scanIntervalMs ?? 1000);
+  const enforceDelays = Boolean(simOptions?.delayState);
+  let delayState = simOptions?.delayState;
+  if (!delayState) {
+    delayState = standaloneAlarmDelayMap.get(project);
+    if (!delayState) {
+      delayState = new Map();
+      standaloneAlarmDelayMap.set(project, delayState);
+    }
+  }
   const newlyTriggered: ActiveAlarmEvent[] = [];
   const cleared: ActiveAlarmEvent[] = [];
 
@@ -76,28 +135,64 @@ export function evaluateProjectAlarms(project: HaiwellProject): AlarmEvalSummary
       (e) => e.alarmId === alm.id && (e.state === 'ACTIVE_UNACK' || e.state === 'ACTIVE_ACK')
     );
 
-    const tripped = isAlarmTripped(alm, cur, prev, Boolean(existingActive));
+    const tripped = isAlarmTripped(alm, cur, prev, Boolean(existingActive), scanIntervalMs);
+    const timer = delayState.get(alm.id) ?? { onMs: 0, offMs: 0 };
 
     if (tripped && !existingActive) {
+      timer.offMs = 0;
+      const delayOn = enforceDelays ? Math.max(0, alm.delayOnMs ?? 0) : 0;
+      if (delayOn > 0) {
+        timer.onMs += scanIntervalMs;
+        if (timer.onMs < delayOn) {
+          delayState.set(alm.id, timer);
+          continue;
+        }
+      }
+      timer.onMs = 0;
+      delayState.set(alm.id, timer);
+
       const ev: ActiveAlarmEvent = {
-        eventId: `ev_${alm.id}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        eventId: `ev_${alm.id}_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
         alarmId: alm.id,
         tagName: alm.tagName,
         value: tag.currentValue,
         priority: alm.priority,
-        message: alm.messageTemplate,
+        message: formatAlarmMessage(alm, tag),
         state: 'ACTIVE_UNACK',
         triggeredAt: now,
       };
       project.alarmHistory.push(ev);
-      if (project.alarmHistory.length > 500) {
-        project.alarmHistory.splice(0, project.alarmHistory.length - 500);
+      while (project.alarmHistory.length > 500) {
+        const inactiveIdx = project.alarmHistory.findIndex(
+          (e) => e.state !== 'ACTIVE_UNACK' && e.state !== 'ACTIVE_ACK'
+        );
+        if (inactiveIdx >= 0) {
+          project.alarmHistory.splice(inactiveIdx, 1);
+        } else {
+          project.alarmHistory.shift();
+        }
       }
       newlyTriggered.push(ev);
     } else if (!tripped && existingActive) {
+      timer.onMs = 0;
+      const delayOff = enforceDelays ? Math.max(0, alm.delayOffMs ?? 0) : 0;
+      if (delayOff > 0) {
+        timer.offMs += scanIntervalMs;
+        if (timer.offMs < delayOff) {
+          delayState.set(alm.id, timer);
+          continue;
+        }
+      }
+      timer.offMs = 0;
+      delayState.set(alm.id, timer);
+
       existingActive.clearedAt = now;
       existingActive.state = existingActive.state === 'ACTIVE_ACK' ? 'NORMAL' : 'CLEARED_UNACK';
       cleared.push(existingActive);
+    } else {
+      if (!tripped) timer.onMs = 0;
+      if (tripped) timer.offMs = 0;
+      delayState.set(alm.id, timer);
     }
   }
 
@@ -116,6 +211,7 @@ export interface SimulationStepInput {
   scanIntervalMs?: number;
   eStopTagName?: string;
   enforceEStopSafeState?: boolean;
+  persistState?: boolean;
 }
 
 function resolveTagByFullName(project: HaiwellProject, rawName: string): TagDefinition | undefined {
@@ -176,48 +272,71 @@ function createSandboxedContext(
   };
 
   const sandbox: Record<string, unknown> = Object.create(null);
-  sandbox.Variable = Object.freeze({
-    GetByFullName: readTag,
-    SetByFullName: writeTag,
-    BatchSetByFullNames: (map: Record<string, unknown>) => {
-      if (!map || typeof map !== 'object') return false;
-      for (const [k, v] of Object.entries(map)) {
-        writeTag(k, v);
-      }
-      return true;
-    },
-  });
-  sandbox.Tag = Object.freeze({
-    Read: readTag,
-    Write: writeTag,
-  });
-  sandbox.Common = Object.freeze({
-    logger: Object.freeze({
-      log: () => {},
-      debug: () => {},
-      info: () => {},
-      trace: () => {},
-      warn: () => {},
-      note: () => {},
-      error: () => {},
-    }),
-    SetTimeout: () => 0,
-    SetInterval: () => 0,
-  });
+  const defineImmutableGlobal = (key: string, val: unknown) => {
+    Object.defineProperty(sandbox, key, {
+      value: val,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  };
+
+  defineImmutableGlobal(
+    'Variable',
+    Object.freeze({
+      GetByFullName: readTag,
+      SetByFullName: writeTag,
+      BatchSetByFullNames: (map: Record<string, unknown>) => {
+        if (!map || typeof map !== 'object') return false;
+        for (const [k, v] of Object.entries(map)) {
+          writeTag(k, v);
+        }
+        return true;
+      },
+    })
+  );
+  defineImmutableGlobal(
+    'Tag',
+    Object.freeze({
+      Read: readTag,
+      Write: writeTag,
+    })
+  );
+  defineImmutableGlobal(
+    'Common',
+    Object.freeze({
+      logger: Object.freeze({
+        log: () => {},
+        debug: () => {},
+        info: () => {},
+        trace: () => {},
+        warn: () => {},
+        note: () => {},
+        error: () => {},
+      }),
+      SetTimeout: () => 0,
+      SetInterval: () => 0,
+      database: Object.freeze({
+        query: (_sql: string, cb?: (err: null, rows: unknown[]) => void) => {
+          if (typeof cb === 'function') cb(null, []);
+          return [];
+        },
+        exec: (_sql: string, cb?: (err: null) => void) => {
+          if (typeof cb === 'function') cb(null);
+        },
+        execTransaction: (_sqls: string[], cb?: (err: null) => void) => {
+          if (typeof cb === 'function') cb(null);
+        },
+      }),
+      Ajax: (_opts: unknown, cb?: (err: null, res: { statusCode: number; body: string }) => void) => {
+        if (typeof cb === 'function') cb(null, { statusCode: 200, body: '{}' });
+      },
+    })
+  );
   sandbox.__fbState = fbState;
+  sandbox.__haiwellFbStore = fbState;
   sandbox.__SCAN_MS = scanIntervalMs;
-  sandbox.Math = Math;
-  sandbox.Date = Date;
-  sandbox.JSON = JSON;
-  sandbox.Number = Number;
-  sandbox.String = String;
-  sandbox.Boolean = Boolean;
-  sandbox.Array = Array;
-  sandbox.Object = Object;
-  sandbox.parseInt = parseInt;
-  sandbox.parseFloat = parseFloat;
-  sandbox.isNaN = isNaN;
-  sandbox.isFinite = isFinite;
+  sandbox.__haiwellCyclicMs = scanIntervalMs;
 
   // Bind single-level $TagName accessors on sandbox global
   for (const tag of Object.values(project.tags)) {
@@ -231,11 +350,11 @@ function createSandboxedContext(
     });
   }
 
-  // Bind $DeviceName objects with tag properties
+  // Bind $DeviceName objects with tag properties (strictly matched by deviceId)
   for (const dev of project.devices) {
-    const devProxy: Record<string, unknown> = {};
+    const devProxy: Record<string, unknown> = Object.create(null);
     for (const tag of Object.values(project.tags)) {
-      if (tag.deviceId === dev.id || tag.scope === 'PLC') {
+      if (tag.deviceId === dev.id) {
         Object.defineProperty(devProxy, tag.name, {
           enumerable: true,
           get: () => tag.currentValue,
@@ -245,7 +364,7 @@ function createSandboxedContext(
         });
       }
     }
-    sandbox[`$${dev.name}`] = devProxy;
+    defineImmutableGlobal(`$${dev.name}`, devProxy);
   }
 
   return vm.createContext(sandbox, {
@@ -253,17 +372,61 @@ function createSandboxedContext(
   });
 }
 
+interface PersistentSimState {
+  fbState: Record<string, Record<string, unknown>>;
+  delayState: Map<string, { onMs: number; offMs: number }>;
+  simTimeMs: number;
+  cyclicAccumMs: Map<string, number>;
+  startupRan: Set<string>;
+  firedOnceEvents: Set<string>;
+}
+
+const simProjectStateMap = new WeakMap<HaiwellProject, PersistentSimState>();
+
 export function runSimulationSteps(project: HaiwellProject, input: SimulationStepInput) {
   const steps = Math.max(1, Math.min(input.steps ?? 1, 50));
   const scanIntervalMs = Math.max(50, Math.min(input.scanIntervalMs ?? 1000, 60000));
   const hasOwnTag = (name: string) => Object.prototype.hasOwnProperty.call(project.tags, name);
+
+  if (input.eStopTagName && !hasOwnTag(input.eStopTagName)) {
+    throw new Error(`Explicit eStopTagName "${input.eStopTagName}" does not exist in project tags.`);
+  }
+
+  let simState: PersistentSimState;
+  if (input.persistState) {
+    let existing = simProjectStateMap.get(project);
+    if (!existing) {
+      existing = {
+        fbState: {},
+        delayState: new Map(),
+        simTimeMs: Date.now(),
+        cyclicAccumMs: new Map(),
+        startupRan: new Set(),
+        firedOnceEvents: new Set(),
+      };
+      simProjectStateMap.set(project, existing);
+    }
+    simState = existing;
+  } else {
+    simState = {
+      fbState: {},
+      delayState: new Map(),
+      simTimeMs: Date.now(),
+      cyclicAccumMs: new Map(),
+      startupRan: new Set(),
+      firedOnceEvents: new Set(),
+    };
+  }
 
   // Pre-compile saved ST POUs once before running N scan cycles
   const compiledPous: { name: string; script: vm.Script }[] = [];
   const preCompileErrors: string[] = [];
   for (const pou of project.pous) {
     if (pou.language !== 'ST') continue;
-    const transpiled = transpileStToHaiwellJs(pou.source, {}, { apiStyle: 'HAIWELL_NATIVE_350' });
+    const transpiled = transpileStToHaiwellJs(pou.source, {}, {
+      apiStyle: 'HAIWELL_NATIVE_350',
+      cyclicIntervalMs: scanIntervalMs,
+    });
     if (transpiled.success && transpiled.jsCode) {
       try {
         compiledPous.push({
@@ -275,6 +438,12 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
       } catch (err) {
         preCompileErrors.push(`POU "${pou.name}": ${(err as Error).message}`);
       }
+    } else {
+      const errMsgs = transpiled.validation.diagnostics
+        .filter((d) => d.severity === 'ERROR')
+        .map((d) => `${d.code}: ${d.message}`);
+      const errMsg = errMsgs.length ? errMsgs.join('; ') : 'ST transpilation failed';
+      preCompileErrors.push(`POU "${pou.name}" transpile error: ${errMsg}`);
     }
   }
 
@@ -283,40 +452,48 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
     name: string;
     trigger: string;
     triggerTag?: string;
+    intervalMs?: number;
     script: vm.Script;
   }[] = [];
+  const compiledScriptByName = new Map<string, vm.Script>();
   for (const scr of project.scripts) {
-    if (scr.trigger !== 'CYCLIC' && scr.trigger !== 'TAG_CHANGE') continue;
     const check = validateHaiwellScript(scr.code, project.tags, {
       trigger: scr.trigger,
       intervalMs: scr.intervalMs,
       triggerTag: scr.triggerTag,
-      strictEs5: false,
+      targetHardware: project.targetHardware,
     });
-    const hasSecurityOrSyntaxError = check.diagnostics.some(
-      (d) => d.severity === 'ERROR' && (d.code === 'HWJS-SEC-001' || d.code === 'HWJS-SYN-001' || d.code === 'HWJS-SAFE-001')
-    );
-    if (hasSecurityOrSyntaxError) {
-      preCompileErrors.push(`Script "${scr.name}" skipped due to safety/syntax error.`);
+    const blockingErrors = check.diagnostics.filter((d) => d.severity === 'ERROR');
+    if (blockingErrors.length > 0) {
+      const firstErr = blockingErrors.map((d) => `${d.code}: ${d.message}`).join('; ');
+      preCompileErrors.push(`Script "${scr.name}" skipped: ${firstErr}`);
       continue;
     }
     try {
-      compiledScripts.push({
-        name: scr.name,
-        trigger: scr.trigger,
-        triggerTag: scr.triggerTag,
-        script: new vm.Script(`(function() {\n${scr.code}\n})();`, {
-          filename: `script_${scr.name}.js`,
-        }),
+      const compiled = new vm.Script(`(function() {\n${scr.code}\n})();`, {
+        filename: `script_${scr.name}.js`,
       });
+      compiledScriptByName.set(scr.name, compiled);
+      if (
+        scr.trigger === 'CYCLIC' ||
+        scr.trigger === 'TAG_CHANGE' ||
+        scr.trigger === 'STARTUP' ||
+        scr.trigger === 'ALARM_EVENT'
+      ) {
+        compiledScripts.push({
+          name: scr.name,
+          trigger: scr.trigger,
+          triggerTag: scr.triggerTag,
+          intervalMs: scr.intervalMs,
+          script: compiled,
+        });
+      }
     } catch (err) {
       preCompileErrors.push(`Script "${scr.name}": ${(err as Error).message}`);
     }
   }
 
-  // Persistent FB state across all scan steps (TON/TOF/TP/CTU/CTD/R_TRIG/F_TRIG/SR/RS)
-  const fbState: Record<string, Record<string, unknown>> = {};
-  const vmContext = createSandboxedContext(project, fbState, scanIntervalMs);
+  const vmContext = createSandboxedContext(project, simState.fbState, scanIntervalMs);
 
   const trace: {
     step: number;
@@ -333,14 +510,18 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
 
   const enforceEStop = (outputsForcedSafe: string[]): boolean => {
     const eStopTag = resolveEStopTag(project, input.eStopTagName);
-    const tripped = Boolean(eStopTag && eStopTag.currentValue === false);
+    const tripped = Boolean(
+      eStopTag &&
+        (eStopTag.currentValue === false || eStopTag.currentValue === 0 || eStopTag.currentValue === '0')
+    );
     if (tripped && input.enforceEStopSafeState !== false) {
       for (const tag of Object.values(project.tags)) {
         if (tag.requiresInterlock && tag.access !== 'RO') {
-          const safeVal = tag.dataType === 'BOOL' ? false : tag.safeMin ?? 0;
+          const safeVal =
+            tag.dataType === 'BOOL' ? false : tag.dataType === 'STRING' ? '' : (tag.safeMin ?? 0);
           if (tag.currentValue !== safeVal) {
             tag.currentValue = safeVal;
-            tag.updatedAt = new Date().toISOString();
+            tag.updatedAt = new Date(simState.simTimeMs).toISOString();
             if (!outputsForcedSafe.includes(tag.name)) {
               outputsForcedSafe.push(tag.name);
             }
@@ -351,7 +532,15 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
     return tripped;
   };
 
+  // Snapshot previousValue before Step 1 injections
+  for (const tag of Object.values(project.tags)) {
+    if (tag.previousValue === undefined) {
+      tag.previousValue = tag.currentValue;
+    }
+  }
+
   for (let s = 1; s <= steps; s++) {
+    simState.simTimeMs += scanIntervalMs;
     const scriptErrors: string[] = s === 1 ? [...preCompileErrors] : [];
     const executedPous: string[] = [];
     const executedScripts: string[] = [];
@@ -364,19 +553,19 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
         tag.previousValue = tag.currentValue;
         tag.currentValue = tag.scaling ? applyLinearScaling(rawVal, tag.scaling) : rawVal;
         tag.quality = 'SIMULATED';
-        tag.updatedAt = new Date().toISOString();
+        tag.updatedAt = new Date(simState.simTimeMs).toISOString();
       }
     }
 
-    // 2. Apply direct tag injections on step 1
+    // 2. Apply direct tag injections on step 1 with type coercion
     if (s === 1 && input.injectTagValues) {
       for (const [tagName, val] of Object.entries(input.injectTagValues)) {
         const tag = hasOwnTag(tagName) ? project.tags[tagName] : undefined;
         if (!tag) continue;
         tag.previousValue = tag.currentValue;
-        tag.currentValue = val;
+        tag.currentValue = coerceTagWriteValue(tag, val);
         tag.quality = 'SIMULATED';
-        tag.updatedAt = new Date().toISOString();
+        tag.updatedAt = new Date(simState.simTimeMs).toISOString();
       }
     }
 
@@ -394,10 +583,24 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
       }
     }
 
-    // 5. Execute validated Haiwell JS scripts (CYCLIC every scan, TAG_CHANGE when triggerTag changed)
+    // 5. Execute validated Haiwell JS scripts (STARTUP, CYCLIC with intervalMs accumulator, TAG_CHANGE)
     for (const scr of compiledScripts) {
-      let shouldRun = scr.trigger === 'CYCLIC';
-      if (scr.trigger === 'TAG_CHANGE' && scr.triggerTag && hasOwnTag(scr.triggerTag)) {
+      let shouldRun = false;
+      if (scr.trigger === 'STARTUP') {
+        if (s === 1 && !simState.startupRan.has(scr.name)) {
+          shouldRun = true;
+          simState.startupRan.add(scr.name);
+        }
+      } else if (scr.trigger === 'CYCLIC') {
+        const targetMs = scr.intervalMs ?? scanIntervalMs;
+        const accum = (simState.cyclicAccumMs.get(scr.name) ?? 0) + scanIntervalMs;
+        if (accum >= targetMs) {
+          shouldRun = true;
+          simState.cyclicAccumMs.set(scr.name, accum % targetMs);
+        } else {
+          simState.cyclicAccumMs.set(scr.name, accum);
+        }
+      } else if (scr.trigger === 'TAG_CHANGE' && scr.triggerTag && hasOwnTag(scr.triggerTag)) {
         const t = project.tags[scr.triggerTag];
         shouldRun = t.previousValue !== undefined && t.previousValue !== t.currentValue;
       }
@@ -410,10 +613,13 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
       }
     }
 
-    // 6. Evaluate declarative Haiwell Event Triggers
+    // 6. Re-evaluate E-Stop before Event Triggers, then evaluate declarative Haiwell Event Triggers
+    eStopTripped = enforceEStop(outputsForcedSafe);
     const triggeredEvents: string[] = [];
     for (const rule of project.eventTriggers) {
       if (!rule.enabled) continue;
+      const mode = (rule as { executionMode?: string }).executionMode;
+      if (mode === 'ONCE' && simState.firedOnceEvents.has(rule.id)) continue;
       const src = hasOwnTag(rule.sourceTag) ? project.tags[rule.sourceTag] : undefined;
       if (!src) continue;
       const cur = toNumeric(src.currentValue);
@@ -427,12 +633,35 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
         cur === (rule.threshold ?? 0);
 
       if (fired) {
+        if (mode === 'ONCE') simState.firedOnceEvents.add(rule.id);
         triggeredEvents.push(`${rule.id}:${rule.actionType}->${rule.targetId}`);
         if (rule.actionType === 'WRITE_TAG' && rule.actionValue !== undefined) {
           const targetTag = hasOwnTag(rule.targetId) ? project.tags[rule.targetId] : undefined;
           if (targetTag && targetTag.access !== 'RO' && !eStopTripped) {
-            targetTag.currentValue = rule.actionValue;
-            targetTag.updatedAt = new Date().toISOString();
+            targetTag.currentValue = coerceTagWriteValue(targetTag, rule.actionValue);
+            targetTag.updatedAt = new Date(simState.simTimeMs).toISOString();
+          }
+        } else if (rule.actionType === 'RUN_SCRIPT' && !eStopTripped) {
+          const targetScript = compiledScriptByName.get(rule.targetId);
+          if (targetScript) {
+            try {
+              targetScript.runInContext(vmContext, { timeout: 250 });
+              executedScripts.push(rule.targetId);
+            } catch (err) {
+              scriptErrors.push(`Event script "${rule.targetId}" runtime error: ${(err as Error).message}`);
+            }
+          }
+        } else if (rule.actionType === 'DOWNLOAD_RECIPE' && !eStopTripped) {
+          const recipe = project.recipes.find((r) => r.id === rule.targetId || r.name === rule.targetId);
+          const rec = recipe?.records[0];
+          if (rec) {
+            for (const [k, v] of Object.entries(rec.values)) {
+              const targetTag = hasOwnTag(k) ? project.tags[k] : undefined;
+              if (targetTag && targetTag.access !== 'RO') {
+                targetTag.currentValue = coerceTagWriteValue(targetTag, v);
+                targetTag.updatedAt = new Date(simState.simTimeMs).toISOString();
+              }
+            }
           }
         }
       }
@@ -441,8 +670,24 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
     // 7. Post-logic E-Stop enforcement (safety relay always overrides software logic!)
     eStopTripped = enforceEStop(outputsForcedSafe);
 
-    // 8. Evaluate ISA-18.2 alarms
-    const almSummary = evaluateProjectAlarms(project);
+    // 8. Evaluate ISA-18.2 alarms (and run ALARM_EVENT scripts if newly triggered)
+    const almSummary = evaluateProjectAlarms(project, {
+      simTimeMs: simState.simTimeMs,
+      scanIntervalMs,
+      delayState: simState.delayState,
+    });
+    if (almSummary.newlyTriggered.length > 0) {
+      for (const scr of compiledScripts) {
+        if (scr.trigger !== 'ALARM_EVENT') continue;
+        try {
+          scr.script.runInContext(vmContext, { timeout: 250 });
+          executedScripts.push(scr.name);
+        } catch (err) {
+          scriptErrors.push(`Script "${scr.name}" runtime error: ${(err as Error).message}`);
+        }
+      }
+      eStopTripped = enforceEStop(outputsForcedSafe);
+    }
 
     const tagsSnapshot: Record<string, number | boolean | string> = Object.fromEntries(
       Object.values(project.tags).map((t) => [t.name, t.currentValue])

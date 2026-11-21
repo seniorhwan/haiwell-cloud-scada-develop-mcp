@@ -248,7 +248,17 @@ export function parseHaiwellRegister(address: string): ParsedHaiwellAddress | In
 
   const modbusOffset0Based = spec.modbusDecBase + index;
   const modbusHexAddress = `0x${modbusOffset0Based.toString(16).toUpperCase().padStart(4, '0')}`;
-  const modbusAddress1Based = spec.oneBasedPrefix + modbusOffset0Based;
+  const effective1BasedPrefix =
+    modbusOffset0Based >= 9999
+      ? spec.oneBasedPrefix === 1
+        ? 1
+        : spec.oneBasedPrefix === 10001
+          ? 100001
+          : spec.oneBasedPrefix === 30001
+            ? 300001
+            : 400001
+      : spec.oneBasedPrefix;
+  const modbusAddress1Based = effective1BasedPrefix + modbusOffset0Based;
   const effectiveKind: 'BIT' | 'WORD' = bitOffset !== undefined ? 'BIT' : spec.kind;
 
   let iecDirectAddress: string;
@@ -257,19 +267,24 @@ export function parseHaiwellRegister(address: string): ParsedHaiwellAddress | In
   else if (area === 'AI') {
     iecDirectAddress =
       bitOffset !== undefined
-        ? `%IX${index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`
+        ? `%IX${1024 + index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`
         : `%IW${index}`;
   } else if (area === 'AQ') {
     iecDirectAddress =
       bitOffset !== undefined
-        ? `%QX${index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`
+        ? `%QX${1024 + index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`
         : `%QW${index}`;
+  } else if (area === 'V') {
+    iecDirectAddress =
+      bitOffset !== undefined
+        ? `%MX${index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`
+        : `%MW${index}`;
   } else if (bitOffset !== undefined) {
-    iecDirectAddress = `%MX${index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`;
+    iecDirectAddress = `%MX${modbusOffset0Based * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`;
   } else if (effectiveKind === 'BIT') {
-    iecDirectAddress = `%MX${Math.floor(index / 8)}.${index % 8}`;
+    iecDirectAddress = `%MX${modbusOffset0Based}`;
   } else {
-    iecDirectAddress = `%MW${index}`;
+    iecDirectAddress = `%MW${modbusOffset0Based}`;
   }
 
   return {

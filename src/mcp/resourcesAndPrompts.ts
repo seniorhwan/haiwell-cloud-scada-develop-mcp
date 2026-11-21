@@ -334,7 +334,13 @@ export function readHaiwellResource(uri: string, store: HaiwellProjectStore): { 
     if (section === 'opcua-nodeset2') return { mimeType: 'application/xml', text: generateOpcUaNodeSet2Xml(project) };
     if (section === 'safety-audit') return { mimeType: 'application/json', text: JSON.stringify(runProjectSafetyAudit(project), null, 2) };
     if (section === 'export-bundle') return { mimeType: 'application/json', text: JSON.stringify(buildProjectExportBundle(project), null, 2) };
-    if (section === 'tags-csv') return { mimeType: 'text/csv', text: buildProjectExportBundle(project).artifacts['tags.csv'] };
+    if (section === 'tags-csv') {
+      const bundle = buildProjectExportBundle(project);
+      return {
+        mimeType: 'text/csv',
+        text: bundle.artifacts['haiwell_variables_import.csv'] ?? bundle.artifacts['tags.csv'],
+      };
+    }
   }
 
   throw new Error(`Unknown MCP resource URI: "${uri}".`);

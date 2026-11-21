@@ -42,7 +42,7 @@ test('Project properties match real Haiwell HMI B7H 1024x600 Enable network proj
   assert.ok(typeof artifacts['haiwell_variables_import.csv'] === 'string');
   assert.match(
     artifacts['haiwell_variables_import.csv'] as string,
-    /Variable name,Register type,Address format,Register address,Address length,Data type,The mode of reading and writing/
+    /Variable name,Register type,Address format,Register address,Address length,Data type,Read-write mode,Acquisition frequency,Always Collect/
   );
   assert.ok(artifacts['project.hwdev.manifest.json']);
 });
@@ -723,7 +723,7 @@ test('v2.4.0: haiwell_open_project_bridge_export compiles full 5-section open-.h
   const x0Row = data.plan.variables.find((v) => v.gridRow['Variable name'] === 'X0_Sensor')!.gridRow;
   assert.equal(x0Row['Register type'], '1X(Digital input,Function code 02)');
   assert.equal(x0Row['Register address'], '13312');
-  assert.equal(x0Row['The mode of reading and writing'], 'Read only');
+  assert.equal(x0Row['Read-write mode'], 'Read only');
 
   // Verify exact Event selection modal labels
   assert.equal(data.plan.events[0].modalTitle, 'Event selection');
@@ -785,17 +785,17 @@ test('v2.6.0: Official Haiwell documentation parity — zero guessed graphics it
     graphicsLibraryMetadata: Record<string, { requiresLiveCatalogCalibration: boolean }>;
   };
   assert.equal(catData.graphicsLibraryCategories['Lamp'].length, 0);
-  assert.equal(catData.graphicsLibraryCategories['Valve'].length, 0);
-  assert.equal(catData.graphicsLibraryCategories['Trace·Pipe'].length, 0);
+  assert.ok(catData.graphicsLibraryCategories['Valve'].includes('Valve1'));
+  assert.ok(catData.graphicsLibraryCategories['Trace·Pipe'].includes('Pipe 1'));
   assert.equal(catData.graphicsLibraryMetadata['Lamp'].requiresLiveCatalogCalibration, true);
-  assert.equal(catData.graphicsLibraryMetadata['Valve'].requiresLiveCatalogCalibration, true);
-  assert.equal(catData.graphicsLibraryMetadata['Trace·Pipe'].requiresLiveCatalogCalibration, true);
-  assert.ok(catData.graphicsLibraryCategories['Switch'].includes('Switch 1'));
+  assert.equal(catData.graphicsLibraryMetadata['Valve'].requiresLiveCatalogCalibration, false);
+  assert.equal(catData.graphicsLibraryMetadata['Trace·Pipe'].requiresLiveCatalogCalibration, false);
+  assert.ok(catData.graphicsLibraryCategories['Switch'].includes('Switch1'));
   for (const verifiedCtrl of [
-    'Alarm table-new',
+    'New alarm table',
     'Marquee',
-    'Camera display',
-    'Historical data view report',
+    'Camera View',
+    'Historical data report table',
     'Information scan code input box',
   ]) {
     assert.ok(

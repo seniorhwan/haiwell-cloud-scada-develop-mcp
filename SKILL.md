@@ -1,6 +1,6 @@
 ---
 name: haiwell-cloud-scada-develop
-description: Zero-UI, production-grade headless Model Context Protocol (MCP 2025-03-26) server for Haiwell Cloud SCADA Develop. Exposes 47 strictly validated tools across 15 domains for AI agents in VS Code, Google Antigravity, Claude Code, and Codex.
+description: Zero-UI, production-grade headless Model Context Protocol (MCP 2025-03-26) server for Haiwell Cloud SCADA Develop. Exposes 61 strictly validated tools across 15 domains for AI agents in VS Code, Google Antigravity, Claude Code, and Codex.
 transports:
   - streamable-http: POST http://localhost:3000/mcp
   - stdio: npx tsx src/mcp/stdio.ts
@@ -20,5 +20,5 @@ transports:
 2. **Validate multi-vendor PLC addresses**: call `haiwell_device_validate_address` with the target device's protocol (Haiwell, Modbus, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, BACnet) before creating tags. Never overlap 32-bit/64-bit register word spans.
 3. **Dry-run physical control writes**: call `haiwell_tag_read_write` or `haiwell_tag_batch_io` with `dryRun: true` first. Interlocked `SIL2`/`SIL3` outputs require `confirmSafetyOverride: true` and an audit `reason`.
 4. **Gate PLC logic on IEC 61131-3 validation**: resolve all `ERROR` diagnostics from `haiwell_iec61131_validate` before `haiwell_iec61131_pou_save`.
-5. **Never drag-and-drop raw HMI pixels**: inspect `haiwell_hmi_toolbox_catalog`, compile process layouts via `haiwell_hmi_pid_compile` or `haiwell_hmi_screen_generate`, auto-repair edits via `haiwell_hmi_layout_solve`, verify `valid: true` + ASCII map via `haiwell_hmi_spatial_verify`, and export native manifest + closed-loop Windows UIA Property-Grid script via `haiwell_hmi_desktop_bridge_export`.
+5. **Never drag-and-drop raw HMI pixels**: inspect `haiwell_hmi_toolbox_catalog`, compile process layouts via `haiwell_hmi_pid_compile` or `haiwell_hmi_screen_generate`, auto-repair edits via `haiwell_hmi_layout_solve`, verify `valid: true` + ASCII map via `haiwell_hmi_spatial_verify`, calibrate live WinForms selectors once via `haiwell_desktop_uia_calibrate`, and export native `haiwell_variables_import.csv` (`haiwell_project_export`) + UIA bridges via `haiwell_hmi_desktop_bridge_export` / `haiwell_open_project_bridge_export`.
 6. **Run FAT simulation + safety audit**: run `haiwell_simulation_step` (verify E-Stop fail-safe de-energization) and `haiwell_project_audit_safety` (`deploymentReady: true`) before `haiwell_project_export`.

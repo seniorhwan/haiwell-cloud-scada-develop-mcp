@@ -71,15 +71,26 @@ export function validateHmiScreen(
   const isa101Notices: string[] = [];
 
   const isTouchPanel = Boolean(options.targetHardware?.startsWith('CLOUD_HMI_'));
+  const hasOwnTag = (name: string) => Object.prototype.hasOwnProperty.call(knownTags, name);
+  const seenWidgetIds = new Set<string>();
+  const widgetIdSet = new Set<string>(screen.widgets.map((w) => w.id));
 
   for (const w of screen.widgets) {
-    if (w.x < 0 || w.y < 0 || w.x + w.width > screen.width || w.y + w.height > screen.height) {
+    if (seenWidgetIds.has(w.id)) {
+      isa101Notices.push(`Duplicate widget ID "${w.id}" detected on screen "${screen.id}".`);
+    }
+    seenWidgetIds.add(w.id);
+
+    if (w.width <= 0 || w.height <= 0 || w.x < 0 || w.y < 0 || w.x + w.width > screen.width || w.y + w.height > screen.height) {
       outOfBounds.push(w.id);
     }
-    if (w.tagName && !knownTags[w.tagName]) {
+    if (w.min !== undefined && w.max !== undefined && w.min > w.max) {
+      isa101Notices.push(`Widget "${w.id}" has inverted range (min=${w.min} > max=${w.max}).`);
+    }
+    if (w.tagName && !hasOwnTag(w.tagName)) {
       unresolvedTags.push(`${w.id}->${w.tagName}`);
     }
-    if (w.writeEnabled && w.tagName && knownTags[w.tagName]?.access === 'RO') {
+    if (w.writeEnabled && w.tagName && hasOwnTag(w.tagName) && knownTags[w.tagName]?.access === 'RO') {
       isa101Notices.push(`Widget "${w.id}" enables write on read-only tag "${w.tagName}".`);
     }
     if (w.targetScreenId && options.knownScreenIds && !options.knownScreenIds.has(w.targetScreenId)) {
@@ -87,6 +98,18 @@ export function validateHmiScreen(
     }
     if (isTouchPanel && (INTERACTIVE_WIDGET_TYPES.has(w.type) || w.writeEnabled) && (w.width < 44 || w.height < 44)) {
       touchTargetViolations.push(`${w.id} (${w.width}x${w.height}px < 44x44px minimum touch target)`);
+    }
+  }
+
+  for (const pipe of screen.pipes ?? []) {
+    if (pipe.flowTagName && !hasOwnTag(pipe.flowTagName)) {
+      unresolvedTags.push(`${pipe.id}->${pipe.flowTagName}`);
+    }
+    if (!widgetIdSet.has(pipe.fromWidgetId)) {
+      brokenNavTargets.push(`${pipe.id}.from->${pipe.fromWidgetId}`);
+    }
+    if (!widgetIdSet.has(pipe.toWidgetId)) {
+      brokenNavTargets.push(`${pipe.id}.to->${pipe.toWidgetId}`);
     }
   }
 
@@ -153,12 +176,16 @@ export function generateAutoLayoutScreen(spec: AutoLayoutSpec): HmiScreen {
 export function generateAutoLayoutScreenDetailed(spec: AutoLayoutSpec): AutoLayoutResult {
   const pad = 20;
   const gap = 14;
-  const cols = Math.max(1, Math.min(spec.columns ?? 4, 8));
+  const usableWidth = spec.width - pad * 2;
+  let cols = Math.max(1, Math.min(spec.columns ?? 4, 8));
+  while (cols > 1 && Math.floor((usableWidth - gap * (cols - 1)) / cols) < 48) {
+    cols--;
+  }
   const widgets: HmiWidget[] = [];
   const overflowWidgets: string[] = [];
 
   let topOffset = pad;
-  const bottomReserve = spec.includeNavBar ? 60 : 0;
+  const bottomReserve = spec.includeNavBar ? 44 + pad + gap : 0;
 
   if (spec.includeAlarmBanner !== false) {
     widgets.push({
@@ -204,7 +231,6 @@ export function generateAutoLayoutScreenDetailed(spec: AutoLayoutSpec): AutoLayo
     }
   });
 
-  const usableWidth = spec.width - pad * 2;
   const colWidth = Math.floor((usableWidth - gap * (cols - 1)) / cols);
   const availableHeight = spec.height - topOffset - bottomReserve - pad;
   const computedRowHeight =
@@ -248,7 +274,7 @@ export function generateAutoLayoutScreenDetailed(spec: AutoLayoutSpec): AutoLayo
       type: 'NAV_BAR',
       label: 'Screen Navigation',
       x: pad,
-      y: spec.height - 44 - pad / 2,
+      y: spec.height - 44 - pad,
       width: spec.width - pad * 2,
       height: 44,
     });
@@ -317,18 +343,20 @@ export function renderScreenToSvg(
   screen: HmiScreen,
   tags: Record<string, TagDefinition>
 ): string {
+  const hasOwnTag = (name: string) => Object.prototype.hasOwnProperty.call(tags, name);
   const pipeElements = (screen.pipes ?? []).map((p) => {
     const pts = p.waypoints.map((pt) => `${pt.x},${pt.y}`).join(' ');
     const stroke = PIPE_FLUID_COLOR[p.fluid] ?? '#334155';
     const mid = p.waypoints[Math.floor(p.waypoints.length / 2)] ?? p.waypoints[0];
-    const flowTag = p.flowTagName ? tags[p.flowTagName] : undefined;
+    const flowTag = p.flowTagName && hasOwnTag(p.flowTagName) ? tags[p.flowTagName] : undefined;
     const labelText = p.label ?? (flowTag ? `${p.flowTagName}: ${flowTag.currentValue}${flowTag.unit ? ' ' + flowTag.unit : ''}` : '');
+    const boxW = Math.max(84, labelText.length * 6 + 12);
     return [
       `  <g id="${escapeXml(p.id)}" data-type="PIPELINE" data-from="${escapeXml(p.fromWidgetId)}" data-to="${escapeXml(p.toWidgetId)}" data-fluid="${escapeXml(p.fluid)}">`,
       `    <polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linejoin="round" marker-end="url(#pid-arrow)" />`,
       ...(labelText && mid
         ? [
-            `    <rect x="${mid.x - 42}" y="${mid.y - 16}" width="84" height="16" rx="2" fill="#FFFFFF" fill-opacity="0.92" stroke="#CBD5E1" stroke-width="0.75" />`,
+            `    <rect x="${mid.x - Math.round(boxW / 2)}" y="${mid.y - 16}" width="${boxW}" height="16" rx="2" fill="#FFFFFF" fill-opacity="0.92" stroke="#CBD5E1" stroke-width="0.75" />`,
             `    <text x="${mid.x}" y="${mid.y - 5}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="#0F172A">${escapeXml(labelText)}</text>`,
           ]
         : []),
@@ -337,7 +365,7 @@ export function renderScreenToSvg(
   });
 
   const elements = screen.widgets.map((w) => {
-    const tag = w.tagName ? tags[w.tagName] : undefined;
+    const tag = w.tagName && hasOwnTag(w.tagName) ? tags[w.tagName] : undefined;
     const valueText = tag !== undefined ? String(tag.currentValue) : '--';
     const fill =
       w.type === 'ALARM_BANNER'
