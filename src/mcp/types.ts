@@ -12,6 +12,12 @@ export type HaiwellTargetHardware =
   | 'CLOUD_HMI_B7H'
   | 'CLOUD_HMI_B10'
   | 'CLOUD_HMI_A8'
+  | 'CLOUD_HMI_A7_PRO'
+  | 'CLOUD_HMI_A10_PRO'
+  | 'CLOUD_HMI_A15_PRO'
+  | 'CLOUD_HMI_D7_PRO'
+  | 'CLOUD_HMI_D10_PRO'
+  | 'CLOUD_HMI_D15_PRO'
   | 'CLOUD_BOX_CBOX'
   | 'IPC_SCADA';
 

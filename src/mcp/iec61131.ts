@@ -6,6 +6,7 @@
  * and FBD algebraic-loop cycle detection.
  */
 
+import * as acorn from 'acorn';
 import type { Iec61131Diagnostic } from './types';
 
 export const IEC_ELEMENTARY_TYPES = new Set([
@@ -48,6 +49,7 @@ export interface DeclaredVariable {
   name: string;
   dataType: string;
   isArray?: boolean;
+  initialValue?: string;
   section: 'VAR' | 'VAR_INPUT' | 'VAR_OUTPUT' | 'VAR_IN_OUT' | 'VAR_GLOBAL' | 'VAR_TEMP';
   constant: boolean;
   directAddress?: string;
@@ -191,9 +193,74 @@ interface LogicalStatement {
 }
 
 /**
- * Splits cleaned ST body lines into logical statements so single-line
- * "IF a THEN b := 1; END_IF;" and multi-statement lines "a := 1; b := 2;"
- * and multi-line "IF a AND\n b THEN" are all analyzed accurately!
+ * Quote-aware string masking: replaces IEC single-quoted ('...') and double-quoted ("...")
+ * string literals with tokens so statement/VAR splitting never splits inside quotes.
+ */
+function maskIecStrings(input: string): { masked: string; literals: string[] } {
+  const literals: string[] = [];
+  let masked = '';
+  let i = 0;
+  while (i < input.length) {
+    const ch = input[i];
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      let lit = ch;
+      i++;
+      while (i < input.length) {
+        const c = input[i];
+        lit += c;
+        if (c === '$' && i + 1 < input.length) {
+          i++;
+          lit += input[i];
+        } else if (c === quote) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      const idx = literals.push(lit) - 1;
+      masked += `__IECSTR_${idx}__`;
+    } else {
+      masked += ch;
+      i++;
+    }
+  }
+  return { masked, literals };
+}
+
+function unmaskIecStrings(masked: string, literals: string[]): string {
+  return masked.replace(/__IECSTR_(\d+)__/g, (_, idx) => literals[Number(idx)] ?? '');
+}
+
+/**
+ * Parses an IEC 61131-3 duration literal such as T#2s, TIME#500ms, T#1m30s, T#1h2m3s4ms
+ * into integer milliseconds.
+ */
+function parseIecTimeLiteralMs(literal: string): number {
+  const body = literal.replace(/^(?:TIME|T)#/i, '').trim();
+  const unitFactors: Record<string, number> = {
+    d: 86_400_000,
+    h: 3_600_000,
+    m: 60_000,
+    s: 1000,
+    ms: 1,
+  };
+  let total = 0;
+  const re = /(\d+(?:\.\d+)?)\s*(ms|d|h|m|s)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    const num = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    if (Number.isFinite(num) && unitFactors[unit]) {
+      total += num * unitFactors[unit];
+    }
+  }
+  return Math.round(total);
+}
+
+/**
+ * Splits cleaned ST body lines into logical statements cleanly OUTSIDE string literals
+ * so single-line "IF a THEN b := 1; END_IF;" and strings like `'a; b THEN c'` both work!
  */
 function expandBodyStatements(lines: { text: string; line: number }[]): LogicalStatement[] {
   const result: LogicalStatement[] = [];
@@ -201,19 +268,18 @@ function expandBodyStatements(lines: { text: string; line: number }[]): LogicalS
   let bufferLine = 0;
 
   const flushLine = (raw: string, line: number) => {
-    // Expand inline IF ... THEN <stmt>; END_IF; cleanly
-    let segment = raw.trim();
+    const segment = raw.trim();
     if (!segment) return;
 
-    // Split on keyword boundaries that begin/end blocks on the same line
-    const expanded = segment
+    const { masked, literals } = maskIecStrings(segment);
+    const expanded = masked
       .replace(/\bTHEN\b\s+(?=\S)/gi, 'THEN\n')
       .replace(/\bDO\b\s+(?=\S)/gi, 'DO\n')
       .replace(/;\s*(?=\S)/g, ';\n')
       .replace(/\bELSE\b\s+(?=\S)/gi, 'ELSE\n');
 
     for (const part of expanded.split('\n')) {
-      const p = part.trim();
+      const p = unmaskIecStrings(part, literals).trim();
       if (p) result.push({ text: p, line });
     }
   };
@@ -225,11 +291,12 @@ function expandBodyStatements(lines: { text: string; line: number }[]): LogicalS
     if (!buffer) bufferLine = item.line;
     buffer = buffer ? `${buffer} ${t}` : t;
 
+    const { masked } = maskIecStrings(buffer);
     const complete =
-      buffer.endsWith(';') ||
-      /^UNTIL\b/i.test(buffer) ||
-      /\b(THEN|DO|ELSE|OF|REPEAT|END_IF|END_CASE|END_FOR|END_WHILE|END_REPEAT|END_PROGRAM|END_FUNCTION_BLOCK|END_FUNCTION)\s*;?$/i.test(buffer) ||
-      /^[0-9,\s.-]+:\s*$/.test(buffer);
+      masked.endsWith(';') ||
+      /^UNTIL\b/i.test(masked) ||
+      /\b(THEN|DO|ELSE|OF|REPEAT|END_IF|END_CASE|END_FOR|END_WHILE|END_REPEAT|END_PROGRAM|END_FUNCTION_BLOCK|END_FUNCTION)\s*;?$/i.test(masked) ||
+      /^[0-9,\s.-]+:\s*$/.test(masked);
 
     if (complete) {
       flushLine(buffer, bufferLine);
@@ -285,18 +352,20 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
 
   const cleaned = stripCommentsPreserveLines(source);
   const rawLines = cleaned.split(/\r?\n/);
-  // Normalize single-line VAR blocks (e.g., "VAR A : INT; B : INT; END_VAR") while preserving original line numbers
+  // Normalize single-line VAR blocks (e.g., "VAR A : INT; B : INT; END_VAR") outside string literals
   const numberedLines: { text: string; lineNum: number }[] = [];
   rawLines.forEach((rawLine, idx) => {
     const lineNum = idx + 1;
     const t = rawLine.trim();
     if (/^(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_TEMP|VAR)(?:\s+(?:CONSTANT|RETAIN|PERSISTENT))*\s+\S/i.test(t)) {
-      const expanded = t
+      const { masked, literals } = maskIecStrings(t);
+      const expanded = masked
         .replace(/^(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_TEMP|VAR(?:\s+(?:CONSTANT|RETAIN|PERSISTENT))*)\s+/i, '$1\n')
         .replace(/;\s*(?=\S)/g, ';\n')
         .replace(/\s+(END_VAR)\b/gi, '\n$1');
       for (const part of expanded.split('\n')) {
-        if (part.trim()) numberedLines.push({ text: part.trim(), lineNum });
+        const restored = unmaskIecStrings(part, literals).trim();
+        if (restored) numberedLines.push({ text: restored, lineNum });
       }
     } else {
       numberedLines.push({ text: rawLine, lineNum });
@@ -381,10 +450,11 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
     }
 
     if (inVarSection) {
-      // Support scalar, STRING[N]/STRING(N), and ARRAY[lo..hi] OF TYPE
+      // Quote-aware VAR declaration supporting comma-separated names (A, B : INT := 5;), STRING[N], ARRAY[lo..hi] OF TYPE, and string initializers containing `;`
+      const { masked: maskedDecl, literals: declLiterals } = maskIecStrings(trimmed);
       const declMatch =
-        /^([A-Za-z_][A-Za-z0-9_]*)(?:\s+AT\s+(%[A-Za-z0-9_.]+))?\s*:\s*(?:(ARRAY\s*\[\s*-?\d+\s*\.\.\s*-?\d+\s*\]\s*OF\s+))?([A-Za-z_][A-Za-z0-9_]*)(?:\s*[\[(]\s*\d+\s*[\])])?(?:\s*:=\s*([^;]+))?\s*(;)?$/i.exec(
-          trimmed
+        /^([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)(?:\s+AT\s+(%[A-Za-z0-9_.]+))?\s*:\s*(?:(ARRAY\s*\[\s*-?\d+\s*\.\.\s*-?\d+\s*\]\s*OF\s+))?([A-Za-z_][A-Za-z0-9_]*)(?:\s*[\[(]\s*\d+\s*[\])])?(?:\s*:=\s*([^;]+))?\s*(;)?$/i.exec(
+          maskedDecl
         );
       if (!declMatch) {
         diagnostics.push({
@@ -394,13 +464,16 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
           column: 1,
           rule: 'IEC 61131-3 §6.5.2 Variable Declaration Syntax',
           message: `Malformed variable declaration: "${trimmed}".`,
-          fixHint: 'Use syntax "VarName [AT %MW0] : [ARRAY[0..9] OF] TYPE [:= InitialValue];".',
+          fixHint: 'Use syntax "VarName [, Var2] [AT %MW0] : [ARRAY[0..9] OF] TYPE [:= InitialValue];".',
         });
         continue;
       }
 
-      const [, name, directAddr, arrayPrefix, rawType, , semicolon] = declMatch;
+      const [, rawNames, directAddr, arrayPrefix, rawType, rawInit, semicolon] = declMatch;
+      const names = rawNames.split(',').map((s) => s.trim()).filter(Boolean);
       const dataType = rawType.toUpperCase();
+      const initialValue = rawInit ? unmaskIecStrings(rawInit.trim(), declLiterals) : undefined;
+
       if (!semicolon) {
         diagnostics.push({
           code: 'IEC-SYN-001',
@@ -408,20 +481,8 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
           line: lineNum,
           column: trimmed.length,
           rule: 'IEC 61131-3 Statement Termination',
-          message: `Missing terminating semicolon ";" on declaration of "${name}".`,
+          message: `Missing terminating semicolon ";" on declaration of "${names.join(', ')}".`,
           fixHint: 'Append ";" at the end of the declaration.',
-        });
-      }
-
-      if (varMap.has(name.toUpperCase())) {
-        diagnostics.push({
-          code: 'IEC-VAR-004',
-          severity: 'ERROR',
-          line: lineNum,
-          column: 1,
-          rule: 'IEC 61131-3 Unique Identifier Scope',
-          message: `Duplicate variable declaration "${name}".`,
-          fixHint: `Rename or remove duplicate declaration of "${name}".`,
         });
       }
 
@@ -441,17 +502,31 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
         validateDirectAddress(directAddr, lineNum, diagnostics);
       }
 
-      const declared: DeclaredVariable = {
-        name,
-        dataType,
-        isArray: Boolean(arrayPrefix),
-        section: inVarSection,
-        constant: currentVarIsConstant,
-        directAddress: directAddr,
-        line: lineNum,
-      };
-      variables.push(declared);
-      varMap.set(name.toUpperCase(), declared);
+      for (const name of names) {
+        if (varMap.has(name.toUpperCase())) {
+          diagnostics.push({
+            code: 'IEC-VAR-004',
+            severity: 'ERROR',
+            line: lineNum,
+            column: 1,
+            rule: 'IEC 61131-3 Unique Identifier Scope',
+            message: `Duplicate variable declaration "${name}".`,
+            fixHint: `Rename or remove duplicate declaration of "${name}".`,
+          });
+        }
+        const declared: DeclaredVariable = {
+          name,
+          dataType,
+          isArray: Boolean(arrayPrefix),
+          initialValue,
+          section: inVarSection,
+          constant: currentVarIsConstant,
+          directAddress: directAddr,
+          line: lineNum,
+        };
+        variables.push(declared);
+        varMap.set(name.toUpperCase(), declared);
+      }
       continue;
     }
 
@@ -1281,9 +1356,17 @@ export function transpileStToHaiwellJs(
     return { success: false, validation };
   }
 
-  const apiStyle = options?.apiStyle ?? 'TAG_API';
+  const apiStyle = options?.apiStyle ?? 'HAIWELL_NATIVE_350';
   const cleaned = stripCommentsPreserveLines(source);
   const rawLines = cleaned.split(/\r?\n/);
+
+  const fbVarTypes = new Map<string, string>();
+  for (const v of validation.variables) {
+    if (IEC_STANDARD_FBS.has(v.dataType)) {
+      fbVarTypes.set(v.name, v.dataType);
+    }
+  }
+  const hasStandardFbs = fbVarTypes.size > 0;
 
   // Strict ES5 output for Haiwell B7H-W ARM Linux Node.js v0.10.41 compatibility
   // (no const/let, no arrow functions, no template literals, no Math.trunc)
@@ -1295,6 +1378,60 @@ export function transpileStToHaiwellJs(
     `function __TRUNC(x) { return x < 0 ? Math.ceil(x) : Math.floor(x); }`,
   ];
 
+  if (hasStandardFbs) {
+    jsLines.push(
+      `var __fbStore = (typeof __fbState !== "undefined" && __fbState) ? __fbState : {};`,
+      `var __scanMs = (typeof __SCAN_MS === "number" && __SCAN_MS > 0) ? __SCAN_MS : 1000;`,
+      `function __getFb(k, def) { if (!__fbStore[k]) __fbStore[k] = def; return __fbStore[k]; }`,
+      `function __FB_TON(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = Number(args.PT || 0); if (args.IN) { s.ET = Math.min(pt, s.ET + __scanMs); s.Q = s.ET >= pt; } else { s.ET = 0; s.Q = false; } return s; }`,
+      `function __FB_TOF(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = Number(args.PT || 0); if (args.IN) { s.Q = true; s.ET = 0; } else if (s.Q) { s.ET = Math.min(pt, s.ET + __scanMs); if (s.ET >= pt) s.Q = false; } return s; }`,
+      `function __FB_TP(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = Number(args.PT || 0); if (args.IN && !s.Q && s.ET === 0) { s.Q = true; s.ET = __scanMs; } else if (s.Q) { s.ET = Math.min(pt, s.ET + __scanMs); if (s.ET >= pt) { s.Q = false; } } else if (!args.IN) { s.ET = 0; } return s; }`,
+      `function __FB_CTU(k, args) { var s = __getFb(k, { Q: false, CV: 0, _prev: false }); var pv = Number(args.PV || 0); if (args.R) { s.CV = 0; } else if (args.CU && !s._prev) { s.CV += 1; } s._prev = Boolean(args.CU); s.Q = s.CV >= pv; return s; }`,
+      `function __FB_CTD(k, args) { var s = __getFb(k, { Q: false, CV: 0, _prev: false }); var pv = Number(args.PV || 0); if (args.LD) { s.CV = pv; } else if (args.CD && !s._prev) { s.CV -= 1; } s._prev = Boolean(args.CD); s.Q = s.CV <= 0; return s; }`,
+      `function __FB_R_TRIG(k, args) { var s = __getFb(k, { Q: false, _prev: false }); s.Q = Boolean(args.CLK) && !s._prev; s._prev = Boolean(args.CLK); return s; }`,
+      `function __FB_F_TRIG(k, args) { var s = __getFb(k, { Q: false, _prev: false }); s.Q = !Boolean(args.CLK) && s._prev; s._prev = Boolean(args.CLK); return s; }`,
+      `function __FB_SR(k, args) { var s = __getFb(k, { Q1: false }); s.Q1 = Boolean(args.S1) || (!Boolean(args.R) && s.Q1); return s; }`,
+      `function __FB_RS(k, args) { var s = __getFb(k, { Q1: false }); s.Q1 = !Boolean(args.R1) && (Boolean(args.S) || s.Q1); return s; }`
+    );
+  }
+
+  const convertExpr = (expr: string): string => {
+    // Preserve string literals while translating IEC operators outside strings
+    const { masked, literals } = maskIecStrings(expr);
+    // Translate IEC duration literals (T#2s, TIME#500ms) into numeric milliseconds
+    let converted = masked.replace(/\b(?:TIME|T)#(?:(?:\d+(?:\.\d+)?(?:ms|d|h|m|s)))+/gi, (lit) =>
+      String(parseIecTimeLiteralMs(lit))
+    );
+    // Translate binary XOR cleanly into Strict ES5 boolean inequality
+    while (/\bXOR\b/i.test(converted)) {
+      converted = converted.replace(
+        /([A-Za-z0-9_.$()]+)\s+\bXOR\b\s+([A-Za-z0-9_.$()]+)/i,
+        '(Boolean($1) !== Boolean($2))'
+      );
+      if (/\bXOR\b/i.test(converted)) {
+        converted = converted.replace(/\bXOR\b/i, '!==');
+      }
+    }
+    converted = converted
+      .replace(/\bAND\b/gi, '&&')
+      .replace(/\bOR\b/gi, '||')
+      .replace(/\bNOT\b/gi, '!')
+      .replace(/\bMOD\b/gi, '%')
+      .replace(/\bTRUE\b/gi, 'true')
+      .replace(/\bFALSE\b/gi, 'false')
+      .replace(/<>/g, '!==')
+      .replace(/(?<![<>!=:])=(?!=)/g, '===')
+      .replace(/\bABS\s*\(/gi, 'Math.abs(')
+      .replace(/\bSQRT\s*\(/gi, 'Math.sqrt(')
+      .replace(/\bMIN\s*\(/gi, 'Math.min(')
+      .replace(/\bMAX\s*\(/gi, 'Math.max(')
+      .replace(/\bLIMIT\s*\(/gi, '__LIMIT(')
+      .replace(/\bSEL\s*\(/gi, '__SEL(')
+      .replace(/\b(?:REAL_TO_INT|REAL_TO_DINT|DINT_TO_INT|REAL_TO_UINT)\s*\(/gi, '__TRUNC(')
+      .replace(/\b(?:INT_TO_REAL|DINT_TO_REAL|UINT_TO_REAL)\s*\(/gi, 'Number(');
+    return unmaskIecStrings(converted, literals);
+  };
+
   const readCall = (scadaTag: string) =>
     apiStyle === 'HAIWELL_NATIVE_350'
       ? `Variable.GetByFullName(${JSON.stringify(scadaTag)})`
@@ -1304,8 +1441,18 @@ export function transpileStToHaiwellJs(
     const scadaTag = tagBindings[v.name] ?? v.name;
     if (v.section === 'VAR_INPUT' || v.section === 'VAR_IN_OUT' || v.section === 'VAR_GLOBAL') {
       jsLines.push(`var ${v.name} = ${readCall(scadaTag)};`);
-    } else if (!IEC_STANDARD_FBS.has(v.dataType)) {
-      const init = v.isArray ? '[]' : v.dataType === 'BOOL' ? 'false' : v.dataType === 'STRING' ? '""' : '0';
+    } else if (IEC_STANDARD_FBS.has(v.dataType)) {
+      jsLines.push(`var ${v.name} = __getFb(${JSON.stringify(`${validation.pouName ?? 'POU'}.${v.name}`)}, { Q: false, Q1: false, ET: 0, CV: 0 });`);
+    } else {
+      const init = v.initialValue
+        ? convertExpr(v.initialValue)
+        : v.isArray
+          ? '[]'
+          : v.dataType === 'BOOL'
+            ? 'false'
+            : v.dataType === 'STRING'
+              ? '""'
+              : '0';
       jsLines.push(`var ${v.name} = ${init};`);
     }
   }
@@ -1313,13 +1460,13 @@ export function transpileStToHaiwellJs(
   let inVar = false;
   const bodyLines: { text: string; line: number }[] = [];
   rawLines.forEach((raw, idx) => {
-    // Normalize single-line VAR ... END_VAR blocks identical to validateStructuredText
-    const expandedSegments = raw
+    const { masked, literals } = maskIecStrings(raw);
+    const expandedSegments = masked
       .replace(/\b(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_TEMP|VAR)\b/gi, '\n$1\n')
       .replace(/\bEND_VAR\b/gi, '\nEND_VAR\n')
       .split('\n');
     for (const seg of expandedSegments) {
-      const t = seg.trim();
+      const t = unmaskIecStrings(seg, literals).trim();
       if (!t) continue;
       if (/^(PROGRAM|FUNCTION_BLOCK|FUNCTION|END_PROGRAM|END_FUNCTION_BLOCK|END_FUNCTION)\b/i.test(t)) continue;
       if (/^(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_TEMP|VAR)\b/i.test(t)) {
@@ -1338,52 +1485,49 @@ export function transpileStToHaiwellJs(
   let indent = 0;
   const pad = () => '  '.repeat(Math.max(0, indent));
 
-  const convertExpr = (expr: string): string => {
-    // Preserve string literals while translating IEC operators outside strings
-    const tokens: string[] = [];
-    const masked = expr.replace(/'(?:[^'$]|\$.)*'|"(?:[^"$]|\$.)*"/g, (lit) => {
-      const idx = tokens.push(lit) - 1;
-      return `__STR_${idx}__`;
-    });
-    const converted = masked
-      .replace(/\bAND\b/gi, '&&')
-      .replace(/\bOR\b/gi, '||')
-      .replace(/\bNOT\b/gi, '!')
-      .replace(/\bMOD\b/gi, '%')
-      .replace(/\bTRUE\b/gi, 'true')
-      .replace(/\bFALSE\b/gi, 'false')
-      .replace(/<>/g, '!==')
-      .replace(/(?<![<>!=:])=(?!=)/g, '===')
-      .replace(/\bABS\s*\(/gi, 'Math.abs(')
-      .replace(/\bSQRT\s*\(/gi, 'Math.sqrt(')
-      .replace(/\bMIN\s*\(/gi, 'Math.min(')
-      .replace(/\bMAX\s*\(/gi, 'Math.max(')
-      .replace(/\bLIMIT\s*\(/gi, '__LIMIT(')
-      .replace(/\bSEL\s*\(/gi, '__SEL(')
-      .replace(/\b(?:REAL_TO_INT|REAL_TO_DINT|DINT_TO_INT|REAL_TO_UINT)\s*\(/gi, '__TRUNC(')
-      .replace(/\b(?:INT_TO_REAL|DINT_TO_REAL|UINT_TO_REAL)\s*\(/gi, 'Number(');
-    return converted.replace(/__STR_(\d+)__/g, (_, idx) => tokens[Number(idx)]);
-  };
+  // Pre-scan which CASE statements contain range labels (`1..5:`) so we emit `if / else if` for those
+  const caseUsesRanges = new Map<number, boolean>();
+  const caseIdxStack: number[] = [];
+  statements.forEach((st, idx) => {
+    if (/^CASE\b/i.test(st.text)) {
+      caseIdxStack.push(idx);
+      caseUsesRanges.set(idx, false);
+    } else if (/^END_CASE\b/i.test(st.text)) {
+      caseIdxStack.pop();
+    } else if (caseIdxStack.length > 0 && /^-?\d[\d,\s.-]*\.\.[\d,\s.-]*:\s*$/.test(st.text)) {
+      caseUsesRanges.set(caseIdxStack[caseIdxStack.length - 1], true);
+    }
+  });
 
   interface TranspileFrame {
     kind: 'IF' | 'CASE' | 'FOR' | 'WHILE' | 'REPEAT';
     caseBranchOpen?: boolean;
+    caseUsesIfElse?: boolean;
+    caseVar?: string;
+    caseBranchCount?: number;
     watchdogVar?: string;
   }
   const blockStack: TranspileFrame[] = [];
   let loopCounter = 0;
+  let caseCounter = 0;
   const topFrame = () => blockStack[blockStack.length - 1];
 
   const closeOpenCaseBranch = () => {
     const top = topFrame();
     if (top && top.kind === 'CASE' && top.caseBranchOpen) {
-      jsLines.push(`${pad()}break;`);
-      indent = Math.max(0, indent - 1);
+      if (top.caseUsesIfElse) {
+        indent = Math.max(0, indent - 1);
+        jsLines.push(`${pad()}}`);
+      } else {
+        jsLines.push(`${pad()}break;`);
+        indent = Math.max(0, indent - 1);
+      }
       top.caseBranchOpen = false;
     }
   };
 
-  for (const stmt of statements) {
+  for (let stmtIdx = 0; stmtIdx < statements.length; stmtIdx++) {
+    const stmt = statements[stmtIdx];
     const t = stmt.text;
     const top = topFrame();
 
@@ -1399,10 +1543,21 @@ export function transpileStToHaiwellJs(
       indent++;
     } else if (/^ELSE\b/i.test(t)) {
       if (top && top.kind === 'CASE') {
-        closeOpenCaseBranch();
-        jsLines.push(`${pad()}default:`);
-        indent++;
-        top.caseBranchOpen = true;
+        if (top.caseUsesIfElse) {
+          if (top.caseBranchOpen) {
+            indent = Math.max(0, indent - 1);
+            jsLines.push(`${pad()}} else {`);
+          } else {
+            jsLines.push(`${pad()}{`);
+          }
+          indent++;
+          top.caseBranchOpen = true;
+        } else {
+          closeOpenCaseBranch();
+          jsLines.push(`${pad()}default:`);
+          indent++;
+          top.caseBranchOpen = true;
+        }
       } else {
         indent = Math.max(0, indent - 1);
         jsLines.push(`${pad()}} else {`);
@@ -1414,20 +1569,50 @@ export function transpileStToHaiwellJs(
       if (top && top.kind === 'IF') blockStack.pop();
     } else if (/^CASE\b/i.test(t)) {
       const sel = t.replace(/^CASE\s+/i, '').replace(/\s+OF$/i, '');
-      jsLines.push(`${pad()}switch (${convertExpr(sel)}) {`);
-      indent++;
-      blockStack.push({ kind: 'CASE', caseBranchOpen: false });
+      const usesRanges = Boolean(caseUsesRanges.get(stmtIdx));
+      if (usesRanges) {
+        const cv = `__case_${++caseCounter}`;
+        jsLines.push(`${pad()}var ${cv} = ${convertExpr(sel)};`);
+        blockStack.push({ kind: 'CASE', caseBranchOpen: false, caseUsesIfElse: true, caseVar: cv, caseBranchCount: 0 });
+      } else {
+        jsLines.push(`${pad()}switch (${convertExpr(sel)}) {`);
+        indent++;
+        blockStack.push({ kind: 'CASE', caseBranchOpen: false, caseUsesIfElse: false });
+      }
     } else if (/^END_CASE\b/i.test(t)) {
       closeOpenCaseBranch();
-      indent = Math.max(0, indent - 1);
-      jsLines.push(`${pad()}}`);
+      if (top && top.kind === 'CASE' && !top.caseUsesIfElse) {
+        indent = Math.max(0, indent - 1);
+        jsLines.push(`${pad()}}`);
+      }
       if (topFrame()?.kind === 'CASE') blockStack.pop();
-    } else if (top && top.kind === 'CASE' && /^(-?\d+(?:\s*,\s*-?\d+)*)\s*:$/.test(t)) {
-      closeOpenCaseBranch();
-      const nums = t.replace(/:$/, '').split(',').map((s) => s.trim());
-      for (const n of nums) jsLines.push(`${pad()}case ${n}:`);
-      indent++;
-      top.caseBranchOpen = true;
+    } else if (
+      top &&
+      top.kind === 'CASE' &&
+      /^(-?\d+(?:\s*\.\.\s*-?\d+)?(?:\s*,\s*-?\d+(?:\s*\.\.\s*-?\d+)?)*)\s*:$/.test(t)
+    ) {
+      const parts = t.replace(/:$/, '').split(',').map((s) => s.trim());
+      if (top.caseUsesIfElse && top.caseVar) {
+        const conds = parts.map((p) => {
+          const rm = /^(-?\d+)\s*\.\.\s*(-?\d+)$/.exec(p);
+          if (rm) return `(${top.caseVar} >= ${rm[1]} && ${top.caseVar} <= ${rm[2]})`;
+          return `(${top.caseVar} === ${p})`;
+        });
+        if (top.caseBranchOpen) {
+          indent = Math.max(0, indent - 1);
+          jsLines.push(`${pad()}} else if (${conds.join(' || ')}) {`);
+        } else {
+          jsLines.push(`${pad()}if (${conds.join(' || ')}) {`);
+        }
+        indent++;
+        top.caseBranchOpen = true;
+        top.caseBranchCount = (top.caseBranchCount ?? 0) + 1;
+      } else {
+        closeOpenCaseBranch();
+        for (const n of parts) jsLines.push(`${pad()}case ${n}:`);
+        indent++;
+        top.caseBranchOpen = true;
+      }
     } else if (/^FOR\b/i.test(t)) {
       const m = /^FOR\s+([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(.+?)\s+TO\s+(.+?)(?:\s+BY\s+(.+?))?\s+DO$/i.exec(t);
       if (m) {
@@ -1479,7 +1664,6 @@ export function transpileStToHaiwellJs(
       jsLines.push(`${pad()}} while (!(${convertExpr(cond)}));`);
       if (top && top.kind === 'REPEAT') blockStack.pop();
     } else if (/^END_REPEAT\b/i.test(t)) {
-      // Closed at UNTIL; pop defensively if UNTIL was absent
       if (top && top.kind === 'REPEAT') {
         indent = Math.max(0, indent - 1);
         jsLines.push(`${pad()}} while (false);`);
@@ -1489,11 +1673,33 @@ export function transpileStToHaiwellJs(
       jsLines.push(`${pad()}break;`);
     } else if (/^RETURN\s*;?$/i.test(t)) {
       jsLines.push(`${pad()}return;`);
-    } else if (t.includes(':=')) {
-      const sep = t.indexOf(':=');
-      const lhs = t.slice(0, sep).trim();
-      const rhs = t.slice(sep + 2).replace(/;$/, '').trim();
-      jsLines.push(`${pad()}${lhs} = ${convertExpr(rhs)};`);
+    } else {
+      // Standard Function Block invocation: e.g., StartDelay(IN := Flag, PT := T#2s);
+      const fbCall = /^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*;?$/.exec(t);
+      if (fbCall && fbVarTypes.has(fbCall[1])) {
+        const fbName = fbCall[1];
+        const fbType = fbVarTypes.get(fbName)!;
+        const rawArgs = fbCall[2].trim();
+        const argPairs: string[] = [];
+        if (rawArgs) {
+          for (const part of rawArgs.split(',')) {
+            const pm = /^([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(.+)$/.exec(part.trim());
+            if (pm) {
+              argPairs.push(`${pm[1].toUpperCase()}: ${convertExpr(pm[2].trim())}`);
+            }
+          }
+        }
+        const helper = `__FB_${fbType}`;
+        const keyLit = JSON.stringify(`${validation.pouName ?? 'POU'}.${fbName}`);
+        if (['TON', 'TOF', 'TP', 'CTU', 'CTD', 'R_TRIG', 'F_TRIG', 'SR', 'RS'].includes(fbType)) {
+          jsLines.push(`${pad()}${fbName} = ${helper}(${keyLit}, { ${argPairs.join(', ')} });`);
+        }
+      } else if (t.includes(':=')) {
+        const sep = t.indexOf(':=');
+        const lhs = t.slice(0, sep).trim();
+        const rhs = t.slice(sep + 2).replace(/;$/, '').trim();
+        jsLines.push(`${pad()}${lhs} = ${convertExpr(rhs)};`);
+      }
     }
   }
 
@@ -1508,9 +1714,29 @@ export function transpileStToHaiwellJs(
     }
   }
 
+  const jsCode = jsLines.join('\n');
+
+  // Strict ES5 output syntax verification gate via Acorn
+  try {
+    acorn.parse(jsCode, { ecmaVersion: 5, allowReturnOutsideFunction: true, sourceType: 'script' });
+  } catch (err) {
+    validation.diagnostics.push({
+      code: 'IEC-TRANSPILE-001',
+      severity: 'ERROR',
+      line: 1,
+      column: 1,
+      rule: 'Strict ES5 Transpiler Output Verification',
+      message: `Transpiled JavaScript failed Strict ES5 Acorn parse verification: ${(err as Error).message}`,
+      fixHint: 'Review unsupported ST syntax constructs before transpiling.',
+    });
+    validation.valid = false;
+    validation.summary.errors += 1;
+    return { success: false, validation };
+  }
+
   return {
     success: true,
-    jsCode: jsLines.join('\n'),
+    jsCode,
     validation,
   };
 }

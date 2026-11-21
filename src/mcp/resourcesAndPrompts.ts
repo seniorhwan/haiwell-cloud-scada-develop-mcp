@@ -4,6 +4,7 @@
  * Claude Code, and OpenAI Codex CLI.
  */
 
+import path from 'node:path';
 import { HAIWELL_REGISTER_MAP } from './haiwellRegisters';
 import { renderScreenToSvg } from './hmiGenerator';
 import { generateOpcUaNodeSet2Xml } from './protocolAdapters';
@@ -74,6 +75,10 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
       'haiwell_shape_library_manage',
       'haiwell_desktop_uia_calibrate',
       'haiwell_hmi_desktop_bridge_export',
+      'haiwell_open_project_bridge_export',
+      'haiwell_desktop_inspect',
+      'haiwell_desktop_launch',
+      'haiwell_desktop_new_project',
     ],
     standards: ['ANSI/ISA-101.01', 'ISA-5.1 P&ID'],
   },
@@ -482,6 +487,8 @@ ${HAIWELL_CAPABILITY_MATRIX.map(
 
 export function generateClientConfigs(baseUrl: string) {
   const mcpUrl = `${baseUrl.replace(/\/$/, '')}/mcp`;
+  const repoDir = process.cwd();
+  const stdioEntryPath = path.resolve(repoDir, 'src/mcp/stdio.ts');
   return {
     vscode: {
       client: 'VS Code (GitHub Copilot / MCP)',
@@ -491,7 +498,12 @@ export function generateClientConfigs(baseUrl: string) {
         {
           servers: {
             'haiwell-cloud-scada': { type: 'http', url: mcpUrl },
-            'haiwell-cloud-scada-local': { type: 'stdio', command: 'npx', args: ['tsx', 'src/mcp/stdio.ts'] },
+            'haiwell-cloud-scada-local': {
+              type: 'stdio',
+              command: 'npx',
+              args: ['tsx', stdioEntryPath],
+              cwd: repoDir,
+            },
           },
         },
         null,
@@ -506,7 +518,11 @@ export function generateClientConfigs(baseUrl: string) {
         {
           mcpServers: {
             'haiwell-cloud-scada': { serverUrl: mcpUrl, transport: 'streamable-http' },
-            'haiwell-cloud-scada-stdio': { command: 'npx', args: ['tsx', 'src/mcp/stdio.ts'] },
+            'haiwell-cloud-scada-stdio': {
+              command: 'npx',
+              args: ['tsx', stdioEntryPath],
+              cwd: repoDir,
+            },
           },
         },
         null,
@@ -522,6 +538,12 @@ export function generateClientConfigs(baseUrl: string) {
         {
           mcpServers: {
             'haiwell-cloud-scada': { type: 'http', url: mcpUrl },
+            'haiwell-cloud-scada-local': {
+              type: 'stdio',
+              command: 'npx',
+              args: ['tsx', stdioEntryPath],
+              cwd: repoDir,
+            },
           },
         },
         null,
@@ -532,7 +554,7 @@ export function generateClientConfigs(baseUrl: string) {
       client: 'OpenAI Codex CLI',
       filename: '~/.codex/config.toml',
       transport: 'Streamable HTTP or stdio',
-      config: `[mcp_servers.haiwell_cloud_scada]\nurl = "${mcpUrl}"\n\n[mcp_servers.haiwell_cloud_scada_local]\ncommand = "npx"\nargs = ["tsx", "src/mcp/stdio.ts"]\n`,
+      config: `[mcp_servers.haiwell_cloud_scada]\nurl = "${mcpUrl}"\n\n[mcp_servers.haiwell_cloud_scada_local]\ncommand = "npx"\nargs = ["tsx", ${JSON.stringify(stdioEntryPath)}]\ncwd = ${JSON.stringify(repoDir)}\n`,
     },
   };
 }

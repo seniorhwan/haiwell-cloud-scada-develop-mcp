@@ -165,8 +165,14 @@ test('Inversion #4: IEC 61131-3 ST transpiler handles IF inside CASE, multi-stat
         outputs[k] = v;
       },
     };
-    const fn = new Function('Tag', res.jsCode!);
-    fn(Tag);
+    const Variable = {
+      GetByFullName: (k: string) => inputs[k],
+      SetByFullName: (k: string, v: unknown) => {
+        outputs[k] = v;
+      },
+    };
+    const fn = new Function('Tag', 'Variable', res.jsCode!);
+    fn(Tag, Variable);
     return outputs;
   };
 

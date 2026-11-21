@@ -6,6 +6,7 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { defaultProjectStore, type HaiwellProjectStore } from './projectStore';
+import { SERVER_VERSION } from './version';
 import {
   buildPromptMessages,
   HAIWELL_PROMPTS,
@@ -43,7 +44,7 @@ export function createHaiwellMcpServer(
   const server = new McpServer(
     {
       name: 'haiwell-cloud-scada-mcp',
-      version: '2.6.0',
+      version: SERVER_VERSION,
     },
     {
       capabilities: {

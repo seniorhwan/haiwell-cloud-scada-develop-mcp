@@ -107,6 +107,15 @@ END_PROGRAM
 `;
   const js = transpileStToHaiwellJs(st, { Supply: 'Supply_Temp_C', Ret: 'Return_Temp_C', DeltaT: 'Plant_DeltaT_C' });
   assert.equal(js.success, true);
-  assert.match(js.jsCode ?? '', /Tag\.Read\("Supply_Temp_C"\)/);
-  assert.match(js.jsCode ?? '', /Tag\.Write\("Plant_DeltaT_C", DeltaT\)/);
+  assert.match(js.jsCode ?? '', /Variable\.GetByFullName\("Supply_Temp_C"\)/);
+  assert.match(js.jsCode ?? '', /Variable\.SetByFullName\("Plant_DeltaT_C", DeltaT\)/);
+
+  const legacyJs = transpileStToHaiwellJs(
+    st,
+    { Supply: 'Supply_Temp_C', Ret: 'Return_Temp_C', DeltaT: 'Plant_DeltaT_C' },
+    { apiStyle: 'TAG_API' }
+  );
+  assert.equal(legacyJs.success, true);
+  assert.match(legacyJs.jsCode ?? '', /Tag\.Read\("Supply_Temp_C"\)/);
+  assert.match(legacyJs.jsCode ?? '', /Tag\.Write\("Plant_DeltaT_C", DeltaT\)/);
 });

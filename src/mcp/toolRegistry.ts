@@ -53,6 +53,11 @@ import {
 } from './protocolAdapters';
 import { validateHaiwellScript } from './scriptAnalyzer';
 import { evaluateProjectAlarms, runSimulationSteps } from './simulationEngine';
+import {
+  createNewHaiwellProjectOnDesktop,
+  inspectHaiwellDesktopInstallation,
+  launchHaiwellDesktop,
+} from './desktopAutomation';
 import type { HaiwellProjectStore } from './projectStore';
 import type { HaiwellDomain, HaiwellProject, PlcDriverProtocol, TagDefinition, ToolSafetyTier } from './types';
 
@@ -258,22 +263,63 @@ export function buildProjectExportBundle(project: HaiwellProject) {
     ].join(',')
   );
 
+  const formatHaiwellRegisterType = (t: TagDefinition): string => {
+    if (t.scope !== 'PLC') return t.scope === 'INTERNAL' ? 'Internal' : t.scope;
+    const addr = (t.address ?? '').trim().toUpperCase();
+    if (/^(1X|X|I|DI)/.test(addr) || (t.modbusAddress1Based && t.modbusAddress1Based >= 10001 && t.modbusAddress1Based < 20000)) {
+      return '1X(Digital input,Function code 02)';
+    }
+    if (/^(0X|Y|Q|M|COIL)/.test(addr) || (t.modbusAddress1Based && t.modbusAddress1Based >= 1 && t.modbusAddress1Based < 10000)) {
+      return '0X(Digital output,Function code 01 05)';
+    }
+    if (/^(3X|AI|IW|PIW)/.test(addr) || (t.modbusAddress1Based && t.modbusAddress1Based >= 30001 && t.modbusAddress1Based < 40000)) {
+      return '3X(Input register,Function code 04)';
+    }
+    return '4X(Holding register,Function code 03 06 16)';
+  };
+  const formatHaiwellDataType = (dt: TagDefinition['dataType']): string => {
+    switch (dt) {
+      case 'BOOL':
+        return 'Bool';
+      case 'INT16':
+        return '16-bit Signed';
+      case 'UINT16':
+        return '16-bit Unsigned';
+      case 'INT32':
+        return '32-bit Signed';
+      case 'UINT32':
+        return '32-bit Unsigned';
+      case 'FLOAT32':
+        return '32-bit Float';
+      case 'FLOAT64':
+        return '64-bit Double';
+      case 'STRING':
+        return 'String';
+      case 'BCD16':
+        return '16-bit BCD';
+      case 'BCD32':
+        return '32-bit BCD';
+    }
+  };
+  const formatHaiwellAccess = (access: TagDefinition['access']): string =>
+    access === 'RO' ? 'Read only' : access === 'WO' ? 'Write only' : 'Read and write';
+
   const haiwellVarHeader =
-    'VariableName,VariableType,DeviceName,RegisterAddress,DataType,ReadWrite,Unit,MinValue,MaxValue,AlwaysCollect,Description';
+    'Variable name,Register type,Address format,Register address,Address length,Data type,The mode of reading and writing,Collect frequency,Always collect,Description';
   const haiwellVarRows = Object.values(project.tags).map((t) => {
-    const devName = t.deviceId
-      ? project.devices.find((d) => d.id === t.deviceId)?.name ?? t.deviceId
-      : '';
+    const rawAddr =
+      t.modbusOffset0Based !== undefined
+        ? String(t.modbusOffset0Based)
+        : (t.address ?? '');
     return [
       escapeCsvCell(t.name, true),
-      escapeCsvCell(t.scope === 'PLC' ? 'Device' : t.scope === 'INTERNAL' ? 'Internal' : t.scope),
-      escapeCsvCell(devName, true),
-      escapeCsvCell(t.address ?? '', true),
-      escapeCsvCell(t.dataType),
-      escapeCsvCell(t.access),
-      escapeCsvCell(t.unit ?? '', true),
-      escapeCsvCell(t.safeMin ?? ''),
-      escapeCsvCell(t.safeMax ?? ''),
+      escapeCsvCell(formatHaiwellRegisterType(t)),
+      escapeCsvCell('Decimal'),
+      escapeCsvCell(rawAddr, true),
+      escapeCsvCell(Math.max(1, t.wordSpan ?? getWordSpanForType(t.dataType))),
+      escapeCsvCell(formatHaiwellDataType(t.dataType)),
+      escapeCsvCell(formatHaiwellAccess(t.access)),
+      escapeCsvCell('Normal'),
       escapeCsvCell(t.alwaysCollect ? 'TRUE' : 'FALSE'),
       escapeCsvCell(t.description ?? '', true),
     ].join(',');
@@ -305,7 +351,7 @@ export function buildProjectExportBundle(project: HaiwellProject) {
         hwdevBinaryFormatNote:
           'Real .hwdev files are encrypted proprietary binary containers (1024-byte page-aligned ciphertext) and cannot be written directly offline; use haiwell_open_project_bridge_export against an open Haiwell Cloud Scada window.',
         variablesCsvNote:
-          'haiwell_variables_import.csv is an MCP reference CSV; verify column headers against Haiwell Cloud Scada\'s own Export template or use Batch Add inside the Device Variable grid.',
+          'haiwell_variables_import.csv headers match the Haiwell Cloud Scada 3.50.1.19 Device Variable Grid (Variable name, Register type, Address format, Register address, Address length, Data type, The mode of reading and writing, Collect frequency, Always collect, Description).',
         hwdevFileName: project.hwdevFileName,
         projectBrowserNodesCovered: [...REAL_HAIWELL_350_TREE_NODES],
         project,
@@ -422,9 +468,10 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
       targetHardware: project.targetHardware,
     });
     if (!res.valid) {
+      const hasBindingBreak = res.unresolvedTags.length > 0 || res.brokenNavTargets.length > 0;
       findings.push({
         code: 'AUD-HMI-LAYOUT',
-        severity: 'MEDIUM',
+        severity: hasBindingBreak ? 'HIGH' : 'MEDIUM',
         domain: 'hmi',
         target: screen.id,
         message: `Screen "${screen.name}" issues: collisions=${res.collisions.length}, outOfBounds=${res.outOfBounds.length}, unresolvedTags=${res.unresolvedTags.length}, brokenNav=${res.brokenNavTargets.length}, touchTargets=${res.touchTargetViolations.length}.`,
@@ -781,7 +828,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Project Workspace & Target Hardware Setup',
     safetyTier: 'design',
     description:
-      'Create a new Haiwell Cloud Scada 3.50.x (.hwdev) project targeting PC SCADA, Cloud HMI (C7/C10/B7/B7H/B10/A8), Cloud Box (CBOX), or IPC with resolution, network project port (8888), language, and security defaults.',
+      'Create a new Haiwell Cloud Scada 3.50.x (.hwdev) project targeting PC SCADA, Cloud HMI (C7/C10/B7/B7H/B10/A8, A7/A10/A15 PRO, D7/D10/D15 PRO), Cloud Box (CBOX), or IPC with resolution, network project port (8888), language, and security defaults.',
     inputSchema: z.object({
       id: z.string().regex(/^[a-z0-9_-]{3,48}$/, 'Use lowercase alphanumeric, dash, or underscore (3-48 chars)'),
       name: z.string().min(2).max(120),
@@ -794,6 +841,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           'CLOUD_HMI_B7H',
           'CLOUD_HMI_B10',
           'CLOUD_HMI_A8',
+          'CLOUD_HMI_A7_PRO',
+          'CLOUD_HMI_A10_PRO',
+          'CLOUD_HMI_A15_PRO',
+          'CLOUD_HMI_D7_PRO',
+          'CLOUD_HMI_D10_PRO',
+          'CLOUD_HMI_D15_PRO',
           'CLOUD_BOX_CBOX',
           'IPC_SCADA',
         ])
@@ -1141,6 +1194,13 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             .filter((b) => b.tags.length > 0);
           project.screens.forEach((s) => {
             s.widgets = s.widgets.filter((w) => w.tagName !== input.entityId);
+            if (s.pipes) {
+              s.pipes.forEach((p) => {
+                if (p.flowTagName === input.entityId) {
+                  delete p.flowTagName;
+                }
+              });
+            }
           });
           project.recipes = project.recipes
             .map((r) => ({
@@ -2124,7 +2184,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       source: z.string().min(1),
       tagBindings: z.record(z.string(), z.string()).default({}),
-      apiStyle: z.enum(['TAG_API', 'HAIWELL_NATIVE_350']).default('TAG_API'),
+      apiStyle: z.enum(['TAG_API', 'HAIWELL_NATIVE_350']).default('HAIWELL_NATIVE_350'),
       registerScriptId: z.string().optional(),
       cyclicIntervalMs: z.number().int().min(100).max(60000).default(1000),
     }),
@@ -2273,6 +2333,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         writeEnabled: z.boolean().default(false),
         targetScreenId: z.string().optional(),
         unit: z.string().optional(),
+        min: z.number().optional(),
+        max: z.number().optional(),
+        precision: z.number().int().min(0).max(6).optional(),
       }),
     }),
     sampleInput: {
@@ -2609,6 +2672,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           haiwellVersion: z.string().optional(),
         })
         .optional(),
+      catalogOverrides: z.record(z.string(), z.string()).optional(),
     }),
     sampleInput: { projectId: DEFAULT_PROJECT_ID, screenId: 'scr_chiller_overview' },
     handler: (input, store) => {
@@ -2618,6 +2682,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       return compileDesktopAutomationBridge(screen, project.tags, {
         windowTitleRegex: input.windowTitleRegex,
         uiaMap: input.uiaMap,
+        catalogOverrides: input.catalogOverrides,
         knownScreenIds: new Set(project.screens.map((s) => s.id)),
         targetHardware: project.targetHardware,
       });
@@ -2688,6 +2753,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           propertyGridAutoId: z.string().optional(),
         })
         .optional(),
+      catalogOverrides: z.record(z.string(), z.string()).optional(),
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
@@ -2705,6 +2771,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         sections: input.sections,
         windowTitleRegex: input.windowTitleRegex,
         uiaMap: input.uiaMap,
+        catalogOverrides: input.catalogOverrides,
       });
     },
   }),
@@ -3089,7 +3156,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         if (!binding) throw new Error('No MQTT binding found.');
         const payload = buildMqttPayload(project, binding);
         store.pushMqttLoopback(binding.topic, payload, binding.qos);
-        return { published: true, topic: binding.topic, qos: binding.qos, format: binding.format, payload };
+        return {
+          published: true,
+          simulatedLoopback: true,
+          transport: 'IN_MEMORY_LOOPBACK',
+          topic: binding.topic,
+          qos: binding.qos,
+          format: binding.format,
+          payload,
+        };
       }
       if (input.action === 'READ_LOOPBACK') {
         if (input.topicFilter) {
@@ -3097,7 +3172,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           if (!check.valid) throw new Error(`Invalid topicFilter: ${check.errors.join(' ')}`);
         }
         const messages = store.readMqttLoopback(input.topicFilter);
-        return { count: messages.length, messages };
+        return {
+          simulatedLoopback: true,
+          transport: 'IN_MEMORY_LOOPBACK',
+          count: messages.length,
+          messages,
+        };
       }
       let host = input.probeHost;
       let port = input.probePort;
@@ -3107,7 +3187,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         port = port ?? (Number(parsedUrl.port) || (project.mqtt.tlsEnabled ? 8883 : 1883));
       }
       const probe = await probeTcpEndpoint(host, port, 1200);
-      return { brokerUri: project.mqtt.brokerUri, host, port, ...probe };
+      return {
+        simulatedLoopback: false,
+        transport: 'TCP_SOCKET_PROBE',
+        brokerUri: project.mqtt.brokerUri,
+        host,
+        port,
+        ...probe,
+      };
     },
   }),
 
@@ -3236,6 +3323,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       const project = store.getProject(input.projectId);
       if (input.action === 'BROWSE') {
         return {
+          simulatedAddressSpace: true,
           endpointUrl: project.opcua.endpointUrl,
           namespaceUri: project.opcua.namespaceUri,
           nodes: project.opcua.nodes.map((n) => ({
@@ -3253,6 +3341,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (!tag) throw new Error(`Bound SCADA tag "${node.tagName}" missing.`);
       if (input.action === 'READ_NODE') {
         return {
+          simulatedAddressSpace: true,
           nodeId: node.nodeId,
           statusCode: 'Good (0x00000000)',
           dataType: node.dataType,
@@ -3261,7 +3350,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         };
       }
       if (node.accessLevel === 'CurrentRead') {
-        return { written: false, statusCode: 'BadNotWritable (0x803B0000)', message: `OPC UA Node ${node.nodeId} is CurrentRead only.` };
+        return {
+          simulatedAddressSpace: true,
+          written: false,
+          statusCode: 'BadNotWritable (0x803B0000)',
+          message: `OPC UA Node ${node.nodeId} is CurrentRead only.`,
+        };
       }
       if (input.value === undefined) throw new Error('WRITE_NODE requires value.');
       const guard = checkTagWriteSafety(project, tag.name, input.value, input.confirmSafetyOverride);
@@ -3274,13 +3368,25 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
               : guard.blockedBy.startsWith('TYPE_MISMATCH')
                 ? 'BadTypeMismatch (0x80740000)'
                 : 'BadUserAccessDenied (0x801F0000)';
-        return { written: false, statusCode: uaStatus, blockedBy: guard.blockedBy, message: guard.message };
+        return {
+          simulatedAddressSpace: true,
+          written: false,
+          statusCode: uaStatus,
+          blockedBy: guard.blockedBy,
+          message: guard.message,
+        };
       }
       tag.previousValue = tag.currentValue;
       tag.currentValue = guard.normalizedValue;
       tag.updatedAt = new Date().toISOString();
       store.saveProject(project);
-      return { written: true, statusCode: 'Good (0x00000000)', nodeId: node.nodeId, value: tag.currentValue };
+      return {
+        simulatedAddressSpace: true,
+        written: true,
+        statusCode: 'Good (0x00000000)',
+        nodeId: node.nodeId,
+        value: tag.currentValue,
+      };
     },
   }),
 
@@ -3893,12 +3999,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Headless PLC/SCADA Scan-Cycle FAT Verification Simulator',
     safetyTier: 'design',
     description:
-      'Deterministically simulate N scan cycles with injected tag overrides or raw ADC sensor counts (with linear scaling), verifying E-Stop fail-safe output de-energization, declarative event triggers, and ISA-18.2 alarm state transitions.',
+      'Deterministically simulate N scan cycles with injected tag overrides or raw ADC sensor counts (with linear scaling), executing saved IEC 61131-3 ST POUs and validated Haiwell JS scripts in a sandboxed VM with persistent timer/counter state, E-Stop fail-safe de-energization, declarative event triggers, and ISA-18.2 alarm state transitions.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       injectTagValues: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional(),
       injectRawAdcValues: z.record(z.string(), z.number()).optional(),
       steps: z.number().int().min(1).max(50).default(1),
+      scanIntervalMs: z.number().int().min(50).max(60000).default(1000),
+      eStopTagName: z.string().max(80).optional(),
       enforceEStopSafeState: z.boolean().default(true),
       persistState: z.boolean().default(false),
     }),
@@ -3906,6 +4014,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       projectId: DEFAULT_PROJECT_ID,
       injectTagValues: { EStop_OK: false },
       steps: 1,
+      scanIntervalMs: 1000,
       enforceEStopSafeState: true,
       persistState: false,
     },
@@ -4491,6 +4600,71 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       return { saved: true, audioClip: clip, totalAudioClips: project.audioClips.length };
     },
   }),
+
+  // =========================================================================
+  // 17. LIVE WINDOWS DESKTOP AUTOMATION BRIDGE (Scada.Develop.exe)
+  // =========================================================================
+  defineTool({
+    name: 'haiwell_desktop_inspect',
+    domain: 'hmi',
+    haiwellFeature: 'Haiwell Cloud Scada Desktop Installation & Localized UI Label Inspector',
+    safetyTier: 'read',
+    description:
+      'Inspect the local Windows HaiwellScada3 installation directory, locate Scada.Develop.exe, read config.ini language settings, and parse Language/*.lng to resolve localized UI menu/dialog labels.',
+    inputSchema: z
+      .object({
+        installDir: z.string().max(260).optional(),
+      })
+      .strict(),
+    sampleInput: {},
+    handler: (input) => inspectHaiwellDesktopInstallation(input.installDir),
+  }),
+
+  defineTool({
+    name: 'haiwell_desktop_launch',
+    domain: 'hmi',
+    haiwellFeature: 'Splash-Safe Haiwell Cloud Scada Desktop Launcher & Window Attacher',
+    safetyTier: 'design',
+    description:
+      'Launch Scada.Develop.exe (or attach to an already-running instance), wait strictly for the main "Haiwell Cloud Scada" window (skipping the startup splash screen), and optionally open an existing .hwdev file. On non-Windows hosts or when dryRun=true, returns the verified PowerShell script without executing.',
+    inputSchema: z
+      .object({
+        installDir: z.string().max(260).optional(),
+        projectFilePath: z.string().max(300).optional(),
+        timeoutSec: z.number().int().min(5).max(120).default(25),
+        dryRun: z.boolean().default(false),
+      })
+      .strict(),
+    sampleInput: { timeoutSec: 25, dryRun: true },
+    handler: async (input) => launchHaiwellDesktop(input),
+  }),
+
+  defineTool({
+    name: 'haiwell_desktop_new_project',
+    domain: 'hmi',
+    haiwellFeature: 'Windows UIA New .hwdev Project Wizard Automator',
+    safetyTier: 'design',
+    description:
+      'Automate creating a new .hwdev project inside a running Haiwell Cloud Scada desktop window using UIA MenuItem traversal, adjacent-Label ComboBox selection (runtime platform, device model, resolution), network port configuration, and try/finally clipboard restoration. Supports dryRun=true and non-Windows script generation.',
+    inputSchema: z.object({
+      projectName: z.string().min(1).max(120),
+      runtimePlatform: z.string().min(1).max(64).default('Cloud HMI'),
+      deviceModel: z.string().min(1).max(64).default('Haiwell HMI B7H'),
+      resolution: z.string().min(3).max(32).default('1024*600'),
+      networkProjectPort: z.number().int().min(1024).max(65535).default(8888),
+      installDir: z.string().max(260).optional(),
+      dryRun: z.boolean().default(false),
+    }),
+    sampleInput: {
+      projectName: 'Chiller_Plant_01',
+      runtimePlatform: 'Cloud HMI',
+      deviceModel: 'Haiwell HMI B7H',
+      resolution: '1024*600',
+      networkProjectPort: 8888,
+      dryRun: true,
+    },
+    handler: async (input) => createNewHaiwellProjectOnDesktop(input),
+  }),
 ];
 
 export interface McpToolAnnotations {
@@ -4514,7 +4688,9 @@ export function getToolAnnotations(tool: HaiwellToolDefinition): McpToolAnnotati
   const isOpenWorld =
     tool.name === 'haiwell_mqtt_exchange' ||
     tool.name === 'haiwell_webhook_configure' ||
-    tool.name === 'haiwell_cloud_transparent_tunnel';
+    tool.name === 'haiwell_cloud_transparent_tunnel' ||
+    tool.name === 'haiwell_desktop_launch' ||
+    tool.name === 'haiwell_desktop_new_project';
 
   return {
     title: tool.haiwellFeature,
@@ -4657,7 +4833,11 @@ export async function invokeHaiwellTool(
     }
   }
 
-  const parsed = tool.inputSchema.safeParse(normalizedArgs);
+  const argsForSchema: Record<string, unknown> = { ...normalizedArgs };
+  delete argsForSchema.idempotencyKey;
+  delete argsForSchema.expectedRevision;
+
+  const parsed = tool.inputSchema.safeParse(argsForSchema);
   if (!parsed.success) {
     return {
       ok: false,

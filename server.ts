@@ -13,13 +13,16 @@
  * - GET  /api/health              -> Lightweight health probe
  */
 
+import 'dotenv/config';
 import crypto from 'node:crypto';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createHaiwellMcpServer } from './src/mcp/createMcpServer';
 import { defaultProjectStore, type HaiwellProjectStore } from './src/mcp/projectStore';
+import { SERVER_VERSION } from './src/mcp/version';
 import {
   generateAgentSkillMarkdown,
   generateClientConfigs,
@@ -43,12 +46,21 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const PORT = Number(process.env.PORT ?? 3000);
 
+const VALID_HOST_REGEX = /^[a-zA-Z0-9._-]+(?::\d{1,5})?$/;
+
 function getBaseUrl(req: express.Request): string {
   if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
     return process.env.APP_URL.replace(/\/$/, '');
   }
-  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-  const host = req.headers['x-forwarded-host'] || req.get('host') || `localhost:${PORT}`;
+  const trustProxy = process.env.TRUST_PROXY === 'true';
+  const rawProto = trustProxy
+    ? String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim()
+    : req.protocol || 'http';
+  const proto = rawProto === 'https' ? 'https' : 'http';
+  const rawHost = trustProxy
+    ? String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim()
+    : String(req.get('host') || '').trim();
+  const host = VALID_HOST_REGEX.test(rawHost) ? rawHost : `localhost:${PORT}`;
   return `${proto}://${host}`;
 }
 
@@ -83,6 +95,32 @@ export function createApp(
   ).map((o) => o.toLowerCase());
   const rateLimitPerMin =
     securityOpts.rateLimitPerMin ?? Number(process.env.HAIWELL_MCP_RATE_LIMIT_PER_MIN ?? 600);
+
+  // Bounded idle McpServer pool per profile to avoid rebuilding 61 Zod tool schemas on every HTTP request
+  const mcpServerPool = new Map<string, McpServer[]>();
+  const MAX_POOL_PER_PROFILE = 8;
+  const borrowMcpServer = (profile: ReturnType<typeof resolveToolProfile>): McpServer => {
+    const bucket = mcpServerPool.get(profile);
+    if (bucket && bucket.length > 0) {
+      return bucket.pop()!;
+    }
+    return createHaiwellMcpServer(store, profile);
+  };
+  const releaseMcpServer = async (
+    profile: ReturnType<typeof resolveToolProfile>,
+    srv: McpServer
+  ): Promise<void> => {
+    try {
+      await srv.close();
+      const bucket = mcpServerPool.get(profile) ?? [];
+      if (bucket.length < MAX_POOL_PER_PROFILE) {
+        bucket.push(srv);
+        mcpServerPool.set(profile, bucket);
+      }
+    } catch {
+      // Drop unhealthy server instance instead of returning it to pool
+    }
+  };
 
   // Per-IP Token Bucket rate limiter (prevents runaway agent retry loops)
   const buckets = new Map<string, { tokens: number; lastRefill: number }>();
@@ -222,7 +260,7 @@ export function createApp(
     const profile = resolveToolProfile(typeof req.query.profile === 'string' ? req.query.profile : undefined);
     res.json({
       service: 'haiwell-cloud-scada-mcp',
-      version: '2.6.0',
+      version: SERVER_VERSION,
       mode: 'headless-machine-readable-only',
       protocol: 'MCP 2025-03-26',
       profile,
@@ -320,7 +358,7 @@ export function createApp(
     const profile = resolveToolProfile(
       typeof req.query.profile === 'string' ? req.query.profile : process.env.HAIWELL_MCP_PROFILE
     );
-    const server = createHaiwellMcpServer(store, profile);
+    const server = borrowMcpServer(profile);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -328,7 +366,7 @@ export function createApp(
 
     res.on('close', () => {
       void transport.close();
-      void server.close();
+      void releaseMcpServer(profile, server);
     });
 
     try {
@@ -371,7 +409,7 @@ export function createApp(
     res.json({
       status: 'ok',
       service: 'haiwell-cloud-scada-mcp',
-      version: '2.6.0',
+      version: SERVER_VERSION,
       ui: false,
       protocol: 'MCP 2025-03-26 (Streamable HTTP + stdio)',
       domains: HAIWELL_CAPABILITY_MATRIX.length,
@@ -392,13 +430,14 @@ export function createApp(
     const baseUrl = getBaseUrl(req);
     const profile = resolveToolProfile(typeof req.query.profile === 'string' ? req.query.profile : undefined);
     const tools = serializeToolCatalog(profile);
+    const isAuthenticated = !authToken || timingSafeBearerMatch(req.headers.authorization, authToken);
     res.json({
-      schemaVersion: '2.6.0',
+      schemaVersion: SERVER_VERSION,
       profile,
       catalogSha256: computeToolCatalogHash(profile),
       server: {
         name: 'haiwell-cloud-scada-mcp',
-        version: '2.6.0',
+        version: SERVER_VERSION,
         mode: 'headless',
         mcpEndpoint: `${baseUrl}/mcp`,
         rpcEndpoint: `${baseUrl}/api/rpc`,
@@ -412,7 +451,7 @@ export function createApp(
       prompts: HAIWELL_PROMPTS,
       clients: generateClientConfigs(baseUrl),
       skillMarkdown: generateAgentSkillMarkdown(`${baseUrl}/mcp`),
-      projects: store.listProjects(),
+      ...(isAuthenticated ? { projects: store.listProjects() } : { projectsRedacted: true }),
     });
   });
 
@@ -479,7 +518,7 @@ export function createApp(
       openapi: '3.1.0',
       info: {
         title: 'Haiwell Cloud SCADA Develop MCP & Headless Automation API',
-        version: '2.0.0',
+        version: SERVER_VERSION,
         description:
           'Zero-UI, machine-readable MCP Streamable HTTP and low-latency RPC API for AI agents automating Haiwell Cloud SCADA Develop.',
       },
@@ -565,6 +604,24 @@ export function createApp(
         code: 'NOT_FOUND',
         message: `Endpoint ${req.method} ${req.path} does not exist. Inspect GET / or GET /llms.txt.`,
       },
+    });
+  });
+
+  // Final strict JSON error handler for any synchronous/async route throw (ZERO HTML ever!)
+  app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const errObj = err && typeof err === 'object' ? (err as { status?: number; message?: string }) : {};
+    const status = typeof errObj.status === 'number' && errObj.status >= 400 && errObj.status < 600 ? errObj.status : 500;
+    if (req.path === '/mcp') {
+      res.status(status).json({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32603, message: errObj.message ?? 'Internal server error' },
+      });
+      return;
+    }
+    res.status(status).json({
+      ok: false,
+      error: { code: 'INTERNAL_ERROR', message: errObj.message ?? 'Internal server error' },
     });
   });
 

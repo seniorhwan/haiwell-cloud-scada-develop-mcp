@@ -5,6 +5,7 @@
  * Usage: npx tsx src/mcp/stdio.ts
  */
 
+import 'dotenv/config';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createHaiwellMcpServer } from './createMcpServer';
 import { HAIWELL_PROMPTS, HAIWELL_RESOURCES } from './resourcesAndPrompts';

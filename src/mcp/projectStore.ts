@@ -235,9 +235,9 @@ function makeSeedProject(): HaiwellProject {
         trigger: 'CYCLIC',
         intervalMs: 1000,
         code: [
-          'var supply = Tag.Read("Supply_Temp_C");',
-          'var ret = Tag.Read("Return_Temp_C");',
-          'Tag.Write("Plant_DeltaT_C", Number((ret - supply).toFixed(2)));',
+          'var supply = Variable.GetByFullName("Supply_Temp_C");',
+          'var ret = Variable.GetByFullName("Return_Temp_C");',
+          'Variable.SetByFullName("Plant_DeltaT_C", Number((ret - supply).toFixed(2)));',
         ].join('\n'),
         referencedTags: ['Supply_Temp_C', 'Return_Temp_C', 'Plant_DeltaT_C'],
         validated: true,
@@ -551,7 +551,13 @@ export class HaiwellProjectStore {
       try {
         const raw = JSON.parse(fs.readFileSync(this.persistPath, 'utf8')) as {
           projects?: HaiwellProject[];
+          snapshots?: Record<string, ProjectSnapshot[]>;
         };
+        if (raw.snapshots && typeof raw.snapshots === 'object') {
+          for (const [pid, snaps] of Object.entries(raw.snapshots)) {
+            if (Array.isArray(snaps)) this.snapshots.set(pid, snaps);
+          }
+        }
         if (Array.isArray(raw.projects) && raw.projects.length > 0) {
           for (const p of raw.projects) {
             this.projects.set(p.id, {
@@ -598,8 +604,8 @@ export class HaiwellProjectStore {
           }
           return;
         }
-      } catch {
-        // Corrupted file falls back cleanly to seed
+      } catch (err) {
+        console.warn('[HaiwellProjectStore] Failed to load workspace.json, falling back to seed:', err);
       }
     }
     const seed = makeSeedProject();
@@ -610,11 +616,37 @@ export class HaiwellProjectStore {
     if (!this.persistPath) return;
     try {
       fs.mkdirSync(path.dirname(this.persistPath), { recursive: true });
-      const tmp = `${this.persistPath}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify({ projects: [...this.projects.values()] }, null, 2), 'utf8');
-      fs.renameSync(tmp, this.persistPath);
-    } catch {
-      // Never crash headless runtime on read-only FS
+      const tmp = `${this.persistPath}.${process.pid}.${Date.now()}.tmp`;
+      const payload = {
+        projects: [...this.projects.values()],
+        snapshots: Object.fromEntries(this.snapshots.entries()),
+      };
+      fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          fs.renameSync(tmp, this.persistPath);
+          lastErr = null;
+          break;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          lastErr = err;
+          if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
+            if (attempt === 5) {
+              fs.copyFileSync(tmp, this.persistPath);
+              try { fs.unlinkSync(tmp); } catch { /* ignore cleanup error */ }
+              lastErr = null;
+            }
+          } else {
+            break;
+          }
+        }
+      }
+      if (lastErr) {
+        console.warn('[HaiwellProjectStore] Failed to persist workspace.json:', lastErr);
+      }
+    } catch (err) {
+      console.warn('[HaiwellProjectStore] Persistence error (workspace unchanged on disk):', err);
     }
   }
 
@@ -669,6 +701,7 @@ export class HaiwellProjectStore {
     list.push(snap);
     if (list.length > 50) list.shift();
     this.snapshots.set(projectId, list);
+    this.persistIfEnabled();
     const { payloadJson: _omit, ...meta } = snap;
     return meta;
   }
@@ -693,6 +726,9 @@ export class HaiwellProjectStore {
     for (const s of project.screens) {
       for (const w of s.widgets) {
         if (w.tagName === tagName) deps.push(`screen:${s.id}/widget:${w.id}`);
+      }
+      for (const p of s.pipes ?? []) {
+        if (p.flowTagName === tagName) deps.push(`screen:${s.id}/pipe:${p.id}`);
       }
     }
     for (const a of project.alarms) {

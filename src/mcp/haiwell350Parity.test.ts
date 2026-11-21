@@ -4,8 +4,8 @@ import { HaiwellProjectStore } from './projectStore';
 import { HAIWELL_TOOLS, invokeHaiwellTool } from './toolRegistry';
 import { REAL_HAIWELL_350_TREE_NODES } from './hmiSpatialEngine';
 
-test('Haiwell Cloud Scada 3.50.x parity: 58 total tools cover all 22 real Project Browser nodes', () => {
-  assert.equal(HAIWELL_TOOLS.length, 58);
+test('Haiwell Cloud Scada 3.50.x parity: 61 total tools cover all 22 real Project Browser nodes + desktop automation', () => {
+  assert.equal(HAIWELL_TOOLS.length, 61);
   assert.equal(REAL_HAIWELL_350_TREE_NODES.length, 22);
 });
 
@@ -40,7 +40,10 @@ test('Project properties match real Haiwell HMI B7H 1024x600 Enable network proj
   assert.equal(exported.ok, true);
   const artifacts = (exported.data as { artifacts: Record<string, unknown> }).artifacts;
   assert.ok(typeof artifacts['haiwell_variables_import.csv'] === 'string');
-  assert.match(artifacts['haiwell_variables_import.csv'] as string, /VariableName,VariableType,DeviceName/);
+  assert.match(
+    artifacts['haiwell_variables_import.csv'] as string,
+    /Variable name,Register type,Address format,Register address,Address length,Data type,The mode of reading and writing/
+  );
   assert.ok(artifacts['project.hwdev.manifest.json']);
 });
 
