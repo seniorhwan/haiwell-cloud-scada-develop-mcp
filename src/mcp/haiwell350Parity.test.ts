@@ -771,5 +771,132 @@ test('v2.5.0: Graphics library exposes all 16 real Haiwell 3.50.1.19 categories,
   assert.match(bData.pywinautoScript, /graphicsLibraryCategory/);
 });
 
+test('v2.6.0: Official Haiwell documentation parity — zero guessed graphics items, Common.logger lint, security 1..20, encrypted .hwdev honesty, and RTSP PRO-only hardware guard', async () => {
+  const store = new HaiwellProjectStore();
+
+  // 1. Graphics library catalog: zero guessed items in unverified packs & verified official names in Advanced controls / Switch
+  const catRes = await invokeHaiwellTool('haiwell_hmi_toolbox_catalog', { category: 'ALL' }, store);
+  assert.equal(catRes.ok, true);
+  const catData = catRes.data as {
+    graphicsLibraryCategories: Record<string, string[]>;
+    graphicsLibraryMetadata: Record<string, { requiresLiveCatalogCalibration: boolean }>;
+  };
+  assert.equal(catData.graphicsLibraryCategories['Lamp'].length, 0);
+  assert.equal(catData.graphicsLibraryCategories['Valve'].length, 0);
+  assert.equal(catData.graphicsLibraryCategories['Trace·Pipe'].length, 0);
+  assert.equal(catData.graphicsLibraryMetadata['Lamp'].requiresLiveCatalogCalibration, true);
+  assert.equal(catData.graphicsLibraryMetadata['Valve'].requiresLiveCatalogCalibration, true);
+  assert.equal(catData.graphicsLibraryMetadata['Trace·Pipe'].requiresLiveCatalogCalibration, true);
+  assert.ok(catData.graphicsLibraryCategories['Switch'].includes('Switch 1'));
+  for (const verifiedCtrl of [
+    'Alarm table-new',
+    'Marquee',
+    'Camera display',
+    'Historical data view report',
+    'Information scan code input box',
+  ]) {
+    assert.ok(
+      catData.graphicsLibraryCategories['Advanced controls'].includes(verifiedCtrl),
+      `Expected verified official Advanced controls item "${verifiedCtrl}"`
+    );
+  }
+
+  // 2. Official Haiwell logging API lint (HWJS-API-001): warn on System.Log / Common.Log, clean on Common.logger.info
+  const badLog = await invokeHaiwellTool(
+    'haiwell_script_validate',
+    {
+      code: 'var t = Tag.Read("Supply_Temp_C"); System.Log("t=" + t); Common.Log("t=" + t);',
+    },
+    store
+  );
+  assert.equal(badLog.ok, true);
+  const badDiags = (badLog.data as { diagnostics: { code: string }[] }).diagnostics;
+  assert.ok(badDiags.some((d) => d.code === 'HWJS-API-001'));
+
+  const goodLog = await invokeHaiwellTool(
+    'haiwell_script_validate',
+    {
+      code: 'var t = Tag.Read("Supply_Temp_C"); Common.logger.info("%s", "t=" + t);',
+    },
+    store
+  );
+  assert.equal(goodLog.ok, true);
+  const goodDiags = (goodLog.data as { diagnostics: { code: string }[] }).diagnostics;
+  assert.equal(goodDiags.some((d) => d.code === 'HWJS-API-001'), false);
+
+  // 3. Official User Security permission level 1..20 (/docs/Usersecurity)
+  const secRes = await invokeHaiwellTool(
+    'haiwell_security_policy',
+    {
+      sslBits: 256,
+      abKeyEnabled: true,
+      requireInterlockForOutputs: true,
+      userGroups: [
+        {
+          groupName: 'SuperAdmin',
+          privilegeLevel: 20,
+          canWriteTags: true,
+          canAckAlarms: true,
+          canTransferRecipes: true,
+          canRemoteTunnel: true,
+        },
+      ],
+    },
+    store
+  );
+  assert.equal(secRes.ok, true);
+
+  // 4. Encrypted .hwdev format honesty in export manifest & calibrator Graphics library capture
+  const expRes = await invokeHaiwellTool(
+    'haiwell_project_export',
+    { includeArtifacts: ['hwdev_manifest'] },
+    store
+  );
+  assert.equal(expRes.ok, true);
+  const manifest = (expRes.data as { artifacts: Record<string, { hwdevDirectBinaryWriteSupported: boolean; hwdevBinaryFormatNote: string }> })
+    .artifacts['project.hwdev.manifest.json'];
+  assert.equal(manifest.hwdevDirectBinaryWriteSupported, false);
+  assert.match(manifest.hwdevBinaryFormatNote, /encrypted proprietary binary/i);
+
+  const calRes = await invokeHaiwellTool('haiwell_desktop_uia_calibrate', {}, store);
+  assert.equal(calRes.ok, true);
+  assert.match((calRes.data as { calibratorScript: string }).calibratorScript, /haiwell_graphics_catalog_dump\.json/);
+
+  // 5. RTSP hardware compatibility guard (AUD-HW-COMPAT-RTSP) on non-PRO HMI B7H (/docs/RTSP)
+  await invokeHaiwellTool(
+    'haiwell_project_create',
+    {
+      id: 'prj_b7h_rtsp_check',
+      name: 'B7H RTSP Compatibility Check',
+      targetHardware: 'CLOUD_HMI_B7H',
+      width: 1024,
+      height: 600,
+    },
+    store
+  );
+  const camRes = await invokeHaiwellTool(
+    'haiwell_camera_bind',
+    {
+      projectId: 'prj_b7h_rtsp_check',
+      id: 'cam_line1',
+      name: 'Line 1 IP Camera',
+      protocol: 'RTSP',
+      streamUri: 'rtsp://192.0.2.50:554/stream1',
+    },
+    store
+  );
+  assert.equal(camRes.ok, true);
+  const rtspAudit = await invokeHaiwellTool(
+    'haiwell_project_audit_safety',
+    { projectId: 'prj_b7h_rtsp_check' },
+    store
+  );
+  assert.equal(rtspAudit.ok, true);
+  const rtspAuditData = rtspAudit.data as { deploymentReady: boolean; findings: { code: string; severity: string }[] };
+  assert.equal(rtspAuditData.deploymentReady, false);
+  assert.ok(rtspAuditData.findings.some((f) => f.code === 'AUD-HW-COMPAT-RTSP' && f.severity === 'HIGH'));
+});
+
+
 
 

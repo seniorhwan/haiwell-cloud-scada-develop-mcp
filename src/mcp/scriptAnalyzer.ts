@@ -313,6 +313,19 @@ export function validateHaiwellScript(
     }
   }
 
+  // 5. Real Haiwell 3.50.x official logging API check (/docs/userScriptLogs):
+  // Official API is Common.logger.log/debug/info/trace/warn/note/error (viewable at http://<HMI_IP>/dev/logs.html),
+  // NOT guessed System.Log() or Common.Log().
+  const nonOfficialLog = /\b(System\.Log|Common\.Log)\s*\(/.exec(noComments);
+  if (nonOfficialLog) {
+    diagnostics.push({
+      code: 'HWJS-API-001',
+      severity: 'WARNING',
+      message: `"${nonOfficialLog[1]}()" is not a documented Haiwell Cloud SCADA 3.50.x JS API.`,
+      fixHint: 'Use the official Haiwell logging API: Common.logger.info("%s", message) (levels: log, debug, info, trace, warn, note, error; live viewer at http://<HMI_IP>/dev/logs.html).',
+    });
+  }
+
   // Forbidden dynamic execution, sandbox escape, or bare host globals
   // Note: Haiwell managed Common.SetInterval / Common.SetTimeout are PascalCase and ALLOWED.
   const forbidden = /\b(eval|Function|require|process|child_process|fs|globalThis|__proto__|constructor|prototype|setInterval|setTimeout|import)\b/.exec(
@@ -323,7 +336,7 @@ export function validateHaiwellScript(
       code: 'HWJS-SEC-001',
       severity: 'ERROR',
       message: `Forbidden sandbox/host symbol "${forbidden[1]}" detected.`,
-      fixHint: 'Restrict scripts to Haiwell Cloud SCADA APIs: $Device.Var, Variable, Common, Tag, System, Screen, Recipe, Alarm, Math, Date, JSON.',
+      fixHint: 'Restrict scripts to documented Haiwell Cloud SCADA APIs: $Device.Var, Variable.GetByFullName/SetByFullName, Common.logger.*, Common.SetTimeout/SetInterval, Common.DelAlertRecord, Common.readAttachFile, Common.MobileBarcodescanner, Common.database.*, Common.Ajax, Window.ClearData, Math, Date, JSON.',
     });
   }
 

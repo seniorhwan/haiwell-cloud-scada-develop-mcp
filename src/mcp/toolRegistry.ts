@@ -38,6 +38,7 @@ import {
   compilePidScreen,
   generateDesktopUiaCalibrator,
   HAIWELL_GRAPHICS_LIBRARY_CATALOG,
+  HAIWELL_GRAPHICS_LIBRARY_METADATA,
   HAIWELL_HMI_TOOLBOX,
   REAL_HAIWELL_350_TREE_NODES,
   solveAndRepairScreenLayout,
@@ -299,6 +300,12 @@ export function buildProjectExportBundle(project: HaiwellProject) {
     artifacts: {
       'project.hwdev.manifest.json': {
         schema: 'haiwell.cloud.scada.3.50.hwdev-manifest/v1',
+        artifactRole: 'MCP_INTERMEDIATE_PROJECT_MANIFEST',
+        hwdevDirectBinaryWriteSupported: false,
+        hwdevBinaryFormatNote:
+          'Real .hwdev files are encrypted proprietary binary containers (1024-byte page-aligned ciphertext) and cannot be written directly offline; use haiwell_open_project_bridge_export against an open Haiwell Cloud Scada window.',
+        variablesCsvNote:
+          'haiwell_variables_import.csv is an MCP reference CSV; verify column headers against Haiwell Cloud Scada\'s own Export template or use Batch Add inside the Device Variable grid.',
         hwdevFileName: project.hwdevFileName,
         projectBrowserNodesCovered: [...REAL_HAIWELL_350_TREE_NODES],
         project,
@@ -654,6 +661,42 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
         message: `Data reporting server "${srv.id}" pushes plant data over unencrypted ${srv.protocol}.`,
         remediation: 'Enable tlsRequired=true and use https:// or mqtts://.',
       });
+    }
+  }
+
+  // 7. Hardware compatibility check (official Haiwell /docs/RTSP): RTSP camera display requires PRO-series HMI or PC/IPC SCADA
+  const nonProHardware = new Set<string>([
+    'CLOUD_HMI_B7H',
+    'CLOUD_HMI_B7',
+    'CLOUD_HMI_B10',
+    'CLOUD_HMI_C7',
+    'CLOUD_HMI_C10',
+    'CLOUD_HMI_A8',
+    'CLOUD_BOX_CBOX',
+  ]);
+  if (nonProHardware.has(project.targetHardware)) {
+    const rtspCameras = (project.cameras ?? []).filter((c) => c.protocol === 'RTSP');
+    for (const cam of rtspCameras) {
+      findings.push({
+        code: 'AUD-HW-COMPAT-RTSP',
+        severity: 'HIGH',
+        domain: 'operations',
+        target: `camera:${cam.id}`,
+        message: `RTSP camera "${cam.name}" (${cam.id}) is not supported on ${project.targetHardware}. Official Haiwell documentation (/docs/RTSP) restricts RTSP camera playback to PRO-series HMIs (D7/D10/D15 PRO, A7/A10/A15 PRO) or PC/IPC SCADA.`,
+        remediation: 'Remove RTSP cameras for non-PRO hardware or target PC_SCADA / IPC_SCADA / a PRO-series HMI.',
+      });
+    }
+    for (const scr of project.screens) {
+      if (scr.widgets.some((w) => w.type === 'CAMERA_VIEW') && rtspCameras.length === 0) {
+        findings.push({
+          code: 'AUD-HW-COMPAT-RTSP',
+          severity: 'HIGH',
+          domain: 'hmi',
+          target: `screen:${scr.id}`,
+          message: `Screen "${scr.name}" places a Camera display widget on ${project.targetHardware}. Official Haiwell documentation (/docs/RTSP) restricts RTSP Camera display to PRO-series HMIs or PC/IPC SCADA.`,
+          remediation: 'Remove CAMERA_VIEW widget on non-PRO HMIs or upgrade targetHardware.',
+        });
+      }
     }
   }
 
@@ -2370,10 +2413,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_hmi_toolbox_catalog',
     domain: 'hmi',
-    haiwellFeature: 'Haiwell Component Toolbox Catalog & Property-Grid Schema',
+    haiwellFeature: 'Haiwell Graphics Library Catalog & Modal Property Schema',
     safetyTier: 'read',
     description:
-      'Return the complete machine-readable Haiwell Cloud SCADA Develop HMI component toolbox (display, control, P&ID equipment with port geometry, min touch dimensions, allowed PLC data types, and Windows Property Grid field names).',
+      'Return the verified machine-readable Haiwell Cloud SCADA Develop HMI component toolbox (display, control, P&ID equipment with port geometry, min touch dimensions, allowed PLC data types, documented modal Property Setting dialog fields, and live-calibration metadata for numbered Graphics library packs).',
     inputSchema: z.object({
       category: z
         .enum(['ALL', 'DISPLAY', 'CONTROL', 'PID_EQUIPMENT', 'CHART_HISTORIAN', 'ALARM_RECIPE', 'NAVIGATION'])
@@ -2391,6 +2434,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         minTouchPx: 48,
         graphicsLibraryPanelTitle: 'Graphics library',
         graphicsLibraryCategories: HAIWELL_GRAPHICS_LIBRARY_CATALOG,
+        graphicsLibraryMetadata: HAIWELL_GRAPHICS_LIBRARY_METADATA,
         components: items,
       };
     },
@@ -2545,10 +2589,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_hmi_desktop_bridge_export',
     domain: 'hmi',
-    haiwellFeature: 'Calibrated Haiwell Cloud Scada 3.50.x Windows UIA (pywinauto) Property-Grid Bridge',
+    haiwellFeature: 'Calibrated Haiwell Cloud Scada 3.50.x Windows UIA (pywinauto) Canvas & Property Modal Bridge',
     safetyTier: 'design',
     description:
-      'Export a validated HMI screen for Haiwell Cloud Scada 3.50.x (*.hwdev, .NET WinForms) via BOTH (1) a structured screen manifest AND (2) a calibrated Windows UI Automation (pywinauto) script matching the real "Haiwell Cloud Scada[3.50.x]" window title, loading verified AutomationIds from haiwell_uia_map.json, injecting Left/Top/Width/Height/Variable into the Property Grid with UIA read-back verification, saving .hwdev (Ctrl+S), and triggering Offline Simulation (F6).',
+      'Export a validated HMI screen for Haiwell Cloud Scada 3.50.x (*.hwdev, .NET WinForms) via BOTH (1) an intermediate layout plan manifest AND (2) a calibrated Windows UI Automation (pywinauto) script matching the real "Haiwell Cloud Scada[3.50.x]" window title, selecting components in Graphics library, drawing exact bounding boxes on the Display canvas, configuring documented Property Setting modal dialog fields, saving .hwdev (Ctrl+S), and triggering Offline Simulation (F6).',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       screenId: z.string().default('scr_chiller_overview'),
@@ -2586,7 +2630,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Live Windows UIA Calibrator for Haiwell Cloud Scada 3.50.x (.NET WinForms)',
     safetyTier: 'read',
     description:
-      'Generate calibrate_haiwell_uia.py to inspect a live Haiwell Cloud Scada 3.50.x desktop window (all 22 Project browser nodes, Display canvas, Toolbox, Property Grid) and output haiwell_uia_map.json, OR validate a captured UIA map before running desktop automation.',
+      'Generate calibrate_haiwell_uia.py to inspect a live Haiwell Cloud Scada 3.50.x desktop window (all 22 Project browser nodes, Display canvas, Graphics library panel + visible catalog items) and output haiwell_uia_map.json + haiwell_graphics_catalog_dump.json, OR validate a captured UIA map before running desktop automation.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       action: z.enum(['GENERATE_SCRIPT', 'VALIDATE_MAP']).default('GENERATE_SCRIPT'),
@@ -2627,7 +2671,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Full Open-.hwdev Project Windows UIA Automator (Devices, Variables, Tasks, Events, Displays)',
     safetyTier: 'design',
     description:
-      'Compile an entire safety-verified Haiwell Cloud Scada 3.50.x project into a single Windows UIA automation bundle for an already-open blank .hwdev window, covering all 5 core sections: Devices (4-tab Property Setting dialog), Variables (Device Variable grid/CSV), Tasks (Strict-ES5 clipboard paste), Events (Event selection modal), and Displays (zero-overlap Property Grid). Refuses export if deploymentReady is false.',
+      'Compile an entire safety-verified Haiwell Cloud Scada 3.50.x project into a single Windows UIA automation bundle for an already-open blank .hwdev window, covering all 5 core sections: Devices (4-tab Property Setting dialog), Variables (Device Variable grid / Batch Add), Tasks (Strict-ES5 clipboard paste), Events (Event selection modal), and Displays (Graphics library canvas draw + component Property Setting modal). Refuses export if deploymentReady is false.',
     inputSchema: z.object({
       projectId: z.string().min(2).default(DEFAULT_PROJECT_ID),
       sections: z
@@ -2685,7 +2729,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
-      code: 'var t = Tag.Read("Supply_Temp_C");\nif (t > 12) { Common.Log("High supply temp: " + t); }',
+      code: 'var t = Tag.Read("Supply_Temp_C");\nif (t > 12) { Common.logger.info("%s", "High supply temp: " + t); }',
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
@@ -3792,7 +3836,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'RBAC User Groups, 128/256-bit SSL & Haiwell A/B Key Access Control',
     safetyTier: 'control_guarded',
     description:
-      'Configure Haiwell Cloud SCADA security policy: SSL encryption strength (128/256), Haiwell A/B Key remote cloud authentication, output interlock enforcement, and RBAC privilege groups (0-15).',
+      'Configure Haiwell Cloud SCADA security policy: SSL encryption strength (128/256), Haiwell A/B Key remote cloud authentication, output interlock enforcement, and official User Security RBAC privilege levels (1-20 per /docs/Usersecurity; 0 retained for backwards compatibility).',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       sslBits: z.enum(['128', '256']).or(z.number().int()).default(128),
@@ -3802,7 +3846,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         .array(
           z.object({
             groupName: z.string().min(2).max(40),
-            privilegeLevel: z.number().int().min(0).max(15),
+            privilegeLevel: z.number().int().min(0).max(20),
             canWriteTags: z.boolean(),
             canAckAlarms: z.boolean(),
             canTransferRecipes: z.boolean(),

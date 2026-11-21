@@ -10,13 +10,14 @@ import {
 } from './hmiSpatialEngine';
 import { invokeHaiwellTool } from './toolRegistry';
 
-test('toolbox catalog exposes all Haiwell HMI component types with property-grid mappings and P&ID ports', () => {
+test('toolbox catalog exposes all Haiwell HMI component types with documented modal fields and P&ID ports', () => {
   assert.ok(HAIWELL_HMI_TOOLBOX.length >= 18);
   for (const type of ['TANK', 'PUMP', 'VALVE'] as const) {
     const item = HAIWELL_HMI_TOOLBOX.find((c) => c.type === type);
     assert.ok(item, `Missing toolbox spec for ${type}`);
     assert.ok(item.ports?.left && item.ports?.right && item.ports?.top && item.ports?.bottom);
-    assert.ok(item.propertyGridMap.x === 'Left' && item.propertyGridMap.y === 'Top');
+    assert.equal(item.configUiMethod, 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL');
+    assert.ok(item.documentedModalFields && Object.keys(item.documentedModalFields).length > 0);
   }
 });
 
@@ -133,9 +134,12 @@ test('desktop bridge exports native screen manifest + closed-loop pywinauto prop
   assert.equal(bridgeRes.ok, true);
   const bridge = bridgeRes.data as ReturnType<typeof compileDesktopAutomationBridge>;
   assert.equal(bridge.nativeImportManifest.schema, 'haiwell.scada.screen.v2');
+  assert.equal(bridge.nativeImportManifest.hwdevDirectBinaryWriteSupported, false);
+  assert.equal(bridge.nativeImportManifest.hwdevFileFormat, 'ENCRYPTED_PROPRIETARY_BINARY');
   assert.ok(bridge.uiaExecutionSteps.length >= 4);
   assert.match(bridge.pywinautoScript, /set_and_verify_property/);
   assert.match(bridge.pywinautoScript, /postConditionAssertions/);
+  assert.match(bridge.pywinautoScript, /map_canvas_point/);
   const b64Match = /STEPS = json\.loads\(base64\.b64decode\("([A-Za-z0-9+/=]+)"\)/.exec(bridge.pywinautoScript);
   assert.ok(b64Match, 'Expected Base64-encoded STEPS payload in pywinautoScript');
   const decodedStepsJson = Buffer.from(b64Match[1], 'base64').toString('utf8');

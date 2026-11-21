@@ -163,9 +163,9 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
     id: 'security',
     title: 'User Security, Operation Record, RFID & Haiwell A/B Key Policy',
     haiwellModules: [
-      'User Security RBAC (Privilege Levels 0-15, 128/256-bit SSL, A/B Key)',
+      'User Security RBAC (Official Haiwell Permission Levels 1-20, Operation Password, Local/Remote Login Locks, 128/256-bit SSL, A/B Key)',
       'Operation Record (Audit Trail Policy, Filtered Query & CSV Export)',
-      'RFID Card Reader & Operator Badge Auto-Login',
+      'RFID Card Reader & Operator Badge Auto-Login (-R / -RW HMI models, firmware >= 3.37)',
     ],
     tools: ['haiwell_security_policy', 'haiwell_operation_record_configure', 'haiwell_rfid_configure'],
     standards: ['IEC 62443-3-3'],
