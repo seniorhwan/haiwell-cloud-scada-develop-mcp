@@ -4,31 +4,32 @@
 - **Audited Commits:**
   - Pass 1 (Baseline v2.6.0): `4827a779749951fafcd1f65b0d4f310ef49018b8`
   - Pass 2 (Hardened v2.7.0): `c8527bf6708d78a1be4bf2b80edef349833a023e`
+  - Pass 3 (Local Remediation): Applied locally on top of `f45191c`
 - **Target Workstation Environment Verified Against:**
   - Windows 10/11 (`win32`), Node.js `v24.13.0`, npm `11.6.2`
   - Installed Software: `Haiwell Cloud Scada[3.50.1.19]` at `C:\Program Files (x86)\Haiwell\HaiwellScada3\Scada.Develop.exe`
 
 ---
 
-## 1. Executive Scorecard (`4827a77` -> `c8527bf`)
+## 1. Executive Scorecard (`4827a77` -> `c8527bf` -> Local Remediation)
 
-| # | Audit Category | Pass 1 (`4827a77`) | Pass 2 (`c8527bf`) | Summary of Current State |
-| :- | :--- | :--- | :--- | :--- |
-| **R1** | **Module Resolution (`src/mcp/version.ts`)** | N/A | **BROKEN (Blocker)** | `src/mcp/version.ts` was not committed in `c8527bf`; breaks `npm start`, `npm run dev`, `npm run lint`, and 3 test suites. |
-| **1** | **Desktop Bridges (`open_project` / `hmi_desktop`)** | Failed | **Fixed** | `run_displays`, `run_variables`, `run_tasks`, `run_events`, Label-to-Edit `rectangle()`, `pipeSteps`, and `unverifiedToolboxItems` implemented. |
-| **2** | **IEC 61131-3 ST Validator & JS Transpiler** | Failed | **Fixed** | `StartDelay` FB state helper, `XOR`, `VAR` initializers, `CASE 1..5:`, `A, B : INT;`, string `;`, and `Variable.GetByFullName` default all pass `new vm.Script()`. |
-| **3** | **Packaging, Startup (`npm start`), `.env` & `npm install`** | Failed | **Partially Fixed** | `npm start` (`tsx server.ts`), `dotenv/config`, and cross-platform `clean` fixed; `npm install` **still fails** with `ERESOLVE` (`esbuild@^0.25.0` vs `vite@8.3.8`). |
-| **4** | **Headless PLC/SCADA Simulation Engine** | Failed | **Fixed** | `haiwell_simulation_step` now executes saved ST POUs (`ChillerControl`) and cyclic JS scripts (`ComputePlantDeltaT`) in a sandboxed VM. |
-| **5** | **Safety Audit (`runProjectSafetyAudit`) & HMI Guards** | Failed | **Partially Fixed** | `tagName: "toString"` blocked, `PRO` HMIs added, `screen.pipes` cascade delete fixed. **Still fails:** `AUD-HMI-LAYOUT` is `MEDIUM` (`deploymentReady: true`), `startupScreenId`, `A8` COM, and `IPC_SCADA` Audio are not audited. |
-| **6** | **HTTP Server Security, SSRF & IDE `stdio` Configs** | Failed | **Partially Fixed** | `/api/manifest` redacts projects when unauthenticated, `TRUST_PROXY` guards `X-Forwarded-Host`, `McpServer` pooling added, and `generateClientConfigs` adds `cwd` + absolute path. **Still fails:** SSRF full IPv6-mapped IPv4 (`0:0:0:0:0:ffff:169.254.169.254`) and DNS rebinding. |
-| **7** | **Haiwell JavaScript Static Analyzer (`scriptAnalyzer.ts`)** | Failed | **Fixed** | `acorn` syntax parsing catches `var 123 = @@@`, allows local `var process = 1`, flags `Object.assign`/`.includes`/`for..of`, catches single-level `$InternalTag`, and checks AST for `EStop_OK`. |
-| **8** | **Multi-Vendor PLC Addressing & Overlap Detection** | Failed | **Still Fails** | Mixed Modbus coil notations (`00001`/`0X0`/`COIL:0`), bit-in-word overlap (`DB1.DBX0.0` vs `DB1.DBW0`), `4X65535` `FLOAT32` overflow, and `V100.12` `%MX12.12` bit offset `> 7` remain unfixed. |
-| **9** | **Desktop Launch & New Project (`desktopAutomation.ts`)** | Missing | **Fails on Real Host** | Tools added (`haiwell_desktop_inspect`, `haiwell_desktop_launch`, `haiwell_desktop_new_project`), but look in wrong install path (`C:\Program Files (x86)\HaiwellScada3`), parse XML `.lng` as INI, and fail on numeric `config.ini` `lang=0`. |
-| **10** | **Persistence (`workspace.json`), CSV Export & Assets** | Failed | **Fixed** | Rollback snapshots persist in `workspace.json`, CSV headers match Haiwell 3.50.x Variable Grid, and `public/assets/aistudio/` personal files were removed. |
+| # | Audit Category | Pass 1 (`4827a77`) | Pass 2 (`c8527bf`) | Pass 3 (Local Fix) | Summary of Current State |
+| :- | :--- | :--- | :--- | :--- | :--- |
+| **R1** | **Module Resolution (`src/mcp/version.ts`)** | N/A | **BROKEN (Blocker)** | **Fixed** | Created `src/mcp/version.ts` (`SERVER_VERSION = '2.7.0'`), restoring `npm start`, `npm run lint`, and all test suites. |
+| **1** | **Desktop Bridges (`open_project` / `hmi_desktop`)** | Failed | **Fixed** | **Fixed** | `run_displays`, `run_variables`, `run_tasks`, `run_events`, Label-to-Edit `rectangle()`, `pipeSteps`, and `unverifiedToolboxItems` implemented. |
+| **2** | **IEC 61131-3 ST Validator & JS Transpiler** | Failed | **Fixed** | **Fixed** | `StartDelay` FB state helper, `XOR`, `VAR` initializers, `CASE 1..5:`, `A, B : INT;`, string `;`, and `Variable.GetByFullName` default all pass `new vm.Script()`. |
+| **3** | **Packaging, Startup (`npm start`), `.env` & `npm install`** | Failed | **Partially Fixed** | **Fixed** | Bumped `esbuild` to `^0.28.0` in `package.json`; plain `npm install` now exits 0 cleanly without `--legacy-peer-deps`. |
+| **4** | **Headless PLC/SCADA Simulation Engine** | Failed | **Fixed** | **Fixed** | `haiwell_simulation_step` executes saved ST POUs (`ChillerControl`) and cyclic JS scripts (`ComputePlantDeltaT`) in a sandboxed VM. |
+| **5** | **Safety Audit (`runProjectSafetyAudit`) & HMI Guards** | Failed | **Partially Fixed** | **Fixed** | `AUD-HMI-LAYOUT` is always `HIGH`; `AUD-STARTUP-SCREEN`, `AUD-HW-COMPAT-A8`, `AUD-HW-COMPAT-IPC-AUDIO`, and `AUD-DANGLING-REF` on schedules/triggers added. |
+| **6** | **HTTP Server Security, SSRF & IDE `stdio` Configs** | Failed | **Partially Fixed** | **Fixed** | Full IPv6 expansion/embedded IPv4 extraction, BSD `inet_aton` decoding, and pre-connect `dns.promises.lookup(..., { all: true })` DNS-rebinding guard implemented. |
+| **7** | **Haiwell JavaScript Static Analyzer (`scriptAnalyzer.ts`)** | Failed | **Fixed** | **Fixed** | `acorn` syntax parsing catches `var 123 = @@@`, allows local `var process = 1`, flags `Object.assign`/`.includes`/`for..of`, catches single-level `$InternalTag`, and checks AST for `EStop_OK`. |
+| **8** | **Multi-Vendor PLC Addressing & Overlap Detection** | Failed | **Still Fails** | **Fixed** | Canonicalized Modbus coil/DI keys, added bit-in-word/bit-in-byte overlap detection, multi-word span upper-bound checks, and `%MX{byte}.{0..7}` formatting. |
+| **9** | **Desktop Launch & New Project (`desktopAutomation.ts`)** | Missing | **Fails on Real Host** | **Fixed** | Added Windows Registry + `Haiwell\HaiwellScada3` discovery, numeric `config.ini` `lang` mapping (`0 -> en`), XML `<Group>/<String>` `.lng` parser, and two-step New Project UIA flow (`"New project"` -> `"Project properties"`). *(Note: spawning `Scada.Develop.exe` from a sandboxed shell returns `OS_PERMISSION_DENIED` / `EACCES`, which is an OS sandbox boundary.)* |
+| **10** | **Persistence (`workspace.json`), CSV Export & Assets** | Failed | **Fixed** | **Fixed** | Rollback snapshots persist in `workspace.json`, CSV headers match Haiwell 3.50.x Variable Grid, and `public/assets/aistudio/` personal files were removed. |
 
 ---
 
-## 2. Active Failure Points in `c8527bf` (To Fix in Google AI Studio)
+## 2. Active Failure Points in `c8527bf` (All 6 Remediated Locally)
 
 ### Failure #1 (Blocker): Missing `src/mcp/version.ts` Crashes Server Startup, Typecheck, and Test Suites
 

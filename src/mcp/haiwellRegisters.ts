@@ -254,10 +254,23 @@ export function parseHaiwellRegister(address: string): ParsedHaiwellAddress | In
   let iecDirectAddress: string;
   if (area === 'X') iecDirectAddress = `%IX${Math.floor(index / 8)}.${index % 8}`;
   else if (area === 'Y') iecDirectAddress = `%QX${Math.floor(index / 8)}.${index % 8}`;
-  else if (area === 'AI') iecDirectAddress = `%IW${index}`;
-  else if (area === 'AQ') iecDirectAddress = `%QW${index}`;
-  else if (effectiveKind === 'BIT') iecDirectAddress = `%MX${Math.floor(index / 8)}.${bitOffset ?? index % 8}`;
-  else iecDirectAddress = `%MW${index}`;
+  else if (area === 'AI') {
+    iecDirectAddress =
+      bitOffset !== undefined
+        ? `%IX${index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`
+        : `%IW${index}`;
+  } else if (area === 'AQ') {
+    iecDirectAddress =
+      bitOffset !== undefined
+        ? `%QX${index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`
+        : `%QW${index}`;
+  } else if (bitOffset !== undefined) {
+    iecDirectAddress = `%MX${index * 2 + Math.floor(bitOffset / 8)}.${bitOffset % 8}`;
+  } else if (effectiveKind === 'BIT') {
+    iecDirectAddress = `%MX${Math.floor(index / 8)}.${index % 8}`;
+  } else {
+    iecDirectAddress = `%MW${index}`;
+  }
 
   return {
     valid: true,

@@ -11,7 +11,11 @@ import { validateStructuredText, transpileStToHaiwellJs } from './iec61131';
 import { validateHaiwellScript } from './scriptAnalyzer';
 import { runSimulationSteps } from './simulationEngine';
 import { compileDesktopAutomationBridge, compileFullOpenProjectBridge, compilePidScreen } from './hmiSpatialEngine';
-import { parseHaiwellLngContent } from './desktopAutomation';
+import { parseHaiwellLngContent, detectHaiwellLanguageFromConfig, buildNewProjectPowerShellScript } from './desktopAutomation';
+import { isBlockedSsrfHost, probeTcpEndpoint } from './protocolAdapters';
+import { detectWordOverlapConflicts } from './plcAddressing';
+import { parseHaiwellRegister } from './haiwellRegisters';
+import type { PlcDriverProtocol, TagDefinition } from './types';
 import { generateClientConfigs } from './resourcesAndPrompts';
 import { SERVER_VERSION } from './version';
 
@@ -549,4 +553,368 @@ btnok=确定
   assert.ok(newPrjRes.powershellScript.includes('Get-AdjacentControl'));
   assert.ok(newPrjRes.powershellScript.includes('ControlType]::MenuItem'));
   assert.ok(newPrjRes.powershellScript.includes('finally {'));
+});
+
+// =========================================================================
+// 10. PASS-3 REMEDIATION REGRESSION SUITE (ALL 6 ACTIVE FAILURES)
+// =========================================================================
+test('Audit #10a: SERVER_VERSION matches package.json version', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8')) as { version: string };
+  assert.equal(SERVER_VERSION, pkg.version);
+});
+
+test('Audit #10b: Desktop XML .lng parsing, numeric config.ini lang mapping, and two-step New Project PS script', () => {
+  const enXml = `<?xml version="1.0" encoding="utf-8"?>
+<Language>
+  <Group name="MainFormClassics">
+    <String name="MM_PROJECT" text="Project(#P)" />
+    <String name="MM_PROJECT_NEWPRJ" text="New project(#W)" />
+  </Group>
+  <Group name="Develop.Develop.FrmStart">
+    <String name="lklblNewProject" text="Create a new project..." />
+  </Group>
+  <Group name="Develop.Develop.FrmNewProject">
+    <String name="WindowText" text="New project" />
+    <String name="lblProjectName" text="Project name:" />
+    <String name="lblSaveFile" text="Save document:" />
+    <String name="btnOK" text="OK" />
+    <String name="btnCancel" text="Delete" />
+  </Group>
+  <Group name="FrmNewProject">
+    <String name="WINDOW_TEXT" text="Project properties" />
+    <String name="RUNTIMEPLATFORM" text="Runtime platform" />
+    <String name="OK" text="OK" />
+    <String name="Cancel" text="Cancel" />
+  </Group>
+</Language>`;
+
+  const zhXml = `<?xml version="1.0" encoding="utf-8"?>
+<Language>
+  <Group name="MainFormClassics">
+    <String name="MM_PROJECT" text="工程(#P)" />
+    <String name="MM_PROJECT_NEWPRJ" text="新建工程(#W)..." />
+  </Group>
+  <Group name="Develop.Develop.FrmNewProject">
+    <String name="WindowText" text="新建工程" />
+    <String name="lblProjectName" text="工程名称：" />
+    <String name="lblSaveFile" text="保存文件：" />
+    <String name="btnOK" text="确定" />
+  </Group>
+  <Group name="FrmNewProject">
+    <String name="WINDOW_TEXT" text="工程属性" />
+    <String name="RUNTIMEPLATFORM" text="运行平台" />
+    <String name="OK" text="确定" />
+    <String name="Cancel" text="取消" />
+  </Group>
+</Language>`;
+
+  const enLabels = parseHaiwellLngContent(enXml, 'en');
+  assert.equal(enLabels.projectMenu, 'Project(P)');
+  assert.equal(enLabels.newProjectMenuItem, 'New project(W)');
+  assert.equal(enLabels.startPageNewProjectLink, 'Create a new project...');
+  assert.equal(enLabels.newProjectModalTitle, 'New project');
+  assert.equal(enLabels.saveDocumentLabel, 'Save document:');
+  assert.equal(enLabels.newProjectDialogTitle, 'Project properties');
+  assert.equal(enLabels.runtimePlatformLabel, 'Runtime platform');
+  assert.equal(enLabels.okButton, 'OK');
+  assert.equal(enLabels.cancelButton, 'Cancel');
+
+  const zhLabels = parseHaiwellLngContent(zhXml, 'zh-cn');
+  assert.equal(zhLabels.projectMenu, '工程(P)');
+  assert.equal(zhLabels.newProjectMenuItem, '新建工程(W)...');
+  assert.equal(zhLabels.newProjectModalTitle, '新建工程');
+  assert.equal(zhLabels.saveDocumentLabel, '保存文件：');
+  assert.equal(zhLabels.newProjectDialogTitle, '工程属性');
+  assert.equal(zhLabels.okButton, '确定');
+
+  // Numeric config.ini lang=0 -> en, lang=1 -> zh-cn
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'haiwell-lang-test-'));
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'Language'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'Language', 'en.lng'), enXml, 'utf8');
+    fs.writeFileSync(path.join(tmpDir, 'Language', 'zh-cn.lng'), zhXml, 'utf8');
+
+    fs.writeFileSync(path.join(tmpDir, 'config.ini'), '[setting]\nlang=0\n', 'utf8');
+    const detEn = detectHaiwellLanguageFromConfig(tmpDir);
+    assert.equal(detEn.language, 'en');
+    assert.equal(detEn.lngFilePath, path.join(tmpDir, 'Language', 'en.lng'));
+    assert.equal(detEn.labels.newProjectDialogTitle, 'Project properties');
+
+    fs.writeFileSync(path.join(tmpDir, 'config.ini'), '[setting]\nlang=1\n', 'utf8');
+    const detZh = detectHaiwellLanguageFromConfig(tmpDir);
+    assert.equal(detZh.language, 'zh-cn');
+    assert.equal(detZh.lngFilePath, path.join(tmpDir, 'Language', 'zh-cn.lng'));
+    assert.equal(detZh.labels.newProjectDialogTitle, '工程属性');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // Two-step New Project PS script checks
+  const ps = buildNewProjectPowerShellScript({
+    projectName: 'Line_A',
+    saveDirectory: 'C:\\Projects\\Line_A',
+    runtimePlatform: 'Cloud HMI',
+    deviceModel: 'Haiwell HMI B7H',
+    resolution: '1024*600',
+    networkProjectPort: 8888,
+    labels: enLabels,
+  });
+  assert.ok(ps.includes('NativeWindowHandle'));
+  assert.ok(ps.includes('$isStep1'));
+  assert.ok(ps.includes('Save document'));
+  assert.ok(ps.includes('Project properties'));
+  assert.ok(ps.includes('Runtime platform'));
+  assert.ok(ps.includes('finally {'));
+});
+
+test('Audit #10c: Safety audit enforces HIGH on touch-target/collision/bounds, startupScreenId, A8 COM/Printer, IPC audio, and dangling schedule/trigger targets', async () => {
+  // 1. Touch-target violation alone -> AUD-HMI-LAYOUT HIGH & deploymentReady=false
+  const store1 = new HaiwellProjectStore();
+  const prj1 = store1.getProject('prj_chiller_plant_01');
+  prj1.targetHardware = 'CLOUD_HMI_B7H';
+  prj1.screens[0].widgets.push({
+    id: 'w_tiny_touch',
+    type: 'BIT_BUTTON',
+    label: 'Tiny Button',
+    x: 20,
+    y: 500,
+    width: 24,
+    height: 24,
+    tagName: 'Pump1_Run_Cmd',
+    writeEnabled: true,
+  });
+  const auditTouch = runProjectSafetyAudit(prj1);
+  const touchFinding = auditTouch.findings.find((f) => f.code === 'AUD-HMI-LAYOUT');
+  assert.equal(touchFinding?.severity, 'HIGH');
+  assert.equal(auditTouch.deploymentReady, false);
+
+  // 2. Dangling startupScreenId -> AUD-STARTUP-SCREEN HIGH
+  const store2 = new HaiwellProjectStore();
+  const prj2 = store2.getProject('prj_chiller_plant_01');
+  prj2.startupScreenId = 'scr_does_not_exist';
+  const auditStartup = runProjectSafetyAudit(prj2);
+  assert.ok(auditStartup.findings.some((f) => f.code === 'AUD-STARTUP-SCREEN' && f.severity === 'HIGH'));
+  assert.equal(auditStartup.deploymentReady, false);
+
+  // 3. CLOUD_HMI_A8 rejects RTU serial devices and PRINTER peripherals
+  const store3 = new HaiwellProjectStore();
+  const prj3 = store3.getProject('prj_chiller_plant_01');
+  prj3.targetHardware = 'CLOUD_HMI_A8';
+  prj3.devices.push({
+    id: 'dev_a8_rtu',
+    name: 'Serial PLC',
+    protocol: 'MODBUS_RTU',
+    transport: 'RTU',
+    serialPort: 'COM1',
+    baudRate: 9600,
+    dataBits: 8,
+    stopBits: 1,
+    parity: 'NONE',
+    stationId: 1,
+    pollIntervalMs: 250,
+    timeoutMs: 1000,
+    retryCount: 3,
+    byteOrder: 'CDAB',
+    enabled: true,
+  });
+  prj3.peripherals.push({
+    id: 'per_a8_printer',
+    name: 'Ticket Printer',
+    kind: 'PRINTER',
+    connection: 'SERIAL_RS232',
+    portOrAddress: 'COM2',
+    enabled: true,
+  });
+  const auditA8 = runProjectSafetyAudit(prj3);
+  const a8Findings = auditA8.findings.filter((f) => f.code === 'AUD-HW-COMPAT-A8');
+  assert.equal(a8Findings.length, 2);
+  assert.equal(auditA8.deploymentReady, false);
+
+  // 4. IPC_SCADA rejects enabled audio clips
+  const store4 = new HaiwellProjectStore();
+  const prj4 = store4.getProject('prj_chiller_plant_01');
+  prj4.targetHardware = 'IPC_SCADA';
+  prj4.audioClips.push({
+    id: 'aud_ipc_1',
+    name: 'Siren',
+    sourceType: 'VOICE_TTS',
+    filePathOrTtsText: 'Alarm',
+    volumePercent: 90,
+    repeatCount: 1,
+    enabled: true,
+  });
+  const auditIpc = runProjectSafetyAudit(prj4);
+  assert.ok(auditIpc.findings.some((f) => f.code === 'AUD-HW-COMPAT-IPC-AUDIO' && f.severity === 'HIGH'));
+  assert.equal(auditIpc.deploymentReady, false);
+
+  // 5. Dangling targetId in schedules and eventTriggers
+  const store5 = new HaiwellProjectStore();
+  const prj5 = store5.getProject('prj_chiller_plant_01');
+  prj5.schedules.push({
+    id: 'sch_dangling',
+    name: 'Missing Script',
+    cron: '0 * * * *',
+    timezone: 'UTC',
+    actionType: 'RUN_SCRIPT',
+    targetId: 'scr_missing_js',
+    enabled: true,
+  });
+  prj5.eventTriggers.push({
+    id: 'trg_dangling',
+    name: 'Missing Webhook',
+    sourceTag: 'Supply_Temp_C',
+    condition: 'GT',
+    threshold: 10,
+    actionType: 'SEND_WEBHOOK',
+    targetId: 'wh_missing',
+    enabled: true,
+  });
+  const auditRefs = runProjectSafetyAudit(prj5);
+  const refFindings = auditRefs.findings.filter((f) => f.code === 'AUD-DANGLING-REF');
+  assert.equal(refFindings.length, 2);
+  assert.equal(auditRefs.deploymentReady, false);
+});
+
+test('Audit #10d: SSRF guard blocks expanded IPv6-mapped IPv4, shorthand numeric IPv4, and DNS rebinding', async () => {
+  const expandedBypasses = [
+    '0:0:0:0:0:ffff:169.254.169.254',
+    '[0:0:0:0:0:ffff:169.254.169.254]',
+    '0000:0000:0000:0000:0000:ffff:a9fe:a9fe',
+    '64:ff9b::169.254.169.254',
+    'fe80::1%eth0',
+    '169.254.43518',
+    '169.16689662',
+  ];
+  for (const host of expandedBypasses) {
+    assert.equal(isBlockedSsrfHost(host), true, `Expected SSRF host "${host}" to be blocked`);
+    const res = await probeTcpEndpoint(host, 80, 1200);
+    assert.equal(res.reachable, false);
+    assert.match(res.error ?? '', /SSRF_BLOCK/);
+    assert.ok(res.latencyMs < 100, `Expected immediate SSRF_BLOCK without socket wait, got ${res.latencyMs}ms`);
+  }
+
+  // DNS rebinding guard: external hostname resolving to metadata or loopback IP is blocked
+  for (const resolvedIp of ['169.254.169.254', '0:0:0:0:0:ffff:169.254.169.254', '127.0.0.1']) {
+    const family = resolvedIp.includes(':') ? 6 : 4;
+    const rebindRes = await probeTcpEndpoint('169.254.169.254.nip.io', 80, 500, async () => [
+      { address: resolvedIp, family },
+    ]);
+    assert.equal(rebindRes.reachable, false);
+    assert.match(rebindRes.error ?? '', /SSRF_BLOCK/);
+  }
+});
+
+test('Audit #10e: PLC mixed Modbus coils, bit-in-word/byte overlaps, multi-word span bounds, and %MX bit formatting', async () => {
+  // 1. %MX bit formatting on V100.12 (byte 201, bit 4 -> %MX201.4)
+  const v100_12 = parseHaiwellRegister('V100.12');
+  assert.equal(v100_12.valid, true);
+  if (v100_12.valid) {
+    assert.equal(v100_12.iecDirectAddress, '%MX201.4');
+  }
+
+  const devMap = new Map<string, PlcDriverProtocol>([
+    ['dev_mb', 'MODBUS_TCP'],
+    ['dev_s7', 'SIEMENS_S7_1200'],
+    ['dev_hw', 'HAIWELL_PLC_TCP'],
+  ]);
+  const mkTag = (name: string, deviceId: string, address: string, dataType: TagDefinition['dataType']): TagDefinition => ({
+    name,
+    scope: 'PLC',
+    deviceId,
+    address,
+    dataType,
+    access: 'RW',
+    currentValue: dataType === 'BOOL' ? false : 0,
+    quality: 'GOOD',
+    safetyClass: 'SIL0',
+    requiresInterlock: false,
+    updatedAt: new Date().toISOString(),
+  });
+
+  // 2. Mixed Modbus coil & DI notation collisions
+  assert.ok(
+    detectWordOverlapConflicts(
+      { A: mkTag('A', 'dev_mb', '00001', 'BOOL'), B: mkTag('B', 'dev_mb', '0X0', 'BOOL') },
+      devMap
+    ).length >= 1
+  );
+  assert.ok(
+    detectWordOverlapConflicts(
+      { A: mkTag('A', 'dev_mb', '0X0', 'BOOL'), B: mkTag('B', 'dev_mb', 'COIL:0', 'BOOL') },
+      devMap
+    ).length >= 1
+  );
+  assert.ok(
+    detectWordOverlapConflicts(
+      { A: mkTag('A', 'dev_mb', '10001', 'BOOL'), B: mkTag('B', 'dev_mb', 'DI:0', 'BOOL') },
+      devMap
+    ).length >= 1
+  );
+
+  // 3. Bit-in-word & bit-in-byte overlap caught in BOTH tag orders
+  const bitWordPairs: [TagDefinition, TagDefinition][] = [
+    [mkTag('A', 'dev_s7', 'DB1.DBX0.0', 'BOOL'), mkTag('B', 'dev_s7', 'DB1.DBW0', 'INT16')],
+    [mkTag('A', 'dev_s7', 'DB1.DBW0', 'INT16'), mkTag('B', 'dev_s7', 'DB1.DBX0.0', 'BOOL')],
+    [mkTag('A', 'dev_s7', 'I0.0', 'BOOL'), mkTag('B', 'dev_s7', 'IW0', 'UINT16')],
+    [mkTag('A', 'dev_hw', 'V99', 'FLOAT32'), mkTag('B', 'dev_hw', 'V100.3', 'BOOL')],
+    [mkTag('A', 'dev_hw', 'V100.3', 'BOOL'), mkTag('B', 'dev_hw', 'V99', 'FLOAT32')],
+    [mkTag('A', 'dev_mb', '4X99', 'FLOAT32'), mkTag('B', 'dev_mb', '4X100.3', 'BOOL')],
+  ];
+  for (const [t1, t2] of bitWordPairs) {
+    assert.ok(
+      detectWordOverlapConflicts({ [t1.name]: t1, [t2.name]: t2 }, devMap).length >= 1,
+      `Expected bit-vs-word overlap between ${t1.address} and ${t2.address}`
+    );
+  }
+
+  // Distinct bits in the same word/byte must NOT collide
+  assert.equal(
+    detectWordOverlapConflicts(
+      { A: mkTag('A', 'dev_hw', 'V100.0', 'BOOL'), B: mkTag('B', 'dev_hw', 'V100.1', 'BOOL') },
+      devMap
+    ).length,
+    0
+  );
+  assert.equal(
+    detectWordOverlapConflicts(
+      { A: mkTag('A', 'dev_s7', 'DB1.DBX0.0', 'BOOL'), B: mkTag('B', 'dev_s7', 'DB1.DBX0.1', 'BOOL') },
+      devMap
+    ).length,
+    0
+  );
+
+  // 4. Multi-word upper-bound span overflow rejected in upsert & flagged in safety audit
+  const store = new HaiwellProjectStore();
+  await executeHaiwellTool(
+    'haiwell_device_add',
+    {
+      id: 'dev_mb',
+      name: 'Modbus PLC',
+      protocol: 'MODBUS_TCP',
+      transport: 'TCP',
+      host: '192.168.1.55',
+      port: 502,
+      stationId: 1,
+    },
+    store
+  );
+  const overflowUpsert = (await executeHaiwellTool(
+    'haiwell_tag_upsert_batch',
+    {
+      tags: [
+        { name: 'Mb_Overflow', scope: 'PLC', deviceId: 'dev_mb', address: '4X65535', dataType: 'FLOAT32' },
+        { name: 'Hw_Overflow', scope: 'PLC', deviceId: 'plc_chiller_01', address: 'V14847', dataType: 'FLOAT32' },
+      ],
+    },
+    store
+  )) as { upsertedCount: number; rejectedCount: number; errors: { code: string }[] };
+  assert.equal(overflowUpsert.upsertedCount, 0);
+  assert.equal(overflowUpsert.rejectedCount, 2);
+  assert.ok(overflowUpsert.errors.every((e) => e.code === 'ADDRESS_SPAN_OVERFLOW'));
+
+  // Even if manually injected into project.tags, runProjectSafetyAudit catches it
+  const prj = store.getProject('prj_chiller_plant_01');
+  prj.tags.Manual_Overflow = mkTag('Manual_Overflow', 'plc_chiller_01', 'V14847', 'FLOAT32');
+  const auditOverflow = runProjectSafetyAudit(prj);
+  assert.ok(auditOverflow.findings.some((f) => f.code === 'AUD-TAG-BAD-ADDR' && f.target === 'Manual_Overflow'));
 });

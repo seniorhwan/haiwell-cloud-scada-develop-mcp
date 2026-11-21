@@ -6,6 +6,7 @@
  * - OPC UA Part 6 AddressSpace mapper & UANodeSet2 XML generator (full XML escaping + duplicate NodeId guard)
  */
 
+import dns from 'node:dns';
 import net from 'node:net';
 import type { HaiwellProject, MqttTopicBinding, OpcUaNodeMapping, TagDataType } from './types';
 
@@ -100,63 +101,163 @@ export function buildMqttPayload(
   };
 }
 
-const BLOCKED_PROBE_HOSTS = [
-  /^169\.254\./,
-  /^::ffff:169\.254\./i,
-  /^::ffff:a9fe:/i,
-  /^fe80:/i,
-  /^0+\.0+\.0+\.0+$/,
-  /^::$/,
-  /^metadata(\.google\.internal|\.goog)?$/i,
-  /^100\.100\.100\.200$/,
-  /^::ffff:100\.100\.100\.200$/i,
-  /^::ffff:6464:64c8$/i,
-  /^fd00:ec2::254$/i,
-];
+const BLOCKED_METADATA_HOSTNAMES = /^metadata(\.google\.internal|\.goog)?$/i;
 
+function parseIpv4Part(part: string): number | null {
+  if (!/^(0x[0-9a-f]+|0[0-7]*|[1-9]\d*)$/i.test(part)) return null;
+  if (/^0x/i.test(part)) return Number.parseInt(part, 16);
+  if (part.startsWith('0') && part.length > 1) return Number.parseInt(part, 8);
+  return Number.parseInt(part, 10);
+}
+
+/**
+ * Decodes 1-, 2-, 3-, and 4-part BSD inet_aton numeric IPv4 forms
+ * (e.g. 2852039166, 0xa9fea9fe, 169.16689662, 169.254.43518, 0251.0376.0251.0376).
+ */
 function decodeNumericIpv4(raw: string): string | null {
   const s = raw.trim();
-  // Single integer IPv4 (decimal e.g. 2852039166 or hex e.g. 0xa9fea9fe or octal)
-  if (/^(0x[0-9a-f]+|0[0-7]+|\d+)$/i.test(s)) {
-    const num = s.toLowerCase().startsWith('0x')
-      ? Number.parseInt(s, 16)
-      : s.startsWith('0') && s.length > 1
-        ? Number.parseInt(s, 8)
-        : Number.parseInt(s, 10);
-    if (Number.isInteger(num) && num >= 0 && num <= 0xffffffff) {
-      return [(num >>> 24) & 255, (num >>> 16) & 255, (num >>> 8) & 255, num & 255].join('.');
-    }
-  }
-  // Dotted octal/hex octets (e.g. 0251.0376.0251.0376 or 0xa9.0xfe.0xa9.0xfe)
+  if (!s || s.includes(':')) return null;
   const parts = s.split('.');
-  if (parts.length === 4 && parts.every((p) => /^(0x[0-9a-f]+|0[0-7]+|\d+)$/i.test(p))) {
-    const octets = parts.map((p) =>
-      p.toLowerCase().startsWith('0x')
-        ? Number.parseInt(p, 16)
-        : p.startsWith('0') && p.length > 1
-          ? Number.parseInt(p, 8)
-          : Number.parseInt(p, 10)
-    );
-    if (octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
-      return octets.join('.');
-    }
+  if (parts.length < 1 || parts.length > 4) return null;
+  const nums = parts.map(parseIpv4Part);
+  if (nums.some((n) => n === null || !Number.isInteger(n) || n < 0)) return null;
+  const vals = nums as number[];
+
+  let addr = 0;
+  if (vals.length === 1) {
+    if (vals[0] > 0xffffffff) return null;
+    addr = vals[0] >>> 0;
+  } else if (vals.length === 2) {
+    if (vals[0] > 0xff || vals[1] > 0xffffff) return null;
+    addr = ((vals[0] << 24) | vals[1]) >>> 0;
+  } else if (vals.length === 3) {
+    if (vals[0] > 0xff || vals[1] > 0xff || vals[2] > 0xffff) return null;
+    addr = ((vals[0] << 24) | (vals[1] << 16) | vals[2]) >>> 0;
+  } else {
+    if (vals.some((v) => v > 0xff)) return null;
+    addr = ((vals[0] << 24) | (vals[1] << 16) | (vals[2] << 8) | vals[3]) >>> 0;
   }
-  return null;
+
+  return [(addr >>> 24) & 255, (addr >>> 16) & 255, (addr >>> 8) & 255, addr & 255].join('.');
+}
+
+function isBlockedIpv4Literal(ipv4: string): boolean {
+  return (
+    /^169\.254\./.test(ipv4) || // Cloud metadata / link-local 169.254.0.0/16
+    /^0\./.test(ipv4) || // Unspecified 0.0.0.0/8
+    ipv4 === '100.100.100.200' // Alibaba Cloud metadata
+  );
+}
+
+function expandIpv6ToHextets(raw: string): number[] | null {
+  let s = raw.trim().toLowerCase();
+  const zoneIdx = s.indexOf('%');
+  if (zoneIdx >= 0) s = s.slice(0, zoneIdx);
+  if (!s.includes(':')) return null;
+
+  const doubleColonParts = s.split('::');
+  if (doubleColonParts.length > 2) return null;
+
+  const parseSide = (side: string): number[] | null => {
+    if (!side) return [];
+    const tokens = side.split(':');
+    const out: number[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i];
+      if (!tok) return null;
+      if (tok.includes('.')) {
+        if (i !== tokens.length - 1) return null;
+        const octets = tok.split('.');
+        if (octets.length !== 4 || !octets.every((o) => /^\d{1,3}$/.test(o))) return null;
+        const nums = octets.map((o) => Number.parseInt(o, 10));
+        if (nums.some((n) => n < 0 || n > 255)) return null;
+        out.push((nums[0] << 8) | nums[1], (nums[2] << 8) | nums[3]);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(tok)) return null;
+        out.push(Number.parseInt(tok, 16));
+      }
+    }
+    return out;
+  };
+
+  if (doubleColonParts.length === 1) {
+    const hextets = parseSide(doubleColonParts[0]);
+    return hextets && hextets.length === 8 ? hextets : null;
+  }
+
+  const left = parseSide(doubleColonParts[0]);
+  const right = parseSide(doubleColonParts[1]);
+  if (!left || !right) return null;
+  // Trailing IPv4 in left side is invalid if right is non-empty
+  if (doubleColonParts[0].includes('.') && right.length > 0) return null;
+  const missing = 8 - (left.length + right.length);
+  if (missing < 1) return null;
+  return [...left, ...new Array<number>(missing).fill(0), ...right];
+}
+
+function extractEmbeddedIpv4FromIpv6(h: number[]): string | null {
+  const isIpv4Mapped = h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0xffff;
+  const isIpv4Compat =
+    h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0 && !(h[6] === 0 && h[7] <= 1);
+  const isNat64WellKnown = h[0] === 0x0064 && h[1] === 0xff9b && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0;
+  if (!isIpv4Mapped && !isIpv4Compat && !isNat64WellKnown) return null;
+  return [(h[6] >>> 8) & 0xff, h[6] & 0xff, (h[7] >>> 8) & 0xff, h[7] & 0xff].join('.');
+}
+
+function isLoopbackIp(ip: string): boolean {
+  const clean = ip.trim().replace(/^\[|\]$/g, '').split('%')[0];
+  if (/^127\./.test(clean)) return true;
+  const hextets = expandIpv6ToHextets(clean);
+  if (!hextets) return false;
+  if (hextets.slice(0, 7).every((v) => v === 0) && hextets[7] === 1) return true;
+  const embedded = extractEmbeddedIpv4FromIpv6(hextets);
+  return Boolean(embedded && /^127\./.test(embedded));
 }
 
 export function isBlockedSsrfHost(rawHost: string): boolean {
-  const host = rawHost.trim().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+  const host = rawHost.trim().replace(/^\[|\]$/g, '').replace(/\.+$/, '').split('%')[0];
   if (!host) return true;
-  if (BLOCKED_PROBE_HOSTS.some((re) => re.test(host))) return true;
-  const decoded = decodeNumericIpv4(host);
-  if (decoded && BLOCKED_PROBE_HOSTS.some((re) => re.test(decoded))) return true;
+  if (BLOCKED_METADATA_HOSTNAMES.test(host)) return true;
+
+  const decodedIpv4 = decodeNumericIpv4(host);
+  if (decodedIpv4 && isBlockedIpv4Literal(decodedIpv4)) return true;
+
+  const hextets = expandIpv6ToHextets(host);
+  if (hextets) {
+    // Unspecified :: (all zeros)
+    if (hextets.every((v) => v === 0)) return true;
+    // IPv6 link-local fe80::/10
+    if ((hextets[0] & 0xffc0) === 0xfe80) return true;
+    // AWS IPv6 IMDS fd00:ec2::254
+    if (
+      hextets[0] === 0xfd00 &&
+      hextets[1] === 0x0ec2 &&
+      hextets[2] === 0 &&
+      hextets[3] === 0 &&
+      hextets[4] === 0 &&
+      hextets[5] === 0 &&
+      hextets[6] === 0 &&
+      hextets[7] === 0x0254
+    ) {
+      return true;
+    }
+    const embeddedIpv4 = extractEmbeddedIpv4FromIpv6(hextets);
+    if (embeddedIpv4 && isBlockedIpv4Literal(embeddedIpv4)) return true;
+  }
+
   return false;
 }
+
+export type DnsLookupAllFn = (
+  hostname: string,
+  options: { all: true; verbatim?: boolean }
+) => Promise<Array<{ address: string; family: number }>>;
 
 export async function probeTcpEndpoint(
   host: string,
   port: number,
-  timeoutMs = 1500
+  timeoutMs = 1500,
+  lookupFn?: DnsLookupAllFn
 ): Promise<{ reachable: boolean; latencyMs: number; error?: string }> {
   if (isBlockedSsrfHost(host)) {
     return {
@@ -169,7 +270,65 @@ export async function probeTcpEndpoint(
     return { reachable: false, latencyMs: 0, error: `Invalid TCP port ${port}.` };
   }
 
+  const cleanHost = host.trim().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
   const start = performance.now();
+  let targetIp = cleanHost;
+  let targetFamily: number | undefined;
+
+  if (net.isIP(cleanHost) === 0) {
+    const decoded = decodeNumericIpv4(cleanHost);
+    if (decoded) {
+      targetIp = decoded;
+      targetFamily = 4;
+    } else {
+      const lookup: DnsLookupAllFn = lookupFn ?? ((h, opts) => dns.promises.lookup(h, opts));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const records = await Promise.race([
+          lookup(cleanHost, { all: true, verbatim: true }),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`DNS lookup timed out after ${timeoutMs}ms`)), timeoutMs);
+          }),
+        ]);
+        if (!records || records.length === 0) {
+          return {
+            reachable: false,
+            latencyMs: Number((performance.now() - start).toFixed(2)),
+            error: `DNS lookup returned no addresses for "${host}".`,
+          };
+        }
+        const isExplicitLocalhost =
+          cleanHost.toLowerCase() === 'localhost' || cleanHost.toLowerCase().endsWith('.localhost');
+        for (const rec of records) {
+          if (isBlockedSsrfHost(rec.address)) {
+            return {
+              reachable: false,
+              latencyMs: Number((performance.now() - start).toFixed(2)),
+              error: `SSRF_BLOCK: Host "${host}" resolved to forbidden address "${rec.address}".`,
+            };
+          }
+          if (!isExplicitLocalhost && isLoopbackIp(rec.address)) {
+            return {
+              reachable: false,
+              latencyMs: Number((performance.now() - start).toFixed(2)),
+              error: `SSRF_BLOCK: Host "${host}" resolved to loopback address "${rec.address}" (DNS rebinding blocked).`,
+            };
+          }
+        }
+        targetIp = records[0].address;
+        targetFamily = records[0].family;
+      } catch (err) {
+        return {
+          reachable: false,
+          latencyMs: Number((performance.now() - start).toFixed(2)),
+          error: err instanceof Error ? err.message : String(err),
+        };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+  }
+
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let settled = false;
@@ -189,7 +348,7 @@ export async function probeTcpEndpoint(
     socket.once('connect', () => finish(true));
     socket.once('timeout', () => finish(false, `TCP connect timed out after ${timeoutMs}ms`));
     socket.once('error', (err) => finish(false, err.message));
-    socket.connect(port, host);
+    socket.connect({ port, host: targetIp, ...(targetFamily ? { family: targetFamily } : {}) });
   });
 }
 

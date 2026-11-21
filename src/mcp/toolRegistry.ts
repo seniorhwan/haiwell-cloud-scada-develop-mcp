@@ -15,6 +15,7 @@ import {
   applyLinearScaling,
   detectWordOverlapConflicts,
   getWordSpanForType,
+  validateAddressSpanBounds,
   validatePlcAddress,
   validateTagValueForType,
   VENDOR_MODBUS_REGISTER_MAPS,
@@ -416,15 +417,27 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
             message: parsed.error,
             remediation: parsed.hint,
           });
-        } else if (parsed.readOnly && tag.access !== 'RO') {
-          findings.push({
-            code: 'AUD-TAG-RO-VIOLATION',
-            severity: 'CRITICAL',
-            domain: 'tags',
-            target: tag.name,
-            message: `Tag "${tag.name}" allows ${tag.access} access on physical read-only register ${tag.address}.`,
-            remediation: 'Set tag access mode to RO.',
-          });
+        } else {
+          const spanCheck = validateAddressSpanBounds(parsed, tag.dataType, tag.wordSpan);
+          if (!spanCheck.valid) {
+            findings.push({
+              code: 'AUD-TAG-BAD-ADDR',
+              severity: 'CRITICAL',
+              domain: 'tags',
+              target: tag.name,
+              message: spanCheck.error,
+              remediation: 'Assign a lower starting register index so the full multi-word span fits within hardware bounds.',
+            });
+          } else if (parsed.readOnly && tag.access !== 'RO') {
+            findings.push({
+              code: 'AUD-TAG-RO-VIOLATION',
+              severity: 'CRITICAL',
+              domain: 'tags',
+              target: tag.name,
+              message: `Tag "${tag.name}" allows ${tag.access} access on physical read-only register ${tag.address}.`,
+              remediation: 'Set tag access mode to RO.',
+            });
+          }
         }
       }
     }
@@ -462,16 +475,25 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
 
   // 3. Validate HMI screens (collisions, bounds, tags, nav links, touch targets)
   const screenIds = new Set(project.screens.map((s) => s.id));
+  if (project.startupScreenId && !screenIds.has(project.startupScreenId)) {
+    findings.push({
+      code: 'AUD-STARTUP-SCREEN',
+      severity: 'HIGH',
+      domain: 'hmi',
+      target: project.startupScreenId,
+      message: `Project startupScreenId "${project.startupScreenId}" does not match any HMI screen in project "${project.id}".`,
+      remediation: 'Create the missing startup screen or update startupScreenId to an existing screen ID.',
+    });
+  }
   for (const screen of project.screens) {
     const res = validateHmiScreen(screen, project.tags, {
       knownScreenIds: screenIds,
       targetHardware: project.targetHardware,
     });
     if (!res.valid) {
-      const hasBindingBreak = res.unresolvedTags.length > 0 || res.brokenNavTargets.length > 0;
       findings.push({
         code: 'AUD-HMI-LAYOUT',
-        severity: hasBindingBreak ? 'HIGH' : 'MEDIUM',
+        severity: 'HIGH',
         domain: 'hmi',
         target: screen.id,
         message: `Screen "${screen.name}" issues: collisions=${res.collisions.length}, outOfBounds=${res.outOfBounds.length}, unresolvedTags=${res.unresolvedTags.length}, brokenNav=${res.brokenNavTargets.length}, touchTargets=${res.touchTargetViolations.length}.`,
@@ -633,10 +655,47 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
       if (!hasOwnTag(project, tn)) pushDangling('mqtt', `mqtt_binding:${bind.id}`, tn);
     }
   }
+  const scriptIds = new Set(project.scripts.map((s) => s.id));
+  const webhookIds = new Set(project.webhooks.map((w) => w.id));
+  const reportIds = new Set(project.reports.map((r) => r.id));
+  const hasRecipeTarget = (targetId: string): boolean => {
+    const [grpId, recId] = targetId.split(':');
+    const grp = project.recipes.find((r) => r.id === grpId);
+    return Boolean(grp && recId && grp.records.some((rec) => rec.recordId === recId));
+  };
+  const pushDanglingRef = (domain: HaiwellDomain, target: string, refKind: string, targetId: string) => {
+    findings.push({
+      code: 'AUD-DANGLING-REF',
+      severity: 'HIGH',
+      domain,
+      target,
+      message: `${target} references missing ${refKind} "${targetId}".`,
+      remediation: `Create the missing ${refKind} "${targetId}" or remove the stale reference before deployment.`,
+    });
+  };
   for (const ev of project.eventTriggers) {
     if (!hasOwnTag(project, ev.sourceTag)) pushDangling('scripts', `event_trigger:${ev.id}`, ev.sourceTag);
     if (ev.actionType === 'WRITE_TAG' && !hasOwnTag(project, ev.targetId)) {
       pushDangling('scripts', `event_trigger:${ev.id}`, ev.targetId);
+    } else if (ev.actionType === 'OPEN_SCREEN' && !screenIds.has(ev.targetId)) {
+      pushDanglingRef('scripts', `event_trigger:${ev.id}`, 'screen', ev.targetId);
+    } else if (ev.actionType === 'RUN_SCRIPT' && !scriptIds.has(ev.targetId)) {
+      pushDanglingRef('scripts', `event_trigger:${ev.id}`, 'script', ev.targetId);
+    } else if (ev.actionType === 'SEND_WEBHOOK' && !webhookIds.has(ev.targetId)) {
+      pushDanglingRef('scripts', `event_trigger:${ev.id}`, 'webhook', ev.targetId);
+    } else if (ev.actionType === 'DOWNLOAD_RECIPE' && !hasRecipeTarget(ev.targetId)) {
+      pushDanglingRef('scripts', `event_trigger:${ev.id}`, 'recipe', ev.targetId);
+    }
+  }
+  for (const sch of project.schedules) {
+    if (sch.actionType === 'WRITE_TAG' && !hasOwnTag(project, sch.targetId)) {
+      pushDangling('operations', `schedule:${sch.id}`, sch.targetId);
+    } else if (sch.actionType === 'RUN_SCRIPT' && !scriptIds.has(sch.targetId)) {
+      pushDanglingRef('operations', `schedule:${sch.id}`, 'script', sch.targetId);
+    } else if (sch.actionType === 'DOWNLOAD_RECIPE' && !hasRecipeTarget(sch.targetId)) {
+      pushDanglingRef('operations', `schedule:${sch.id}`, 'recipe', sch.targetId);
+    } else if (sch.actionType === 'EXPORT_REPORT' && !reportIds.has(sch.targetId)) {
+      pushDanglingRef('operations', `schedule:${sch.id}`, 'report', sch.targetId);
     }
   }
   for (const rcp of project.recipes) {
@@ -742,6 +801,56 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
           target: `screen:${scr.id}`,
           message: `Screen "${scr.name}" places a Camera display widget on ${project.targetHardware}. Official Haiwell documentation (/docs/RTSP) restricts RTSP Camera display to PRO-series HMIs or PC/IPC SCADA.`,
           remediation: 'Remove CAMERA_VIEW widget on non-PRO HMIs or upgrade targetHardware.',
+        });
+      }
+    }
+  }
+
+  // Official Haiwell en.lng (A8SWITCHPLATFORMTIPS2): A8 does not support COM serial devices or printers
+  if (project.targetHardware === 'CLOUD_HMI_A8') {
+    for (const dev of project.devices) {
+      if (dev.enabled && dev.transport === 'RTU') {
+        findings.push({
+          code: 'AUD-HW-COMPAT-A8',
+          severity: 'HIGH',
+          domain: 'devices',
+          target: `device:${dev.id}`,
+          message: `Serial RTU device "${dev.name}" (${dev.id}) is not supported on CLOUD_HMI_A8 (Haiwell A8 does not support COM serial devices or printers).`,
+          remediation: 'Switch device transport to TCP/Ethernet or select a non-A8 targetHardware.',
+        });
+      }
+    }
+    for (const per of project.peripherals ?? []) {
+      if (
+        per.enabled &&
+        (per.kind === 'PRINTER' ||
+          per.kind === 'SERIAL_PORT' ||
+          per.connection === 'SERIAL_RS232' ||
+          per.connection === 'SERIAL_RS485')
+      ) {
+        findings.push({
+          code: 'AUD-HW-COMPAT-A8',
+          severity: 'HIGH',
+          domain: 'operations',
+          target: `peripheral:${per.id}`,
+          message: `Peripheral "${per.name}" (${per.kind}/${per.connection}) is not supported on CLOUD_HMI_A8 (Haiwell A8 does not support COM devices or printers).`,
+          remediation: 'Remove the printer/serial peripheral or target a supported HMI/SCADA platform.',
+        });
+      }
+    }
+  }
+
+  // Official Haiwell en.lng (ERROR_AUDIO_PLAY_IPC): IPC does not support audio playing
+  if (project.targetHardware === 'IPC_SCADA') {
+    for (const aud of project.audioClips ?? []) {
+      if (aud.enabled) {
+        findings.push({
+          code: 'AUD-HW-COMPAT-IPC-AUDIO',
+          severity: 'HIGH',
+          domain: 'operations',
+          target: `audio:${aud.id}`,
+          message: `Audio clip "${aud.name}" (${aud.id}) is enabled on IPC_SCADA, which does not support Haiwell audio playback.`,
+          remediation: 'Disable/remove audio clips on IPC_SCADA or target a supported Cloud HMI / PC_SCADA platform.',
         });
       }
     }
@@ -1764,6 +1873,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
               tag: t.name,
               code: 'REGISTER_TYPE_MISMATCH',
               error: `WORD register ${parsed.normalized} cannot bind BOOL without bit suffix (e.g., ${parsed.normalized}.0).`,
+            });
+            continue;
+          }
+          const spanCheck = validateAddressSpanBounds(parsed, t.dataType);
+          if (!spanCheck.valid) {
+            errors.push({
+              tag: t.name,
+              code: 'ADDRESS_SPAN_OVERFLOW',
+              error: spanCheck.error,
             });
             continue;
           }
@@ -4648,6 +4766,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       'Automate creating a new .hwdev project inside a running Haiwell Cloud Scada desktop window using UIA MenuItem traversal, adjacent-Label ComboBox selection (runtime platform, device model, resolution), network port configuration, and try/finally clipboard restoration. Supports dryRun=true and non-Windows script generation.',
     inputSchema: z.object({
       projectName: z.string().min(1).max(120),
+      saveDirectory: z.string().max(300).optional(),
       runtimePlatform: z.string().min(1).max(64).default('Cloud HMI'),
       deviceModel: z.string().min(1).max(64).default('Haiwell HMI B7H'),
       resolution: z.string().min(3).max(32).default('1024*600'),
