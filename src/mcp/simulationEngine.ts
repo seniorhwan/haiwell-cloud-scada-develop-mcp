@@ -715,7 +715,16 @@ export function runSimulationSteps(project: HaiwellProject, input: SimulationSte
     );
     if (tripped && input.enforceEStopSafeState !== false) {
       for (const tag of Object.values(project.tags)) {
-        if (tag.requiresInterlock && tag.access !== 'RO') {
+        if (tag.access === 'RO' || (eStopTag && tag.name === eStopTag.name)) continue;
+        const isSafetyOutput =
+          tag.requiresInterlock ||
+          tag.safetyClass === 'SIL1' ||
+          tag.safetyClass === 'SIL2' ||
+          tag.safetyClass === 'SIL3' ||
+          (tag.scope === 'PLC' &&
+            tag.dataType === 'BOOL' &&
+            /^(?:0X|COIL:|Y\d|Q\d|%Q)/i.test((tag.address ?? '').trim()));
+        if (isSafetyOutput) {
           const safeVal =
             tag.dataType === 'BOOL' ? false : tag.dataType === 'STRING' ? '' : (tag.safeMin ?? 0);
           if (tag.currentValue !== safeVal) {

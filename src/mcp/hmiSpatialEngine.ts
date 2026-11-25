@@ -50,10 +50,15 @@ export const HAIWELL_GRAPHICS_LIBRARY_CATEGORIES = [
 
 export type HaiwellGraphicsLibraryCategory = (typeof HAIWELL_GRAPHICS_LIBRARY_CATEGORIES)[number];
 
+export type HaiwellVisualStyle = 'FLAT_ISA101' | 'SKEUOMORPHIC_3D' | 'SCHEMATIC_VECTOR' | 'MIXED';
+
 export interface HaiwellGraphicsCategoryMeta {
   category: HaiwellGraphicsLibraryCategory;
   completeness: 'VERIFIED_FROM_350_UI_AND_DOCS' | 'PARTIAL_NUMBERED_ICON_PACK';
   requiresLiveCatalogCalibration: boolean;
+  visualStyle: HaiwellVisualStyle;
+  isa101Recommended: boolean;
+  isa101Guidance: string;
   verifiedItems: string[];
   namingNote: string;
   docSources: string[];
@@ -75,6 +80,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Favorite·Common',
     completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
     requiresLiveCatalogCalibration: false,
+    visualStyle: 'MIXED',
+    isa101Recommended: true,
+    isa101Guidance: 'Use Panel 2/Panel 3 and Instrument 3/Cursor 3; avoid 3D decorative icons.',
     verifiedItems: ['Reactor 25', 'Blade 6', 'Instrument 3', 'Cursor 3', 'Panel 2', 'Panel 3', 'Arrow 1'],
     namingNote: 'Pinned favorite items shown in Haiwell Cloud Scada 3.50.1.19 Favorite·Common tab.',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -83,6 +91,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Functional components',
     completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
     requiresLiveCatalogCalibration: false,
+    visualStyle: 'FLAT_ISA101',
+    isa101Recommended: true,
+    isa101Guidance: 'Primary ISA-101 control & telemetry set (flat Bit lamp, Bit switch, Numeric/Text, Function button).',
     verifiedItems: [
       'Bit lamp',
       'Bit switch',
@@ -107,6 +118,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Switch',
     completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
     requiresLiveCatalogCalibration: false,
+    visualStyle: 'SKEUOMORPHIC_3D',
+    isa101Recommended: false,
+    isa101Guidance: 'Skeuomorphic 3D toggle/rocker switches; prefer flat Bit switch / Function button for ISA-101 HMIs.',
     verifiedItems: Array.from({ length: 19 }, (_, i) => `Switch${i + 1}`),
     namingNote: 'Verified from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll (Switch1..Switch19).',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll'],
@@ -115,6 +129,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Lamp',
     completeness: 'PARTIAL_NUMBERED_ICON_PACK',
     requiresLiveCatalogCalibration: true,
+    visualStyle: 'SKEUOMORPHIC_3D',
+    isa101Recommended: false,
+    isa101Guidance: '3D pilot lamps; prefer flat Bit lamp with muted OFF and green/red ON for ISA-101.',
     verifiedItems: [],
     namingNote: 'Numbered lamp symbol pack; exact icon names are discovered live via calibrate_haiwell_uia.py (not guessed).',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -123,6 +140,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Valve',
     completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
     requiresLiveCatalogCalibration: false,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    isa101Guidance: 'Use for P&ID process valve state visualization.',
     verifiedItems: ['Valve1', 'Valve2'],
     namingNote: 'Verified from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll (Valve1, Valve2).',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll'],
@@ -131,6 +151,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Tank',
     completeness: 'PARTIAL_NUMBERED_ICON_PACK',
     requiresLiveCatalogCalibration: true,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    isa101Guidance: 'Use for P&ID vessels; avoid bright gradients.',
     verifiedItems: ['Reactor 25'],
     namingNote: 'Numbered tank/reactor symbol pack (Reactor 25 verified in 3.50.1.19 UI). Enumerate remaining icons via calibrate_haiwell_uia.py.',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -139,6 +162,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Motor·Blade',
     completeness: 'PARTIAL_NUMBERED_ICON_PACK',
     requiresLiveCatalogCalibration: true,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    isa101Guidance: 'Use for pumps, fans, and rotary actuators.',
     verifiedItems: ['Blade 6'],
     namingNote: 'Numbered motor/blade symbol pack (Blade 6 verified in 3.50.1.19 UI). Enumerate remaining icons via calibrate_haiwell_uia.py.',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -147,6 +173,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Advanced controls',
     completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
     requiresLiveCatalogCalibration: false,
+    visualStyle: 'FLAT_ISA101',
+    isa101Recommended: true,
+    isa101Guidance: 'Use Tendency chart, New alarm table, Historical data report table, and Conveyor belt 1/2.',
     verifiedItems: [
       'Conveyor belt 1',
       'Conveyor belt 2',
@@ -186,6 +215,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Instrument·Cursor',
     completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
     requiresLiveCatalogCalibration: false,
+    visualStyle: 'FLAT_ISA101',
+    isa101Recommended: true,
+    isa101Guidance: 'Use Instrument 3 / Cursor 3 for analog KPIs and bar graphs.',
     verifiedItems: [
       'Instrument 1',
       'Instrument 2',
@@ -205,6 +237,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Traceless·Pipe',
     completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
     requiresLiveCatalogCalibration: false,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    isa101Guidance: 'Static pipe segments for P&ID backgrounds.',
     verifiedItems: Array.from({ length: 30 }, (_, i) => `Pipe ${i + 1}`),
     namingNote: 'Verified from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll (Pipe 1..Pipe 30).',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll'],
@@ -213,6 +248,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Trace·Pipe',
     completeness: 'VERIFIED_FROM_350_UI_AND_DOCS',
     requiresLiveCatalogCalibration: false,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    isa101Guidance: 'Flow-animated pipe segments for active P&ID lines.',
     verifiedItems: Array.from({ length: 30 }, (_, i) => `Pipe ${i + 1}`),
     namingNote: 'Verified from Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll (Pipe 1..Pipe 30).',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 Scada.Develop.Symbol.dll'],
@@ -221,6 +259,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Shape·Panel',
     completeness: 'PARTIAL_NUMBERED_ICON_PACK',
     requiresLiveCatalogCalibration: true,
+    visualStyle: 'FLAT_ISA101',
+    isa101Recommended: true,
+    isa101Guidance: 'Use Panel 2 / Panel 3 as clean ISA-101 section group frames.',
     verifiedItems: ['Panel 2', 'Panel 3'],
     namingNote: 'Numbered panel/shape pack (Panel 2, Panel 3 verified in 3.50.1.19 UI). Enumerate remaining icons via calibrate_haiwell_uia.py.',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -229,6 +270,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Environment·Nature',
     completeness: 'PARTIAL_NUMBERED_ICON_PACK',
     requiresLiveCatalogCalibration: true,
+    visualStyle: 'SKEUOMORPHIC_3D',
+    isa101Recommended: false,
+    isa101Guidance: 'Decorative graphics; omit on ISA-101 operator screens.',
     verifiedItems: [],
     namingNote: 'Numbered environment/nature graphics pack; discovered live via calibrate_haiwell_uia.py.',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -237,6 +281,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Sign·Symbol',
     completeness: 'PARTIAL_NUMBERED_ICON_PACK',
     requiresLiveCatalogCalibration: true,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    isa101Guidance: 'Use Arrow 1 to indicate material or process flow direction.',
     verifiedItems: ['Arrow 1'],
     namingNote: 'Numbered sign/symbol pack (Arrow 1 verified in 3.50.1.19 UI). Enumerate remaining icons via calibrate_haiwell_uia.py.',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -245,6 +292,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Safety·Sign',
     completeness: 'PARTIAL_NUMBERED_ICON_PACK',
     requiresLiveCatalogCalibration: true,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    isa101Guidance: 'Use sparingly for physical hazard callouts.',
     verifiedItems: [],
     namingNote: 'Numbered safety sign graphics pack; discovered live via calibrate_haiwell_uia.py.',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -253,6 +303,9 @@ export const HAIWELL_GRAPHICS_LIBRARY_METADATA: Record<
     category: 'Daily·Other',
     completeness: 'PARTIAL_NUMBERED_ICON_PACK',
     requiresLiveCatalogCalibration: true,
+    visualStyle: 'MIXED',
+    isa101Recommended: false,
+    isa101Guidance: 'Miscellaneous graphics; avoid on industrial operator displays.',
     verifiedItems: [],
     namingNote: 'Miscellaneous graphics pack; discovered live via calibrate_haiwell_uia.py.',
     docSources: ['Haiwell Cloud Scada 3.50.1.19 UI'],
@@ -269,6 +322,8 @@ export interface ToolboxComponentSpec {
   graphicsLibraryCategory: HaiwellGraphicsLibraryCategory;
   haiwellToolboxName: string;
   toolboxNameVerified: boolean;
+  visualStyle?: HaiwellVisualStyle;
+  isa101Recommended?: boolean;
   configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL';
   placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS';
   officialDocUrl: string;
@@ -586,6 +641,8 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
     graphicsLibraryCategory: 'Shape·Panel',
     haiwellToolboxName: 'Panel 2',
     toolboxNameVerified: true,
+    visualStyle: 'FLAT_ISA101',
+    isa101Recommended: true,
     configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
     placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
     officialDocUrl: 'https://help.haiwell.com/docs/programmingProcess',
@@ -595,9 +652,94 @@ export const HAIWELL_HMI_TOOLBOX: ToolboxComponentSpec[] = [
     allowedTagTypes: ['BOOL', 'INT16', 'FLOAT32'],
     documentedModalFields: { container: 'Panel container grouped with child components' },
   },
+  {
+    type: 'STATION',
+    category: 'PID_EQUIPMENT',
+    graphicsLibraryCategory: 'Shape·Panel',
+    haiwellToolboxName: 'Panel 2',
+    toolboxNameVerified: true,
+    visualStyle: 'FLAT_ISA101',
+    isa101Recommended: true,
+    configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
+    placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
+    officialDocUrl: 'https://help.haiwell.com/docs/programmingProcess',
+    defaultSize: { width: 168, height: 104 },
+    minSize: { width: 112, height: 64 },
+    interactive: true,
+    allowedTagTypes: ['BOOL', 'INT16', 'UINT16', 'FLOAT32'],
+    ports: { left: { rx: 0, ry: 0.5 }, right: { rx: 1, ry: 0.5 }, top: { rx: 0.5, ry: 0 }, bottom: { rx: 0.5, ry: 1 } },
+    documentedModalFields: { tagName: 'Read variable' },
+  },
+  {
+    type: 'CONVEYOR',
+    category: 'PID_EQUIPMENT',
+    graphicsLibraryCategory: 'Advanced controls',
+    haiwellToolboxName: 'Conveyor belt 1',
+    toolboxNameVerified: true,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
+    placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
+    officialDocUrl: 'https://help.haiwell.com/docs/programmingProcess',
+    defaultSize: { width: 168, height: 72 },
+    minSize: { width: 104, height: 48 },
+    interactive: false,
+    allowedTagTypes: ['BOOL', 'INT16', 'UINT16'],
+    ports: { left: { rx: 0, ry: 0.5 }, right: { rx: 1, ry: 0.5 }, top: { rx: 0.5, ry: 0 }, bottom: { rx: 0.5, ry: 1 } },
+    documentedModalFields: { tagName: 'Read variable' },
+  },
+  {
+    type: 'ACTUATOR',
+    category: 'PID_EQUIPMENT',
+    graphicsLibraryCategory: 'Motor·Blade',
+    haiwellToolboxName: 'Blade 6',
+    toolboxNameVerified: true,
+    visualStyle: 'SCHEMATIC_VECTOR',
+    isa101Recommended: true,
+    configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
+    placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
+    officialDocUrl: 'https://help.haiwell.com/docs/tuyuanfifteen',
+    defaultSize: { width: 136, height: 88 },
+    minSize: { width: 88, height: 64 },
+    interactive: true,
+    allowedTagTypes: ['BOOL', 'INT16', 'UINT16'],
+    ports: { left: { rx: 0, ry: 0.5 }, right: { rx: 1, ry: 0.5 }, top: { rx: 0.5, ry: 0 }, bottom: { rx: 0.5, ry: 1 } },
+    documentedModalFields: { tagName: 'Read variable' },
+  },
+  {
+    type: 'GROUP_PANEL',
+    category: 'DISPLAY',
+    graphicsLibraryCategory: 'Shape·Panel',
+    haiwellToolboxName: 'Panel 2',
+    toolboxNameVerified: true,
+    visualStyle: 'FLAT_ISA101',
+    isa101Recommended: true,
+    configUiMethod: 'DOUBLE_CLICK_OR_RIGHT_CLICK_PROPERTY_MODAL',
+    placementMethod: 'CLICK_TOOLBOX_THEN_DRAG_BOUNDING_BOX_ON_CANVAS',
+    officialDocUrl: 'https://help.haiwell.com/docs/programmingProcess',
+    defaultSize: { width: 320, height: 160 },
+    minSize: { width: 120, height: 64 },
+    interactive: false,
+    allowedTagTypes: ['BOOL', 'INT16', 'FLOAT32', 'STRING'],
+    documentedModalFields: { container: 'Section group panel framing related widgets' },
+  },
 ];
 
 const TOOLBOX_BY_TYPE = new Map(HAIWELL_HMI_TOOLBOX.map((c) => [c.type, c]));
+
+export function getToolboxComponentsWithStyle(): (ToolboxComponentSpec & {
+  visualStyle: HaiwellVisualStyle;
+  isa101Recommended: boolean;
+})[] {
+  return HAIWELL_HMI_TOOLBOX.map((c) => {
+    const catMeta = HAIWELL_GRAPHICS_LIBRARY_METADATA[c.graphicsLibraryCategory];
+    return {
+      ...c,
+      visualStyle: c.visualStyle ?? catMeta.visualStyle,
+      isa101Recommended: c.isa101Recommended ?? catMeta.isa101Recommended,
+    };
+  });
+}
 
 const GRID_STEP = 8;
 function snap(val: number): number {
@@ -626,10 +768,11 @@ export function getPortPoint(
 
 export interface PidNodeInput {
   id: string;
-  type: 'TANK' | 'PUMP' | 'VALVE' | 'NUMERIC_DISPLAY' | 'NUMERIC_INPUT' | 'BIT_BUTTON' | 'BIT_LAMP' | 'GAUGE' | 'BAR_GRAPH';
+  type: 'TANK' | 'PUMP' | 'VALVE' | 'STATION' | 'CONVEYOR' | 'ACTUATOR' | 'NUMERIC_DISPLAY' | 'NUMERIC_INPUT' | 'BIT_BUTTON' | 'BIT_LAMP' | 'GAUGE' | 'BAR_GRAPH';
   label: string;
   tagName?: string;
   writeEnabled?: boolean;
+  visualRole?: HmiWidget['visualRole'];
   unit?: string;
   min?: number;
   max?: number;
@@ -1055,6 +1198,7 @@ export function detectPipeWidgetCrossings(screen: HmiScreen): PipeWidgetCrossing
       const a = pts[k];
       const b = pts[k + 1];
       for (const w of screen.widgets) {
+        if (w.type === 'GROUP_PANEL') continue;
         if (w.id === pipe.fromWidgetId || w.id === pipe.toWidgetId) continue;
         if (segmentIntersectsRectInterior(a, b, w)) {
           crossings.push({ pipeId: pipe.id, widgetId: w.id, segmentIndex: k });
@@ -2247,6 +2391,7 @@ export function generateDesktopUiaCalibrator(options: {
 }
 
 export type OpenProjectBridgeSection = 'devices' | 'variables' | 'tasks' | 'events' | 'displays';
+export type ExistingProjectBridgeMode = 'BLANK' | 'MERGE' | 'REPLACE_DISPLAYS';
 
 function mapHaiwellRegisterTypeLabel(address?: string): { registerType: string; registerAddress: string } {
   const raw = (address ?? '').trim().toUpperCase();
@@ -2310,10 +2455,14 @@ export function compileFullOpenProjectBridge(
     windowTitleRegex?: string;
     uiaMap?: DesktopUiaMap;
     catalogOverrides?: Record<string, string>;
+    existingProjectMode?: ExistingProjectBridgeMode;
+    deleteScreenNames?: string[];
   } = {}
 ) {
   const sections = options.sections ?? ['devices', 'variables', 'tasks', 'events', 'displays'];
   const sectionSet = new Set(sections);
+  const existingProjectMode: ExistingProjectBridgeMode = options.existingProjectMode ?? 'BLANK';
+  const deleteScreenNames = options.deleteScreenNames ?? [];
   const winRegex = options.windowTitleRegex ?? options.uiaMap?.windowTitleRegex ?? '(?i)^Haiwell Cloud Scada\\[.*';
 
   const devicePlans = sectionSet.has('devices')
@@ -2487,6 +2636,8 @@ export function compileFullOpenProjectBridge(
     hwdevFileName: project.hwdevFileName,
     targetHardware: project.targetHardware,
     windowTitleRegex: winRegex,
+    existingProjectMode,
+    deleteScreenNames,
     sections,
     devices: devicePlans,
     variables: variablePlans,
@@ -2660,11 +2811,18 @@ export function compileFullOpenProjectBridge(
     `    return True`,
     ``,
     `def run_devices(app, win, dry_run: bool):`,
+    `    mode = PLAN.get("existingProjectMode", "BLANK")`,
     `    for dev in PLAN["devices"]:`,
-    `        print(f"[DEVICE] {dev['tabs']['Device information']['Device name']} ({dev['treeBranch']})")`,
+    `        dev_name = dev['tabs']['Device information']['Device name']`,
+    `        print(f"[DEVICE] {dev_name} ({dev['treeBranch']})")`,
     `        if dry_run:`,
     `            print(json.dumps(dev["tabs"], indent=2))`,
     `            continue`,
+    `        if mode != "BLANK":`,
+    `            existing_dev = win.child_window(title_re=f"(?i)^{re.escape(dev_name)}$", control_type="TreeItem", found_index=0)`,
+    `            if existing_dev.exists(timeout=0.5):`,
+    `                print(f"[SKIP EXISTING] Device {dev_name} already exists")`,
+    `                continue`,
     `        branch_node = navigate_tree(win, dev["treeBranch"])`,
     `        opened = False`,
     `        for btn_re in (r"(?i)^Add device$", r"(?i)^New$", r"(?i)^Add$"):`,
@@ -2871,10 +3029,35 @@ export function compileFullOpenProjectBridge(
     `            mouse.release(coords=(x2, y2))`,
     `            time.sleep(0.08)`,
     ``,
+    `def delete_existing_displays(app, win, names, dry_run: bool):`,
+    `    for name in names:`,
+    `        print(f"[DELETE DISPLAY] {name}")`,
+    `        if dry_run:`,
+    `            continue`,
+    `        navigate_tree(win, "Display -> Project display")`,
+    `        scr_item = win.child_window(title_re=f"(?i)^{re.escape(name)}$", control_type="TreeItem", found_index=0)`,
+    `        if scr_item.exists(timeout=1.2):`,
+    `            scr_item.right_click_input()`,
+    `            time.sleep(0.2)`,
+    `            if _click_context_menu_item(app, win, r"(?i)^(Delete|Remove).*"):`,
+    `                confirm_dlg = app.window(title_re="(?i).*(Confirm|Delete|Prompt|Haiwell).*")`,
+    `                if confirm_dlg.exists(timeout=1.5):`,
+    `                    yes_btn = confirm_dlg.child_window(title_re="(?i)^(Yes|OK|Confirm)$", control_type="Button", found_index=0)`,
+    `                    if yes_btn.exists(timeout=1.0):`,
+    `                        yes_btn.click_input()`,
+    `                        time.sleep(0.2)`,
+    `                print(f"[OK] Deleted display {name}")`,
+    `        else:`,
+    `            print(f"[SKIP] Display {name} not found")`,
+    ``,
     `def run_displays(app, win, uia: dict, dry_run: bool):`,
+    `    mode = PLAN.get("existingProjectMode", "BLANK")`,
+    `    delete_names = PLAN.get("deleteScreenNames") or []`,
+    `    if delete_names:`,
+    `        delete_existing_displays(app, win, delete_names, dry_run)`,
     `    catalog_overrides = load_graphics_catalog_overrides()`,
     `    for scr in PLAN["displays"]:`,
-    `        print(f"[DISPLAY] {scr['screenName']} ({scr['width']}x{scr['height']}, {len(scr['widgetSteps'])} widgets, {len(scr.get('pipeSteps', []))} pipes)")`,
+    `        print(f"[DISPLAY] {scr['screenName']} ({scr['width']}x{scr['height']}, {len(scr['widgetSteps'])} widgets, {len(scr.get('pipeSteps', []))} pipes, mode={mode})")`,
     `        if dry_run:`,
     `            for st in scr["widgetSteps"]:`,
     `                print(f"  - Step {st['step']}: {st['toolboxItemName']} @ {st['canvasBounds']} -> {st['modalFieldWrites']}")`,
@@ -2897,6 +3080,13 @@ export function compileFullOpenProjectBridge(
     `        scr_item = win.child_window(title_re=f"(?i)^{re.escape(scr['screenName'])}$", control_type="TreeItem", found_index=0)`,
     `        if scr_item.exists(timeout=1.5):`,
     `            scr_item.double_click_input()`,
+    `            if mode == "REPLACE_DISPLAYS":`,
+    `                time.sleep(0.25)`,
+    `                cv_clear = win.child_window(auto_id=uia.get("canvasAutoId", "") or "vectorControl1", found_index=0)`,
+    `                if cv_clear.exists(timeout=1.0):`,
+    `                    cv_clear.click_input()`,
+    `                    win.type_keys("^a{DELETE}")`,
+    `                    time.sleep(0.15)`,
     `        elif disp_node is not None:`,
     `            disp_node.right_click_input()`,
     `            time.sleep(0.2)`,
@@ -2976,6 +3166,8 @@ export function compileFullOpenProjectBridge(
     strategy: 'OPEN_HWDEV_FULL_PROJECT_UIA_BRIDGE',
     targetSoftware: 'Haiwell Cloud Scada 3.50.x (.NET WinForms / open .hwdev window)',
     windowTitleRegex: winRegex,
+    existingProjectMode,
+    deleteScreenNames,
     sectionsIncluded: sections,
     counts: {
       devices: devicePlans.length,

@@ -1,7 +1,7 @@
 ---
 name: haiwell-cloud-scada-develop
-version: 2.8.0
-description: Zero-UI, production-grade headless Model Context Protocol (MCP 2025-03-26) server (v2.8.0) for Haiwell Cloud SCADA Develop. Exposes 61 strictly validated tools across 15 domains for AI agents in VS Code, Google Antigravity, Claude Code, and Codex.
+version: 2.9.0
+description: Zero-UI, production-grade headless Model Context Protocol (MCP 2025-03-26) server (v2.9.0) for Haiwell Cloud SCADA Develop. Exposes 62 strictly validated tools across 15 domains for AI agents in VS Code, Google Antigravity, Claude Code, and Codex.
 transports:
   - streamable-http: POST http://localhost:3000/mcp
   - stdio: npx tsx src/mcp/stdio.ts

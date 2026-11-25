@@ -38,12 +38,14 @@ import {
   compileFullOpenProjectBridge,
   compilePidScreen,
   generateDesktopUiaCalibrator,
+  getToolboxComponentsWithStyle,
   HAIWELL_GRAPHICS_LIBRARY_CATALOG,
   HAIWELL_GRAPHICS_LIBRARY_METADATA,
   HAIWELL_HMI_TOOLBOX,
   REAL_HAIWELL_350_TREE_NODES,
   solveAndRepairScreenLayout,
 } from './hmiSpatialEngine';
+import { importHwrunProject } from './hwrunImporter';
 import {
   buildMqttPayload,
   generateOpcUaNodeSet2Xml,
@@ -110,6 +112,10 @@ const WIDGET_TYPES = [
   'PUMP',
   'VALVE',
   'PIPELINE',
+  'STATION',
+  'CONVEYOR',
+  'ACTUATOR',
+  'GROUP_PANEL',
   'TREND_CHART',
   'ALARM_BANNER',
   'RECIPE_SELECTOR',
@@ -118,6 +124,15 @@ const WIDGET_TYPES = [
   'NAV_BAR',
   'LABEL',
   'FACEPLATE_INSTANCE',
+] as const;
+
+const VISUAL_ROLES = [
+  'DEFAULT',
+  'PRIMARY_ACTION',
+  'DANGER_ACTION',
+  'WARNING_ACTION',
+  'STATUS_READONLY',
+  'KPI_HERO',
 ] as const;
 
 const SQL_RESERVED = new Set(['SELECT', 'DROP', 'DELETE', 'INSERT', 'UPDATE', 'TABLE', 'FROM', 'WHERE', 'UNION', 'ORDER', 'GROUP', 'INDEX', 'ALTER', 'CREATE', 'EXEC', 'EXECUTE', 'GRANT', 'REVOKE', 'TRUNCATE', 'JOIN']);
@@ -378,16 +393,24 @@ export function buildProjectExportBundle(project: HaiwellProject) {
       escapeCsvCell(t.description ?? '', true),
     ].join(',');
   const haiwellVarRows = plcTags.map(formatHaiwellRow);
-  const haiwellInternalHeader = 'Variable name,Scope,Data type,Initial value,Description';
-  const haiwellInternalRows = internalTags.map((t) =>
-    [
+  const haiwellInternalHeader = 'Variable name,Scope,Register address,Data type,Initial value,Description';
+  let nextInternalWord = 0;
+  const haiwellInternalRows = internalTags.map((t) => {
+    let regAddr = (t.address ?? '').trim();
+    if (!regAddr) {
+      const span = t.dataType === 'STRING' ? 16 : Math.max(1, t.wordSpan ?? getWordSpanForType(t.dataType));
+      regAddr = `W${nextInternalWord}`;
+      nextInternalWord += span;
+    }
+    return [
       escapeCsvCell(t.name, true),
       escapeCsvCell(t.scope),
+      escapeCsvCell(regAddr),
       escapeCsvCell(formatHaiwellDataType(t.dataType)),
       escapeCsvCell(t.currentValue ?? '', true),
       escapeCsvCell(t.description ?? '', true),
-    ].join(',')
-  );
+    ].join(',');
+  });
 
   return {
     format: 'haiwell-cloud-scada-bundle/v2.8',
@@ -1329,6 +1352,53 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 
   defineTool({
+    name: 'haiwell_project_import_hwrun',
+    domain: 'project',
+    haiwellFeature: 'Brownfield .hwrun / recipe.db Unencrypted SQLite Importer',
+    safetyTier: 'design',
+    description:
+      'Import an existing unencrypted Haiwell Cloud Scada .hwrun (e.g., Temporary/temp.hwrun) or recipe.db SQLite file into the MCP workspace—extracting devices, tags (auto-resolving cross-device duplicates), user screens (with optional excludeWindowIds), JS tasks (with Strict-ES5 diagnostics), and events in a single call.',
+    inputSchema: z.object({
+      filePath: z.string().min(3).max(500),
+      projectId: z.string().regex(/^[a-z0-9_-]{3,48}$/),
+      projectName: z.string().min(2).max(120).optional(),
+      excludeWindowIds: z.array(z.number().int().min(0)).default([]),
+      includeCommStatusTags: z.boolean().default(true),
+      overwrite: z.boolean().default(false),
+    }),
+    sampleInput: {
+      filePath: 'C:\\Haiwell\\Temporary\\temp.hwrun',
+      projectId: 'prj_imported_01',
+      excludeWindowIds: [5, 6, 7],
+      includeCommStatusTags: true,
+      overwrite: true,
+    },
+    handler: (input, store) => {
+      if (!input.overwrite && store.listProjects().some((p) => p.id === input.projectId)) {
+        throw new Error(
+          `PROJECT_EXISTS: Project "${input.projectId}" already exists. Pass overwrite: true to replace it.`
+        );
+      }
+      const res = importHwrunProject({
+        filePath: input.filePath,
+        projectId: input.projectId,
+        projectName: input.projectName,
+        excludeWindowIds: input.excludeWindowIds,
+        includeCommStatusTags: input.includeCommStatusTags,
+      });
+      store.saveProject(res.project);
+      return {
+        imported: true,
+        projectId: res.project.id,
+        name: res.project.name,
+        targetHardware: res.project.targetHardware,
+        resolution: res.project.resolution,
+        summary: res.summary,
+      };
+    },
+  }),
+
+  defineTool({
     name: 'haiwell_project_snapshot_rollback',
     domain: 'project',
     haiwellFeature: 'Atomic Project Checkpoints & Rollback',
@@ -2023,6 +2093,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       'Batch upsert PLC, internal, system, or cloud-shared variables. Validates deviceId existence, multi-vendor PLC addressing, dataType-to-register-kind compatibility, linear scaling, binary initial values, and 32-bit/64-bit multi-word register overlap collisions.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
+      autoPrefixOnDeviceConflict: z.boolean().default(false),
+      allowDeviceReassign: z.boolean().default(false),
       tags: z
         .array(
           z.object({
@@ -2077,24 +2149,56 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       const deviceProtocols = new Map<string, PlcDriverProtocol>(project.devices.map((d) => [d.id, d.protocol]));
+      const deviceNames = new Map<string, string>(project.devices.map((d) => [d.id, d.name]));
       const deviceOffsets = new Map<string, 'BASE_0' | 'BASE_1'>(
         project.devices.map((d) => [d.id, d.addressOffset ?? 'BASE_0'])
       );
       const now = new Date().toISOString();
       const errors: { tag: string; code: string; error: string }[] = [];
-      const upserted: string[] = [];
+      const upsertedSet = new Set<string>();
+      const autoPrefixedTags: { requestedName: string; assignedName: string; deviceId: string }[] = [];
 
       // Candidate map so multi-word overlaps are caught BEFORE committing
       const candidateTags = { ...project.tags };
 
       for (const t of input.tags) {
-        if (FORBIDDEN_PROTO_KEYS.has(t.name) || Object.prototype.hasOwnProperty.call(Object.prototype, t.name)) {
+        let effectiveName = t.name;
+        if (FORBIDDEN_PROTO_KEYS.has(effectiveName) || Object.prototype.hasOwnProperty.call(Object.prototype, effectiveName)) {
           errors.push({
-            tag: t.name,
+            tag: effectiveName,
             code: 'RESERVED_IDENTIFIER',
-            error: `Tag name "${t.name}" is a reserved JavaScript Object.prototype identifier.`,
+            error: `Tag name "${effectiveName}" is a reserved JavaScript Object.prototype identifier.`,
           });
           continue;
+        }
+        const existingCandidate = Object.prototype.hasOwnProperty.call(candidateTags, effectiveName)
+          ? candidateTags[effectiveName]
+          : undefined;
+        const incomingScopeOwner = t.scope === 'PLC' ? `PLC:${t.deviceId ?? ''}` : `SCOPE:${t.scope}`;
+        const existingScopeOwner = existingCandidate
+          ? existingCandidate.scope === 'PLC'
+            ? `PLC:${existingCandidate.deviceId ?? ''}`
+            : `SCOPE:${existingCandidate.scope}`
+          : undefined;
+
+        if (existingCandidate && existingScopeOwner !== incomingScopeOwner && !input.allowDeviceReassign) {
+          if (input.autoPrefixOnDeviceConflict && t.scope === 'PLC' && t.deviceId) {
+            const devPrefix = (deviceNames.get(t.deviceId) ?? t.deviceId).replace(/[^A-Za-z0-9_]/g, '_');
+            let prefixed = `${devPrefix}_${t.name}`.slice(0, 64);
+            let n = 2;
+            while (Object.prototype.hasOwnProperty.call(candidateTags, prefixed)) {
+              prefixed = `${devPrefix}_${t.name}_${n++}`.slice(0, 64);
+            }
+            autoPrefixedTags.push({ requestedName: t.name, assignedName: prefixed, deviceId: t.deviceId });
+            effectiveName = prefixed;
+          } else {
+            errors.push({
+              tag: t.name,
+              code: 'DUPLICATE_TAG_NAME_CROSS_DEVICE',
+              error: `Tag name "${t.name}" is already bound to ${existingScopeOwner}; cannot silently overwrite from ${incomingScopeOwner}. Use a device-prefixed name, pass autoPrefixOnDeviceConflict: true, or pass allowDeviceReassign: true.`,
+            });
+            continue;
+          }
         }
         let modbus0: number | undefined;
         let modbus1: number | undefined;
@@ -2170,17 +2274,17 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         }
 
         const defaultVal = t.dataType === 'BOOL' ? false : t.dataType === 'STRING' ? '' : 0;
-        const existingTag = getOwnTag(project, t.name);
+        const existingTag = getOwnTag(project, effectiveName);
         const proposedInit = t.initialValue ?? existingTag?.currentValue ?? defaultVal;
         const valCheck = validateTagValueForType(t.dataType, proposedInit);
         if (!valCheck.valid) {
-          errors.push({ tag: t.name, code: valCheck.code, error: valCheck.error });
+          errors.push({ tag: effectiveName, code: valCheck.code, error: valCheck.error });
           continue;
         }
         if (t.initialValue !== undefined && typeof valCheck.normalizedValue === 'number') {
           if (t.safeMin !== undefined && valCheck.normalizedValue < t.safeMin) {
             errors.push({
-              tag: t.name,
+              tag: effectiveName,
               code: 'INITIAL_VALUE_OUT_OF_SAFE_RANGE',
               error: `initialValue (${valCheck.normalizedValue}) is below safeMin (${t.safeMin}).`,
             });
@@ -2188,7 +2292,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           }
           if (t.safeMax !== undefined && valCheck.normalizedValue > t.safeMax) {
             errors.push({
-              tag: t.name,
+              tag: effectiveName,
               code: 'INITIAL_VALUE_OUT_OF_SAFE_RANGE',
               error: `initialValue (${valCheck.normalizedValue}) exceeds safeMax (${t.safeMax}).`,
             });
@@ -2197,7 +2301,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         }
 
         const candidate = {
-          name: t.name,
+          name: effectiveName,
           scope: t.scope,
           deviceId: t.deviceId,
           address: normalizedAddr,
@@ -2221,23 +2325,24 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           updatedAt: now,
         };
 
-        const testMap = { ...candidateTags, [t.name]: candidate };
+        const testMap = { ...candidateTags, [effectiveName]: candidate };
         const overlaps = detectWordOverlapConflicts(testMap, deviceProtocols, deviceOffsets).filter(
-          (c) => c.tagA === t.name || c.tagB === t.name
+          (c) => c.tagA === effectiveName || c.tagB === effectiveName
         );
         if (overlaps.length > 0) {
           errors.push({
-            tag: t.name,
+            tag: effectiveName,
             code: 'REGISTER_OVERLAP_COLLISION',
             error: overlaps[0].reason,
           });
           continue;
         }
 
-        candidateTags[t.name] = candidate;
-        upserted.push(t.name);
+        candidateTags[effectiveName] = candidate;
+        upsertedSet.add(effectiveName);
       }
 
+      const upserted = Array.from(upsertedSet);
       if (upserted.length > 0) {
         project.tags = candidateTags;
         store.saveProject(project);
@@ -2246,6 +2351,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       return {
         upsertedCount: upserted.length,
         upserted,
+        ...(autoPrefixedTags.length > 0 ? { autoPrefixedTags } : {}),
         rejectedCount: errors.length,
         errors,
         totalTags: Object.keys(project.tags).length,
@@ -2651,37 +2757,72 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     safetyTier: 'design',
     description:
       'Generate a collision-free Haiwell Cloud SCADA / Cloud HMI screen using 2D occupancy auto-layout (zero silent drops), touch-target >=44px checks, navigation verification, and optional SVG export.',
-    inputSchema: z.object({
-      projectId: z.string().default(DEFAULT_PROJECT_ID),
-      screenId: z.string().regex(/^[a-z0-9_-]{2,48}$/),
-      name: z.string().min(2).max(100),
-      width: z.number().int().min(320).max(3840).default(1280),
-      height: z.number().int().min(240).max(2160).default(800),
-      layoutStandard: z
-        .enum(['ISA_101_HIGH_PERFORMANCE', 'STANDARD_INDUSTRIAL', 'MOBILE_UNIFIED'])
-        .default('ISA_101_HIGH_PERFORMANCE'),
-      columns: z.number().int().min(1).max(8).default(4),
-      includeAlarmBanner: z.boolean().default(true),
-      includeNavBar: z.boolean().default(true),
-      items: z
-        .array(
-          z.object({
-            id: z.string().optional(),
-            type: z.enum(WIDGET_TYPES),
-            label: z.string().min(1).max(80),
-            tagName: z.string().optional(),
-            writeEnabled: z.boolean().default(false),
-            targetScreenId: z.string().optional(),
-            unit: z.string().optional(),
-            min: z.number().optional(),
-            max: z.number().optional(),
-            colSpan: z.number().int().min(1).max(8).default(1),
-            rowSpan: z.number().int().min(1).max(3).default(1),
-          })
-        )
-        .min(1),
-      returnSvg: z.boolean().default(false),
-    }),
+    inputSchema: z
+      .object({
+        projectId: z.string().default(DEFAULT_PROJECT_ID),
+        screenId: z.string().regex(/^[a-z0-9_-]{2,48}$/),
+        name: z.string().min(2).max(100),
+        width: z.number().int().min(320).max(3840).default(1280),
+        height: z.number().int().min(240).max(2160).default(800),
+        layoutStandard: z
+          .enum(['ISA_101_HIGH_PERFORMANCE', 'STANDARD_INDUSTRIAL', 'MOBILE_UNIFIED'])
+          .default('ISA_101_HIGH_PERFORMANCE'),
+        columns: z.number().int().min(1).max(8).default(4),
+        includeAlarmBanner: z.boolean().default(true),
+        includeNavBar: z.boolean().default(true),
+        items: z
+          .array(
+            z.object({
+              id: z.string().optional(),
+              type: z.enum(WIDGET_TYPES),
+              label: z.string().min(1).max(80),
+              tagName: z.string().optional(),
+              writeEnabled: z.boolean().default(false),
+              targetScreenId: z.string().optional(),
+              visualRole: z.enum(VISUAL_ROLES).optional(),
+              unit: z.string().optional(),
+              min: z.number().optional(),
+              max: z.number().optional(),
+              colSpan: z.number().int().min(1).max(8).default(1),
+              rowSpan: z.number().int().min(1).max(3).default(1),
+            })
+          )
+          .min(1)
+          .optional(),
+        sections: z
+          .array(
+            z.object({
+              id: z.string().optional(),
+              title: z.string().min(1).max(80),
+              columns: z.number().int().min(1).max(6).default(2),
+              colSpan: z.number().int().min(1).max(4).default(1),
+              items: z
+                .array(
+                  z.object({
+                    id: z.string().optional(),
+                    type: z.enum(WIDGET_TYPES),
+                    label: z.string().min(1).max(80),
+                    tagName: z.string().optional(),
+                    writeEnabled: z.boolean().default(false),
+                    targetScreenId: z.string().optional(),
+                    visualRole: z.enum(VISUAL_ROLES).optional(),
+                    unit: z.string().optional(),
+                    min: z.number().optional(),
+                    max: z.number().optional(),
+                    colSpan: z.number().int().min(1).max(6).default(1),
+                    rowSpan: z.number().int().min(1).max(3).default(1),
+                  })
+                )
+                .min(1),
+            })
+          )
+          .min(1)
+          .optional(),
+        returnSvg: z.boolean().default(false),
+      })
+      .refine((d) => (d.items && d.items.length > 0) || (d.sections && d.sections.length > 0), {
+        message: 'Provide either non-empty items or non-empty sections.',
+      }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
       screenId: 'scr_pump_detail',
@@ -2739,6 +2880,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         tagName: z.string().optional(),
         writeEnabled: z.boolean().default(false),
         targetScreenId: z.string().optional(),
+        parentGroupId: z.string().optional(),
+        visualRole: z.enum(VISUAL_ROLES).optional(),
         unit: z.string().optional(),
         min: z.number().optional(),
         max: z.number().optional(),
@@ -2894,10 +3037,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     }),
     sampleInput: { category: 'PID_EQUIPMENT' },
     handler: (input) => {
+      const styled = getToolboxComponentsWithStyle();
       const items =
         input.category === 'ALL'
-          ? HAIWELL_HMI_TOOLBOX
-          : HAIWELL_HMI_TOOLBOX.filter((c) => c.category === input.category);
+          ? styled
+          : styled.filter((c) => c.category === input.category);
       return {
         count: items.length,
         gridSnapPx: 8,
@@ -2932,10 +3076,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         .array(
           z.object({
             id: z.string().regex(/^[a-zA-Z0-9_-]{2,48}$/),
-            type: z.enum(['TANK', 'PUMP', 'VALVE', 'NUMERIC_DISPLAY', 'NUMERIC_INPUT', 'BIT_BUTTON', 'BIT_LAMP', 'GAUGE', 'BAR_GRAPH']),
+            type: z.enum(['TANK', 'PUMP', 'VALVE', 'STATION', 'CONVEYOR', 'ACTUATOR', 'NUMERIC_DISPLAY', 'NUMERIC_INPUT', 'BIT_BUTTON', 'BIT_LAMP', 'GAUGE', 'BAR_GRAPH']),
             label: z.string().min(1).max(80),
             tagName: z.string().optional(),
             writeEnabled: z.boolean().default(false),
+            visualRole: z.enum(VISUAL_ROLES).optional(),
             unit: z.string().optional(),
             min: z.number().optional(),
             max: z.number().optional(),
@@ -2951,7 +3096,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             id: z.string().optional(),
             from: z.string().min(1),
             to: z.string().min(1),
-            fluid: z.enum(['CHILLED_WATER', 'HOT_WATER', 'STEAM', 'AIR', 'CHEMICAL', 'PROCESS', 'RETURN']).default('PROCESS'),
+            fluid: z.enum(['CHILLED_WATER', 'HOT_WATER', 'STEAM', 'AIR', 'CHEMICAL', 'PROCESS', 'RETURN', 'TRANSFER', 'SIGNAL']).default('PROCESS'),
             label: z.string().optional(),
             flowTagName: z.string().optional(),
           })
@@ -3150,6 +3295,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         .array(z.enum(['devices', 'variables', 'tasks', 'events', 'displays']))
         .min(1)
         .default(['devices', 'variables', 'tasks', 'events', 'displays']),
+      existingProjectMode: z.enum(['BLANK', 'MERGE', 'REPLACE_DISPLAYS']).default('BLANK'),
+      deleteScreenNames: z.array(z.string().min(1)).default([]),
       windowTitleRegex: z.string().min(3).default('(?i)^Haiwell Cloud Scada\\[.*'),
       uiaMap: z
         .object({
@@ -3176,6 +3323,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       }
       return compileFullOpenProjectBridge(project, {
         sections: input.sections,
+        existingProjectMode: input.existingProjectMode,
+        deleteScreenNames: input.deleteScreenNames,
         windowTitleRegex: input.windowTitleRegex,
         uiaMap: input.uiaMap,
         catalogOverrides: input.catalogOverrides,

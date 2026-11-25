@@ -176,6 +176,10 @@ export type HmiWidgetType =
   | 'PUMP'
   | 'VALVE'
   | 'PIPELINE'
+  | 'STATION'
+  | 'CONVEYOR'
+  | 'ACTUATOR'
+  | 'GROUP_PANEL'
   | 'TREND_CHART'
   | 'ALARM_BANNER'
   | 'RECIPE_SELECTOR'
@@ -184,6 +188,14 @@ export type HmiWidgetType =
   | 'NAV_BAR'
   | 'LABEL'
   | 'FACEPLATE_INSTANCE';
+
+export type HmiVisualRole =
+  | 'DEFAULT'
+  | 'PRIMARY_ACTION'
+  | 'DANGER_ACTION'
+  | 'WARNING_ACTION'
+  | 'STATUS_READONLY'
+  | 'KPI_HERO';
 
 export interface HmiWidget {
   id: string;
@@ -197,6 +209,8 @@ export interface HmiWidget {
   writeEnabled?: boolean;
   targetScreenId?: string;
   faceplateId?: string;
+  parentGroupId?: string;
+  visualRole?: HmiVisualRole;
   unit?: string;
   min?: number;
   max?: number;
@@ -210,7 +224,7 @@ export interface HmiPipeRoute {
   toWidgetId: string;
   fromPort: 'left' | 'right' | 'top' | 'bottom';
   toPort: 'left' | 'right' | 'top' | 'bottom';
-  fluid: 'CHILLED_WATER' | 'HOT_WATER' | 'STEAM' | 'AIR' | 'CHEMICAL' | 'PROCESS' | 'RETURN';
+  fluid: 'CHILLED_WATER' | 'HOT_WATER' | 'STEAM' | 'AIR' | 'CHEMICAL' | 'PROCESS' | 'RETURN' | 'TRANSFER' | 'SIGNAL';
   label?: string;
   flowTagName?: string;
   waypoints: { x: number; y: number }[];
