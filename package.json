@@ -1,6 +1,6 @@
 {
   "name": "haiwell-cloud-scada-develop-mcp",
-  "private": true,
+  "private": true,`n  "license": "MIT",
   "version": "2.12.0",
   "type": "module",
   "scripts": {
