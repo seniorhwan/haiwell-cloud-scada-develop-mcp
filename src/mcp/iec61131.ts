@@ -551,10 +551,10 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
     }
 
     if (inVarSection) {
-      // Quote-aware VAR declaration supporting comma-separated names (A, B : INT := 5;), STRING[N], ARRAY[lo..hi] OF TYPE, and string initializers containing `;`
+      // Quote-aware VAR declaration supporting comma-separated names (A, B : INT := 5;), STRING[N], 1D/multi-D ARRAY[lo..hi, ...] OF TYPE, and string initializers containing `;`
       const { masked: maskedDecl, literals: declLiterals } = maskIecStrings(trimmed);
       const declMatch =
-        /^([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)(?:\s+AT\s+(%[A-Za-z0-9_.]+))?\s*:\s*(?:(ARRAY\s*\[\s*-?\d+\s*\.\.\s*-?\d+\s*\]\s*OF\s+))?([A-Za-z_][A-Za-z0-9_]*)(?:\s*[\[(]\s*\d+\s*[\])])?(?:\s*:=\s*([^;]+))?\s*(;)?$/i.exec(
+        /^([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)(?:\s+AT\s+(%[A-Za-z0-9_.]+))?\s*:\s*(?:(ARRAY\s*\[\s*-?\d+\s*\.\.\s*-?\d+(?:\s*,\s*-?\d+\s*\.\.\s*-?\d+)*\s*\]\s*OF\s+))?([A-Za-z_][A-Za-z0-9_]*)(?:\s*[\[(]\s*\d+\s*[\])])?(?:\s*:=\s*([^;]+))?\s*(;)?$/i.exec(
           maskedDecl
         );
       if (!declMatch) {
@@ -636,7 +636,7 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
 
   // Analyze expanded logical body statements
   const statements = expandBodyStatements(bodyLines);
-  const blockStack: { kind: string; line: number; hasElse?: boolean; hasUntil?: boolean; whileCondVars?: string[]; mutatedVars?: Set<string> }[] = [];
+  const blockStack: { kind: string; line: number; hasElse?: boolean; hasUntil?: boolean; hasExit?: boolean; whileCondVars?: string[]; mutatedVars?: Set<string> }[] = [];
   const fullBodyUpper = cleaned.toUpperCase();
 
   for (const stmt of statements) {
@@ -654,6 +654,28 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
           message: `Statement "${trimmed}" missing trailing semicolon ";".`,
           fixHint: `Terminate "${trimmed}" with ";".`,
         });
+      }
+      if (/^EXIT\b/i.test(trimmed)) {
+        let enclosingLoop: (typeof blockStack)[number] | undefined;
+        for (let bi = blockStack.length - 1; bi >= 0; bi--) {
+          if (blockStack[bi].kind === 'FOR' || blockStack[bi].kind === 'WHILE' || blockStack[bi].kind === 'REPEAT') {
+            enclosingLoop = blockStack[bi];
+            break;
+          }
+        }
+        if (!enclosingLoop) {
+          diagnostics.push({
+            code: 'IEC-CTRL-011',
+            severity: 'ERROR',
+            line: lineNum,
+            column: 1,
+            rule: 'IEC 61131-3 §7.3.3.4 EXIT Statement',
+            message: 'EXIT statement is only valid inside a FOR, WHILE, or REPEAT loop.',
+            fixHint: 'Remove EXIT or use RETURN; to exit the POU.',
+          });
+        } else {
+          enclosingLoop.hasExit = true;
+        }
       }
       continue;
     }
@@ -797,6 +819,40 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
           fixHint: 'Use syntax "FOR i := 0 TO 10 BY 1 DO".',
         });
       } else {
+        const iterVar = varMap.get(fm[1].toUpperCase());
+        if (iterVar?.section === 'VAR_INPUT') {
+          diagnostics.push({
+            code: 'IEC-SAFE-005',
+            severity: 'ERROR',
+            line: lineNum,
+            column: 1,
+            rule: 'IEC 61131-3 §6.6.2 VAR_INPUT Immutability',
+            message: `Cannot use VAR_INPUT "${fm[1]}" as a FOR loop control variable.`,
+            fixHint: 'Declare a local VAR or VAR_TEMP integer as the FOR loop counter.',
+          });
+        }
+        if (iterVar?.constant) {
+          diagnostics.push({
+            code: 'IEC-SAFE-006',
+            severity: 'ERROR',
+            line: lineNum,
+            column: 1,
+            rule: 'IEC 61131-3 CONSTANT Immutability',
+            message: `Cannot use CONSTANT "${fm[1]}" as a FOR loop control variable.`,
+            fixHint: 'Use a mutable local integer variable for the FOR loop counter.',
+          });
+        }
+        if (iterVar?.directAddress && /^%I/i.test(iterVar.directAddress)) {
+          diagnostics.push({
+            code: 'IEC-SAFE-004',
+            severity: 'ERROR',
+            line: lineNum,
+            column: 1,
+            rule: 'Hardware Input Immutability',
+            message: `Cannot use hardware input "${fm[1]}" (${iterVar.directAddress}) as a FOR loop counter.`,
+            fixHint: 'Use a local integer variable for the FOR loop counter.',
+          });
+        }
         checkExpressionIdentifiers(`${fm[1]} ${fm[2]} ${fm[3]} ${fm[4] ?? ''}`, lineNum, varMap, pouName, diagnostics);
       }
     } else if (/^END_FOR\b/i.test(trimmed)) {
@@ -825,21 +881,22 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
           fixHint: 'Use syntax "WHILE <cond> DO".',
         });
       }
-      const cond = trimmed.replace(/^WHILE\s+/i, '').replace(/\s+DO$/i, '');
+      const cond = trimmed.replace(/^WHILE\s+/i, '').replace(/\s+DO$/i, '').trim();
+      const normalizedCond = stripOuterParens(cond);
       const condVars = [...stripLiteralsForIdentScan(cond).matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g)]
         .map((m) => m[1].toUpperCase())
         .filter((u) => !IEC_KEYWORDS.has(u));
-      blockStack.push({ kind: 'WHILE', line: lineNum, whileCondVars: condVars, mutatedVars: new Set() });
+      blockStack.push({ kind: 'WHILE', line: lineNum, whileCondVars: condVars, mutatedVars: new Set(), hasExit: false });
       cyclomaticComplexity++;
       checkExpressionIdentifiers(cond, lineNum, varMap, pouName, diagnostics);
-      if (/^WHILE\s+(TRUE|1\s*=\s*1)\b/i.test(trimmed)) {
+      if (/^(?:TRUE|1\s*=\s*1|NOT\s*\(?\s*FALSE\s*\)?)$/i.test(normalizedCond)) {
         diagnostics.push({
           code: 'IEC-SAFE-001',
           severity: 'ERROR',
           line: lineNum,
           column: 1,
           rule: 'PLC Watchdog Safety (IEC 61131-3 Scan-Cycle Determinism)',
-          message: 'Unbounded "WHILE TRUE" loop detected. Unbounded loops trigger PLC scan-cycle watchdog faults.',
+          message: `Unbounded "WHILE ${cond}" loop detected. Unbounded loops trigger PLC scan-cycle watchdog faults.`,
           fixHint: 'Use bounded FOR loops or cyclic state machines executed once per PLC scan cycle.',
         });
       }
@@ -856,7 +913,7 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
           fixHint: 'Match every WHILE ... DO with END_WHILE;.',
         });
       } else {
-        if (top.whileCondVars && top.whileCondVars.length > 0 && top.mutatedVars) {
+        if (top.whileCondVars && top.whileCondVars.length > 0 && top.mutatedVars && !top.hasExit) {
           const anyMutated = top.whileCondVars.some((v) => top.mutatedVars!.has(v));
           if (!anyMutated) {
             diagnostics.push({
@@ -866,7 +923,7 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
               column: 1,
               rule: 'PLC Watchdog Safety (Loop Termination)',
               message: `WHILE loop at line ${top.line} never mutates its condition variable(s) [${top.whileCondVars.join(', ')}] inside the loop body.`,
-              fixHint: 'Mutate the loop counter inside the loop or replace with a bounded FOR loop.',
+              fixHint: 'Mutate the loop counter inside the loop, add a bounded EXIT condition, or replace with a bounded FOR loop.',
             });
           }
         }
@@ -945,7 +1002,7 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
         fixHint: 'Guard divisors with an explicit non-zero check before dividing or taking MOD.',
       });
     } else {
-      const varDivMatch = /\/\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(maskedTrimmed);
+      const varDivMatch = /(?:\/|\bMOD\b)\s*([A-Za-z_][A-Za-z0-9_]*)/i.exec(maskedTrimmed);
       if (varDivMatch) {
         const divName = varDivMatch[1].toUpperCase();
         const guarded =
@@ -959,22 +1016,24 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
             line: lineNum,
             column: varDivMatch.index + 1,
             rule: 'PLC Runtime Fault Prevention (Unguarded Variable Divisor)',
-            message: `Division by variable "${varDivMatch[1]}" without visible non-zero guard.`,
-            fixHint: `Wrap division in "IF ${varDivMatch[1]} <> 0.0 THEN ... END_IF;".`,
+            message: `Division/MOD by variable "${varDivMatch[1]}" without visible non-zero guard.`,
+            fixHint: `Wrap division/MOD in "IF ${varDivMatch[1]} <> 0 THEN ... END_IF;".`,
           });
         }
       }
     }
 
-    // Float exact equality check (either LHS or RHS can be a float variable)
-    const eqMatch = /\b([A-Za-z0-9_.]+)\s*(=|<>)\s*([A-Za-z0-9_.]+)/g;
+    // Float exact equality check (supports negative literals/operands like x = -1.5)
+    const eqMatch = /(?<![A-Za-z0-9_.])(-?[A-Za-z0-9_.]+)\s*(=|<>)\s*(-?[A-Za-z0-9_.]+)/g;
     let eqHit: RegExpExecArray | null;
     while ((eqHit = eqMatch.exec(maskedTrimmed)) !== null) {
       const before = maskedTrimmed.slice(0, eqHit.index + eqHit[1].length + 1);
       if (maskedTrimmed.slice(eqHit.index, eqHit.index + eqHit[0].length + 1).includes(':=')) continue;
       if (before.endsWith(':')) continue;
-      const lhsVar = varMap.get(eqHit[1].toUpperCase());
-      const rhsVar = varMap.get(eqHit[3].toUpperCase());
+      const lhsKey = eqHit[1].replace(/^-/, '').toUpperCase();
+      const rhsKey = eqHit[3].replace(/^-/, '').toUpperCase();
+      const lhsVar = varMap.get(lhsKey);
+      const rhsVar = varMap.get(rhsKey);
       if ((lhsVar && FLOAT_TYPES.has(lhsVar.dataType)) || (rhsVar && FLOAT_TYPES.has(rhsVar.dataType))) {
         diagnostics.push({
           code: 'IEC-SAFE-003',
@@ -983,16 +1042,17 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
           column: eqHit.index + 1,
           rule: 'IEEE 754 Floating-Point Control Safety',
           message: `Exact equality/inequality "${eqHit[2]}" on REAL/LREAL comparison "${eqHit[1]} ${eqHit[2]} ${eqHit[3]}" can fail due to floating-point rounding.`,
-          fixHint: `Use tolerance comparison: ABS(${eqHit[1]} - ${eqHit[3]}) < 0.001.`,
+          fixHint: `Use tolerance comparison: ABS(${eqHit[1]} - (${eqHit[3]})) < 0.001.`,
         });
       }
     }
 
-    // Assignment validation (supports array element lhs like Arr[0] := 1;)
-    const assignMatch = /^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\])?|%[IQM][XBWDL]?\d+(?:\.\d+)?)\s*:=\s*(.+?)(;)?$/i.exec(trimmed);
+    // Assignment validation (supports array element lhs like Arr[0] := 1; Arr[i, j] := 1; and FB member lhs like T1.PT := T#5s;)
+    const assignMatch = /^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\]|\.[A-Za-z_][A-Za-z0-9_]*)?|%[IQM][XBWDL]?\d+(?:\.\d+)?)\s*:=\s*(.+?)(;)?$/i.exec(trimmed);
     if (assignMatch && !/^(IF|ELSIF|WHILE|FOR)\b/i.test(trimmed)) {
       const [, rawLhs, rhs, semi] = assignMatch;
-      const lhsBase = rawLhs.replace(/\[[^\]]+\]/, '');
+      const lhsMemberMatch = /\.([A-Za-z_][A-Za-z0-9_]*)$/.exec(rawLhs);
+      const lhsBase = rawLhs.replace(/\[[^\]]+\]/, '').replace(/\.[A-Za-z_][A-Za-z0-9_]*$/, '');
 
       // Record mutated var for enclosing WHILE loops
       for (const blk of blockStack) {
@@ -1037,6 +1097,17 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
             fixHint: `Declare "${lhsBase}" in VAR, VAR_OUTPUT, or VAR_GLOBAL.`,
           });
         } else if (lhsVar) {
+          if (lhsMemberMatch && !IEC_STANDARD_FBS.has(lhsVar.dataType)) {
+            diagnostics.push({
+              code: 'IEC-VAR-005',
+              severity: 'ERROR',
+              line: lineNum,
+              column: 1,
+              rule: 'IEC 61131-3 Member Access',
+              message: `Variable "${lhsBase}" (${lhsVar.dataType}) is not a function block instance and cannot assign member ".${lhsMemberMatch[1]}".`,
+              fixHint: 'Only standard function block instances support member assignment (e.g., T1.PT := T#5s;).',
+            });
+          }
           if (lhsVar.section === 'VAR_INPUT') {
             diagnostics.push({
               code: 'IEC-SAFE-005',
@@ -1071,23 +1142,88 @@ export function validateStructuredText(source: string): Iec61131ValidationResult
             });
           }
 
-          const rhsSingle = /^([A-Za-z_][A-Za-z0-9_]*)$/.exec(rhs.trim());
-          if (rhsSingle) {
-            const rhsVar = varMap.get(rhsSingle[1].toUpperCase());
-            if (rhsVar) {
-              const lhsBits = BIT_WIDTH[lhsVar.dataType];
-              const rhsBits = BIT_WIDTH[rhsVar.dataType];
-              const floatToInt = FLOAT_TYPES.has(rhsVar.dataType) && !FLOAT_TYPES.has(lhsVar.dataType);
-              if (floatToInt || (lhsBits && rhsBits && rhsBits > lhsBits)) {
-                diagnostics.push({
-                  code: 'IEC-TYPE-002',
-                  severity: 'ERROR',
-                  line: lineNum,
-                  column: 1,
-                  rule: 'IEC 61131-3 Strong Typing (No Implicit Narrowing)',
-                  message: `Implicit narrowing conversion from ${rhsVar.dataType} ("${rhsVar.name}") to ${lhsVar.dataType} ("${lhsVar.name}").`,
-                  fixHint: `Use explicit conversion function ${rhsVar.dataType}_TO_${lhsVar.dataType}(${rhsVar.name}).`,
-                });
+          if (!lhsMemberMatch) {
+            const lhsBits = BIT_WIDTH[lhsVar.dataType];
+            const rhsTrim = rhs.trim();
+            const rhsSingle = /^([A-Za-z_][A-Za-z0-9_]*)$/.exec(rhsTrim);
+            if (rhsSingle) {
+              const rhsVar = varMap.get(rhsSingle[1].toUpperCase());
+              if (rhsVar) {
+                const rhsBits = BIT_WIDTH[rhsVar.dataType];
+                const floatToInt = FLOAT_TYPES.has(rhsVar.dataType) && !FLOAT_TYPES.has(lhsVar.dataType);
+                if (floatToInt || (lhsBits && rhsBits && rhsBits > lhsBits)) {
+                  diagnostics.push({
+                    code: 'IEC-TYPE-002',
+                    severity: 'ERROR',
+                    line: lineNum,
+                    column: 1,
+                    rule: 'IEC 61131-3 Strong Typing (No Implicit Narrowing)',
+                    message: `Implicit narrowing conversion from ${rhsVar.dataType} ("${rhsVar.name}") to ${lhsVar.dataType} ("${lhsVar.name}").`,
+                    fixHint: `Use explicit conversion function ${rhsVar.dataType}_TO_${lhsVar.dataType}(${rhsVar.name}).`,
+                  });
+                }
+              }
+            } else if (
+              lhsBits &&
+              lhsVar.dataType !== 'BOOL' &&
+              !FLOAT_TYPES.has(lhsVar.dataType)
+            ) {
+              // Expression narrowing check (e.g., INT := REAL + 1.0 or INT := DINT + 1)
+              const { masked: maskedRhs } = maskIecStrings(rhsTrim);
+              // Strip explicit narrowing conversion calls so INT := REAL_TO_INT(r) + 1 is accepted
+              let exprOutsideCasts = maskedRhs;
+              for (const fn of ['TRUNC', 'ROUND']) {
+                exprOutsideCasts = rewriteBalancedCall(exprOutsideCasts, fn, () => '0');
+              }
+              exprOutsideCasts = exprOutsideCasts.replace(
+                /\b[A-Z0-9]+_TO_[A-Z0-9]+\s*\(/gi,
+                (m) => `__CAST_${m}`
+              );
+              // Remove __CAST_...(...) calls with balanced parens
+              let idxCast = exprOutsideCasts.indexOf('__CAST_');
+              while (idxCast !== -1) {
+                const openParen = exprOutsideCasts.indexOf('(', idxCast);
+                if (openParen === -1) break;
+                let depth = 0;
+                let endParen = openParen;
+                for (let ci = openParen; ci < exprOutsideCasts.length; ci++) {
+                  if (exprOutsideCasts[ci] === '(') depth++;
+                  else if (exprOutsideCasts[ci] === ')') {
+                    depth--;
+                    if (depth === 0) {
+                      endParen = ci;
+                      break;
+                    }
+                  }
+                }
+                exprOutsideCasts = exprOutsideCasts.slice(0, idxCast) + '0' + exprOutsideCasts.slice(endParen + 1);
+                idxCast = exprOutsideCasts.indexOf('__CAST_');
+              }
+              const isComparisonExpr = /(?:<>|<=|>=|[=<>])|\b(?:AND|OR|XOR|NOT)\b/i.test(exprOutsideCasts);
+              if (!isComparisonExpr) {
+                const hasFloatLiteral = /\b\d+\.\d+\b/.test(exprOutsideCasts);
+                const rhsIdentMatches = [...stripLiteralsForIdentScan(exprOutsideCasts).matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g)];
+                let wideningSource: string | null = null;
+                for (const rm of rhsIdentMatches) {
+                  const rv = varMap.get(rm[1].toUpperCase());
+                  if (!rv) continue;
+                  const rb = BIT_WIDTH[rv.dataType];
+                  if (FLOAT_TYPES.has(rv.dataType) || (rb && rb > lhsBits)) {
+                    wideningSource = `${rv.dataType} ("${rv.name}")`;
+                    break;
+                  }
+                }
+                if (wideningSource || hasFloatLiteral) {
+                  diagnostics.push({
+                    code: 'IEC-TYPE-002',
+                    severity: 'ERROR',
+                    line: lineNum,
+                    column: 1,
+                    rule: 'IEC 61131-3 Strong Typing (No Implicit Narrowing)',
+                    message: `Implicit narrowing expression assigned to ${lhsVar.dataType} ("${lhsVar.name}") from ${wideningSource ?? 'floating-point literal'}.`,
+                    fixHint: `Wrap the expression in an explicit conversion such as REAL_TO_${lhsVar.dataType}(...) or TRUNC(...).`,
+                  });
+                }
               }
             }
           }
@@ -1259,6 +1395,7 @@ export function validateLadderGraph(pouName: string, rungsJson: string): Iec6113
   const validCoilTypes = new Set(['OUT', 'SET', 'RESET']);
   const seenRungIds = new Set<string>();
   const writtenCoils = new Map<string, string>();
+  const latchedCoils = new Map<string, { type: string; rungId: string }>();
 
   rungs.forEach((rung, idx) => {
     const line = idx + 1;
@@ -1315,7 +1452,8 @@ export function validateLadderGraph(pouName: string, rungsJson: string): Iec6113
       return;
     }
 
-    if (/^(?:X|AI)\d+/i.test(rung.coil.tag) || /^%I/i.test(rung.coil.tag)) {
+    const trimmedCoilTag = rung.coil.tag.trim();
+    if (/^(?:X|AI)\d+(?:\.\d+)?$/i.test(trimmedCoilTag) || /^%I/i.test(trimmedCoilTag)) {
       diagnostics.push({
         code: 'IEC-SAFE-004',
         severity: 'ERROR',
@@ -1327,7 +1465,7 @@ export function validateLadderGraph(pouName: string, rungsJson: string): Iec6113
       });
     }
 
-    const coilKey = rung.coil.tag.toUpperCase();
+    const coilKey = trimmedCoilTag.toUpperCase();
     if (rung.coil.type === 'OUT') {
       if (writtenCoils.has(coilKey)) {
         diagnostics.push({
@@ -1339,18 +1477,34 @@ export function validateLadderGraph(pouName: string, rungsJson: string): Iec6113
           message: `Double-coil hazard: "${rung.coil.tag}" energized by both rung "${writtenCoils.get(coilKey)}" and "${rid}".`,
           fixHint: 'Combine parallel branch conditions into a single rung or use SET/RESET coils.',
         });
+      } else if (latchedCoils.has(coilKey)) {
+        const prev = latchedCoils.get(coilKey)!;
+        diagnostics.push({
+          code: 'IEC-LD-003',
+          severity: 'ERROR',
+          line,
+          column: 1,
+          rule: 'Double-Coil Hazard Prevention',
+          message: `Coil "${rung.coil.tag}" mixes ${prev.type} on rung "${prev.rungId}" with OUT on rung "${rid}".`,
+          fixHint: 'Use either a single OUT coil or paired SET/RESET coils, not both.',
+        });
       }
       writtenCoils.set(coilKey, rid);
-    } else if ((rung.coil.type === 'SET' || rung.coil.type === 'RESET') && writtenCoils.has(coilKey)) {
-      diagnostics.push({
-        code: 'IEC-LD-003',
-        severity: 'ERROR',
-        line,
-        column: 1,
-        rule: 'Double-Coil Hazard Prevention',
-        message: `Coil "${rung.coil.tag}" mixes OUT on rung "${writtenCoils.get(coilKey)}" with ${rung.coil.type} on rung "${rid}".`,
-        fixHint: 'Use either a single OUT coil or paired SET/RESET coils, not both.',
-      });
+    } else if (rung.coil.type === 'SET' || rung.coil.type === 'RESET') {
+      if (writtenCoils.has(coilKey)) {
+        diagnostics.push({
+          code: 'IEC-LD-003',
+          severity: 'ERROR',
+          line,
+          column: 1,
+          rule: 'Double-Coil Hazard Prevention',
+          message: `Coil "${rung.coil.tag}" mixes OUT on rung "${writtenCoils.get(coilKey)}" with ${rung.coil.type} on rung "${rid}".`,
+          fixHint: 'Use either a single OUT coil or paired SET/RESET coils, not both.',
+        });
+      }
+      if (!latchedCoils.has(coilKey)) {
+        latchedCoils.set(coilKey, { type: rung.coil.type, rungId: rid });
+      }
     }
   });
 
@@ -1470,21 +1624,23 @@ export function validateFbdNetwork(pouName: string, networkJson: string): Iec611
     if (bType === 'DIV') {
       const inVals = Object.entries(node.inputs ?? {});
       const divInput = inVals.find(([k]) => k.toUpperCase() === 'IN2')?.[1] ?? inVals[1]?.[1];
-      if (typeof divInput === 'string' && /^0(?:\.0+)?$/.test(divInput.trim())) {
+      const divNum = typeof divInput === 'number' ? divInput : (typeof divInput === 'string' && /^0(?:\.0+)?$/.test(divInput.trim()) ? 0 : NaN);
+      if (divNum === 0) {
         diagnostics.push({
           code: 'IEC-SAFE-002',
           severity: 'ERROR',
           line,
           column: 1,
           rule: 'PLC Runtime Fault Prevention (Division by Zero)',
-          message: `FBD DIV block "${node.id}" has literal zero divisor "${divInput}".`,
+          message: `FBD DIV block "${node.id}" has literal zero divisor "${String(divInput)}".`,
           fixHint: 'Ensure DIV IN2 is non-zero.',
         });
       }
     }
 
-    for (const outSig of Object.values(node.outputs ?? {})) {
-      if (/^(?:X|AI)\d+/i.test(outSig) || /^%I/i.test(outSig)) {
+    for (const rawOutSig of Object.values(node.outputs ?? {})) {
+      const outSig = String(rawOutSig ?? '').trim();
+      if (/^(?:X|AI)\d+(?:\.\d+)?$/i.test(outSig) || /^%I/i.test(outSig)) {
         diagnostics.push({
           code: 'IEC-SAFE-004',
           severity: 'ERROR',
@@ -1495,7 +1651,8 @@ export function validateFbdNetwork(pouName: string, networkJson: string): Iec611
           fixHint: 'Connect FBD output to writable register/coil instead of %I/X/AI.',
         });
       }
-      const list = signalProducers.get(outSig) ?? [];
+      const sigKey = outSig.toUpperCase();
+      const list = signalProducers.get(sigKey) ?? [];
       if (list.length > 0) {
         diagnostics.push({
           code: 'IEC-FBD-002',
@@ -1508,15 +1665,16 @@ export function validateFbdNetwork(pouName: string, networkJson: string): Iec611
         });
       }
       list.push(node.id);
-      signalProducers.set(outSig, list);
+      signalProducers.set(sigKey, list);
     }
   });
 
   // Build dependency edges and detect combinational cycles (algebraic loops)
   for (const node of nodes) {
     if (!node?.id) continue;
-    for (const inSig of Object.values(node.inputs ?? {})) {
-      const producers = signalProducers.get(inSig) ?? [];
+    for (const rawInSig of Object.values(node.inputs ?? {})) {
+      const sigKey = String(rawInSig ?? '').trim().toUpperCase();
+      const producers = signalProducers.get(sigKey) ?? [];
       for (const producer of producers) {
         graph.get(producer)?.push(node.id);
       }
@@ -1676,30 +1834,302 @@ function stripOuterParens(expr: string): string {
   return s;
 }
 
-function convertXorAndPrecedence(maskedExpr: string): string {
-  const s = maskedExpr.trim();
-  if (!/\bXOR\b/i.test(s)) return s;
+function rewriteBalancedCall(expr: string, fnName: string, transform: (argsInner: string) => string): string {
+  const re = new RegExp(`(?<![.\\w])${fnName}\\s*\\(`, 'gi');
+  let out = '';
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(expr)) !== null) {
+    const openParen = expr.indexOf('(', m.index);
+    if (openParen === -1) continue;
+    let depth = 0;
+    let closeParen = -1;
+    for (let i = openParen; i < expr.length; i++) {
+      if (expr[i] === '(') depth++;
+      else if (expr[i] === ')') {
+        depth--;
+        if (depth === 0) {
+          closeParen = i;
+          break;
+        }
+      }
+    }
+    if (closeParen === -1) break;
+    out += expr.slice(lastIdx, m.index);
+    const inner = rewriteBalancedCall(expr.slice(openParen + 1, closeParen), fnName, transform);
+    out += transform(inner);
+    lastIdx = closeParen + 1;
+    re.lastIndex = lastIdx;
+  }
+  out += expr.slice(lastIdx);
+  return out;
+}
 
-  const orParts = splitTopLevelBinaryOp(s, /\bOR\b/gi);
-  if (orParts) {
-    return orParts.map((p) => convertXorAndPrecedence(p)).join(' || ');
+function rewritePowerOperators(expr: string): string {
+  // First recurse inside parenthesized groups so (a + b) ** 2 and f(x ** 2 + 1) work cleanly
+  let s = '';
+  let i = 0;
+  while (i < expr.length) {
+    if (expr[i] === '(') {
+      let depth = 0;
+      let closeIdx = -1;
+      for (let j = i; j < expr.length; j++) {
+        if (expr[j] === '(') depth++;
+        else if (expr[j] === ')') {
+          depth--;
+          if (depth === 0) {
+            closeIdx = j;
+            break;
+          }
+        }
+      }
+      if (closeIdx !== -1) {
+        s += '(' + rewritePowerOperators(expr.slice(i + 1, closeIdx)) + ')';
+        i = closeIdx + 1;
+        continue;
+      }
+    }
+    s += expr[i];
+    i++;
   }
-  const xorParts = splitTopLevelBinaryOp(s, /\bXOR\b/gi);
-  if (xorParts) {
-    return xorParts
-      .map((p) => `Boolean(${convertXorAndPrecedence(p)})`)
-      .reduce((acc, cur) => `(${acc} !== ${cur})`);
-  }
-  const andParts = splitTopLevelBinaryOp(s, /\bAND\b/gi);
-  if (andParts) {
-    return andParts.map((p) => convertXorAndPrecedence(p)).join(' && ');
-  }
-  if (s.startsWith('(') && s.endsWith(')')) {
-    const inner = stripOuterParens(s);
-    if (inner !== s) return `(${convertXorAndPrecedence(inner)})`;
+
+  // Right-associative rewrite for top-level **
+  let guard = 0;
+  while (guard++ < 64) {
+    let depth = 0;
+    let opIdx = -1;
+    for (let k = 0; k < s.length - 1; k++) {
+      if (s[k] === '(' || s[k] === '[') depth++;
+      else if (s[k] === ')' || s[k] === ']') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && s[k] === '*' && s[k + 1] === '*') {
+        opIdx = k; // keep scanning to pick the rightmost ** for right-associativity
+        k++;
+      }
+    }
+    if (opIdx === -1) break;
+
+    // Scan LHS primary operand backwards from opIdx - 1
+    let lhsEnd = opIdx;
+    while (lhsEnd > 0 && /\s/.test(s[lhsEnd - 1])) lhsEnd--;
+    let lhsStart = lhsEnd;
+    if (lhsStart > 0 && (s[lhsStart - 1] === ')' || s[lhsStart - 1] === ']')) {
+      const closeCh = s[lhsStart - 1];
+      const openCh = closeCh === ')' ? '(' : '[';
+      let d = 0;
+      let p = lhsStart - 1;
+      for (; p >= 0; p--) {
+        if (s[p] === closeCh) d++;
+        else if (s[p] === openCh) {
+          d--;
+          if (d === 0) break;
+        }
+      }
+      lhsStart = Math.max(0, p);
+      // Include any preceding function/identifier chain like Math.abs(...) or arr[...]
+      while (lhsStart > 0 && /[A-Za-z0-9_.$]/.test(s[lhsStart - 1])) lhsStart--;
+    } else {
+      while (lhsStart > 0 && /[A-Za-z0-9_.$]/.test(s[lhsStart - 1])) lhsStart--;
+    }
+
+    // Scan RHS unary + primary operand forwards from opIdx + 2
+    let rhsStart = opIdx + 2;
+    while (rhsStart < s.length && /\s/.test(s[rhsStart])) rhsStart++;
+    let rhsEnd = rhsStart;
+    if (rhsEnd < s.length && (s[rhsEnd] === '+' || s[rhsEnd] === '-')) {
+      rhsEnd++;
+      while (rhsEnd < s.length && /\s/.test(s[rhsEnd])) rhsEnd++;
+    }
+    if (rhsEnd < s.length && s[rhsEnd] === '(') {
+      let d = 0;
+      for (; rhsEnd < s.length; rhsEnd++) {
+        if (s[rhsEnd] === '(') d++;
+        else if (s[rhsEnd] === ')') {
+          d--;
+          if (d === 0) {
+            rhsEnd++;
+            break;
+          }
+        }
+      }
+    } else {
+      while (rhsEnd < s.length && /[A-Za-z0-9_.$]/.test(s[rhsEnd])) rhsEnd++;
+      // Include trailing call (...) or index [...] if attached to identifier
+      while (rhsEnd < s.length && (s[rhsEnd] === '(' || s[rhsEnd] === '[')) {
+        const openCh = s[rhsEnd];
+        const closeCh = openCh === '(' ? ')' : ']';
+        let d = 0;
+        for (; rhsEnd < s.length; rhsEnd++) {
+          if (s[rhsEnd] === openCh) d++;
+          else if (s[rhsEnd] === closeCh) {
+            d--;
+            if (d === 0) {
+              rhsEnd++;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    const lhs = s.slice(lhsStart, lhsEnd).trim();
+    const rhs = s.slice(rhsStart, rhsEnd).trim();
+    if (!lhs || !rhs) break;
+    s = s.slice(0, lhsStart) + `Math.pow(${lhs}, ${rhs})` + s.slice(rhsEnd);
   }
   return s;
 }
+
+function splitTopLevelComparison(expr: string): { lhs: string; op: string; rhs: string } | null {
+  let depth = 0;
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i];
+    if (ch === '(' || ch === '[') {
+      depth++;
+      continue;
+    }
+    if (ch === ')' || ch === ']') {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth === 0) {
+      const two = expr.slice(i, i + 2);
+      if (two === '<>' || two === '<=' || two === '>=') {
+        return { lhs: expr.slice(0, i), op: two, rhs: expr.slice(i + 2) };
+      }
+      if ((ch === '=' && expr[i - 1] !== ':' && expr[i - 1] !== '!' && expr[i - 1] !== '<' && expr[i - 1] !== '>' && expr[i + 1] !== '=') || ch === '<' || ch === '>') {
+        return { lhs: expr.slice(0, i), op: ch, rhs: expr.slice(i + 1) };
+      }
+    }
+  }
+  return null;
+}
+
+function rewriteLogicAndBitwiseExpr(
+  maskedExpr: string,
+  bitwiseVars: Set<string>,
+  boolVars: Set<string>,
+  forceBoolTop: boolean
+): string {
+  const s = maskedExpr.trim();
+  if (!s) return s;
+
+  const isBooleanSubexpr = (sub: string): boolean => {
+    const t = sub.trim();
+    if (!t) return false;
+    if (/(?:<>|<=|>=|(?<![:!<>=])=(?!=)|<|>)/.test(t)) return true;
+    if (/\b(?:TRUE|FALSE)\b/i.test(t)) return true;
+    const bareIdent = /^\(?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)?$/.exec(t);
+    if (bareIdent && boolVars.has(bareIdent[1].toUpperCase())) return true;
+    return false;
+  };
+
+  const isBitwiseSubexpr = (sub: string): boolean => {
+    if (isBooleanSubexpr(sub)) return false;
+    return [...sub.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g)].some((m) => bitwiseVars.has(m[1].toUpperCase()));
+  };
+
+  const orParts = splitTopLevelBinaryOp(s, /\bOR\b/gi);
+  if (orParts) {
+    const useBitwise =
+      !forceBoolTop &&
+      orParts.every((p) => !isBooleanSubexpr(p)) &&
+      orParts.some((p) => isBitwiseSubexpr(p));
+    return orParts
+      .map((p) => rewriteLogicAndBitwiseExpr(p, bitwiseVars, boolVars, !useBitwise))
+      .join(useBitwise ? ' | ' : ' || ');
+  }
+
+  const xorParts = splitTopLevelBinaryOp(s, /\bXOR\b/gi);
+  if (xorParts) {
+    const useBitwise =
+      !forceBoolTop &&
+      xorParts.every((p) => !isBooleanSubexpr(p)) &&
+      xorParts.some((p) => isBitwiseSubexpr(p));
+    if (useBitwise) {
+      return xorParts
+        .map((p) => rewriteLogicAndBitwiseExpr(p, bitwiseVars, boolVars, false))
+        .join(' ^ ');
+    }
+    return xorParts
+      .map((p) => `Boolean(${rewriteLogicAndBitwiseExpr(p, bitwiseVars, boolVars, true)})`)
+      .reduce((acc, cur) => `(${acc} !== ${cur})`);
+  }
+
+  const andParts = splitTopLevelBinaryOp(s, /\bAND\b/gi);
+  if (andParts) {
+    const useBitwise =
+      !forceBoolTop &&
+      andParts.every((p) => !isBooleanSubexpr(p)) &&
+      andParts.some((p) => isBitwiseSubexpr(p));
+    return andParts
+      .map((p) => rewriteLogicAndBitwiseExpr(p, bitwiseVars, boolVars, !useBitwise))
+      .join(useBitwise ? ' & ' : ' && ');
+  }
+
+  // Leading unary NOT (handles NOT (StatusWord = 0), NOT (A XOR B), NOT WordMask)
+  const notMatch = /^NOT\b\s*(.+)$/i.exec(s);
+  if (notMatch) {
+    const rest = notMatch[1].trim();
+    const useBitwiseNot = !forceBoolTop && !isBooleanSubexpr(rest) && isBitwiseSubexpr(rest);
+    const rewrittenRest = rewriteLogicAndBitwiseExpr(rest, bitwiseVars, boolVars, !useBitwiseNot);
+    return useBitwiseNot ? `~(${rewrittenRest})` : `!(${rewrittenRest})`;
+  }
+
+  // Top-level comparison: operands are value/bitwise expressions, result is BOOL
+  const cmp = splitTopLevelComparison(s);
+  if (cmp) {
+    const jsOp = cmp.op === '<>' ? '!==' : cmp.op === '=' ? '===' : cmp.op;
+    const lhsJs = rewriteLogicAndBitwiseExpr(cmp.lhs, bitwiseVars, boolVars, false);
+    const rhsJs = rewriteLogicAndBitwiseExpr(cmp.rhs, bitwiseVars, boolVars, false);
+    return `${lhsJs} ${jsOp} ${rhsJs}`;
+  }
+
+  // Parenthesized expression wrapping entire string
+  if (s.startsWith('(') && s.endsWith(')')) {
+    const inner = stripOuterParens(s);
+    if (inner !== s) {
+      return `(${rewriteLogicAndBitwiseExpr(inner, bitwiseVars, boolVars, forceBoolTop && isBooleanSubexpr(inner))})`;
+    }
+  }
+
+  // Recurse into any nested parenthesized subexpressions (e.g., function args like SEL(A XOR B, x, y) or (a AND 16#FF) + 1)
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '(') {
+      let depth = 0;
+      let closeIdx = -1;
+      for (let j = i; j < s.length; j++) {
+        if (s[j] === '(') depth++;
+        else if (s[j] === ')') {
+          depth--;
+          if (depth === 0) {
+            closeIdx = j;
+            break;
+          }
+        }
+      }
+      if (closeIdx !== -1) {
+        const inside = s.slice(i + 1, closeIdx);
+        const args = splitTopLevelArgs(inside);
+        if (args.length > 1) {
+          out += '(' + args.map((a) => rewriteLogicAndBitwiseExpr(a, bitwiseVars, boolVars, false)).join(', ') + ')';
+        } else {
+          out += '(' + rewriteLogicAndBitwiseExpr(inside, bitwiseVars, boolVars, false) + ')';
+        }
+        i = closeIdx + 1;
+        continue;
+      }
+    }
+    out += s[i];
+    i++;
+  }
+  return out;
+}
+
+const STANDARD_FB_OUTPUT_PINS = new Set([
+  'Q', 'Q1', 'QU', 'QD', 'ET', 'CV', 'OUT', 'IN', 'PT', 'PV', 'R', 'S', 'S1', 'R1', 'CU', 'CD', 'LD', 'CLK', 'SP', 'KP', 'KI', 'KD',
+]);
 
 export function transpileStToHaiwellJs(
   source: string,
@@ -1719,6 +2149,7 @@ export function transpileStToHaiwellJs(
   const identResolveMap = new Map<string, string>();
   const fbVarTypes = new Map<string, string>();
   const bitwiseVars = new Set<string>();
+  const boolVars = new Set<string>();
   const jsIdentFor = (name: string): string =>
     JS_RESERVED_WORDS.has(name.toLowerCase()) ? `__st_${name}` : name;
 
@@ -1730,6 +2161,9 @@ export function transpileStToHaiwellJs(
     }
     if (['BYTE', 'WORD', 'DWORD', 'LWORD'].includes(v.dataType)) {
       bitwiseVars.add(v.name.toUpperCase());
+    }
+    if (v.dataType === 'BOOL') {
+      boolVars.add(v.name.toUpperCase());
     }
   }
   const hasStandardFbs = fbVarTypes.size > 0;
@@ -1754,30 +2188,38 @@ export function transpileStToHaiwellJs(
   }
   if (hasStandardFbs) {
     jsLines.push(
-      `function __FB_TON(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = Number(args.PT || 0); if (args.IN) { s.ET = Math.min(pt, s.ET + __scanMs); s.Q = s.ET >= pt; } else { s.ET = 0; s.Q = false; } return s; }`,
-      `function __FB_TOF(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = Number(args.PT || 0); if (args.IN) { s.Q = true; s.ET = 0; } else if (s.Q) { s.ET = Math.min(pt, s.ET + __scanMs); if (s.ET >= pt) s.Q = false; } return s; }`,
-      `function __FB_TP(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = Number(args.PT || 0); if (args.IN && !s.Q && s.ET === 0) { if (pt > 0) { s.Q = true; s.ET = Math.min(pt, __scanMs); if (s.ET >= pt) s.Q = false; } } else if (s.Q) { s.ET = Math.min(pt, s.ET + __scanMs); if (s.ET >= pt) { s.Q = false; } } if (!s.Q && !args.IN) { s.ET = 0; } return s; }`,
-      `function __FB_CTU(k, args) { var s = __getFb(k, { Q: false, CV: 0, _prev: false }); var pv = Number(args.PV || 0); if (args.R) { s.CV = 0; } else if (args.CU && !s._prev) { s.CV += 1; } s._prev = Boolean(args.CU); s.Q = s.CV >= pv; return s; }`,
-      `function __FB_CTD(k, args) { var s = __getFb(k, { Q: false, CV: 0, _prev: false }); var pv = Number(args.PV || 0); if (args.LD) { s.CV = pv; } else if (args.CD && !s._prev) { s.CV -= 1; } s._prev = Boolean(args.CD); s.Q = s.CV <= 0; return s; }`,
-      `function __FB_CTUD(k, args) { var s = __getFb(k, { QU: false, QD: false, CV: 0, _prevU: false, _prevD: false }); var pv = Number(args.PV || 0); if (args.R) { s.CV = 0; } else if (args.LD) { s.CV = pv; } else { if (args.CU && !s._prevU) s.CV += 1; if (args.CD && !s._prevD) s.CV -= 1; } s._prevU = Boolean(args.CU); s._prevD = Boolean(args.CD); s.QU = s.CV >= pv; s.QD = s.CV <= 0; return s; }`,
+      `function __FB_TON(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = args.PT !== undefined ? Number(args.PT) : (s.PT !== undefined ? Number(s.PT) : 0); if (args.IN) { s.ET = Math.min(pt, (s.ET || 0) + __scanMs); s.Q = s.ET >= pt; } else { s.ET = 0; s.Q = false; } return s; }`,
+      `function __FB_TOF(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = args.PT !== undefined ? Number(args.PT) : (s.PT !== undefined ? Number(s.PT) : 0); if (args.IN) { s.Q = true; s.ET = 0; } else if (s.Q) { s.ET = Math.min(pt, (s.ET || 0) + __scanMs); if (s.ET >= pt) s.Q = false; } return s; }`,
+      `function __FB_TP(k, args) { var s = __getFb(k, { Q: false, ET: 0 }); var pt = args.PT !== undefined ? Number(args.PT) : (s.PT !== undefined ? Number(s.PT) : 0); if (args.IN && !s.Q && (s.ET || 0) === 0) { if (pt > 0) { s.Q = true; s.ET = Math.min(pt, __scanMs); if (s.ET >= pt) s.Q = false; } } else if (s.Q) { s.ET = Math.min(pt, (s.ET || 0) + __scanMs); if (s.ET >= pt) { s.Q = false; } } if (!s.Q && !args.IN) { s.ET = 0; } return s; }`,
+      `function __FB_CTU(k, args) { var s = __getFb(k, { Q: false, CV: 0, _prev: false }); var pv = args.PV !== undefined ? Number(args.PV) : 0; if (args.R) { s.CV = 0; } else if (args.CU && !s._prev) { s.CV = (s.CV || 0) + 1; } s._prev = Boolean(args.CU); s.Q = s.CV >= pv; return s; }`,
+      `function __FB_CTD(k, args) { var s = __getFb(k, { Q: false, CV: 0, _prev: false }); var pv = args.PV !== undefined ? Number(args.PV) : 0; if (args.LD) { s.CV = pv; } else if (args.CD && !s._prev) { s.CV = (s.CV || 0) - 1; } s._prev = Boolean(args.CD); s.Q = s.CV <= 0; return s; }`,
+      `function __FB_CTUD(k, args) { var s = __getFb(k, { QU: false, QD: false, CV: 0, _prevU: false, _prevD: false }); var pv = args.PV !== undefined ? Number(args.PV) : 0; if (args.R) { s.CV = 0; } else if (args.LD) { s.CV = pv; } else { if (args.CU && !s._prevU) s.CV = (s.CV || 0) + 1; if (args.CD && !s._prevD) s.CV = (s.CV || 0) - 1; } s._prevU = Boolean(args.CU); s._prevD = Boolean(args.CD); s.QU = s.CV >= pv; s.QD = s.CV <= 0; return s; }`,
       `function __FB_R_TRIG(k, args) { var s = __getFb(k, { Q: false, _prev: false }); s.Q = Boolean(args.CLK) && !s._prev; s._prev = Boolean(args.CLK); return s; }`,
-      `function __FB_F_TRIG(k, args) { var s = __getFb(k, { Q: false, _prev: false }); s.Q = !Boolean(args.CLK) && s._prev; s._prev = Boolean(args.CLK); return s; }`,
-      `function __FB_SR(k, args) { var s = __getFb(k, { Q1: false }); s.Q1 = Boolean(args.S1) || (!Boolean(args.R) && s.Q1); return s; }`,
-      `function __FB_RS(k, args) { var s = __getFb(k, { Q1: false }); s.Q1 = !Boolean(args.R1) && (Boolean(args.S) || s.Q1); return s; }`,
-      `function __FB_PID(k, args) { var s = __getFb(k, { OUT: 0, _errPrev: 0, _i: 0 }); var sp = Number(args.SP || 0), pv = Number(args.PV || 0), kp = Number(args.KP || 1), ki = Number(args.KI || 0), kd = Number(args.KD || 0); var dt = __scanMs / 1000.0; var err = sp - pv; s._i += err * dt; var d = dt > 0 ? (err - s._errPrev) / dt : 0; s._errPrev = err; s.OUT = kp * err + ki * s._i + kd * d; return s; }`,
-      `function __FB_HYSTERESIS(k, args) { var s = __getFb(k, { Q: false }); var x = Number(args.X || args.IN || 0), hi = Number(args.HIGH || args.HI || 0), lo = Number(args.LOW || args.LO || 0); if (x >= hi) s.Q = true; else if (x <= lo) s.Q = false; return s; }`,
-      `function __FB_SCALE_LIN(k, args) { var s = __getFb(k, { OUT: 0 }); var x = Number(args.X || args.IN || 0), x0 = Number(args.X0 || 0), x1 = Number(args.X1 || 100), y0 = Number(args.Y0 || 0), y1 = Number(args.Y1 || 100); s.OUT = (x1 === x0) ? y0 : y0 + ((x - x0) / (x1 - x0)) * (y1 - y0); return s; }`
+      `function __FB_F_TRIG(k, args) { var s = __getFb(k, { Q: false, _prev: false }); s.Q = !Boolean(args.CLK) && Boolean(s._prev); s._prev = Boolean(args.CLK); return s; }`,
+      `function __FB_SR(k, args) { var s = __getFb(k, { Q1: false }); s.Q1 = Boolean(args.S1) || (!Boolean(args.R) && Boolean(s.Q1)); return s; }`,
+      `function __FB_RS(k, args) { var s = __getFb(k, { Q1: false }); s.Q1 = !Boolean(args.R1) && (Boolean(args.S) || Boolean(s.Q1)); return s; }`,
+      `function __FB_PID(k, args) { var s = __getFb(k, { OUT: 0, _errPrev: 0, _i: 0 }); if (typeof s._i !== "number") s._i = 0; if (typeof s._errPrev !== "number") s._errPrev = 0; var sp = args.SP !== undefined ? Number(args.SP) : 0, pv = args.PV !== undefined ? Number(args.PV) : 0, kp = args.KP !== undefined ? Number(args.KP) : 1, ki = args.KI !== undefined ? Number(args.KI) : 0, kd = args.KD !== undefined ? Number(args.KD) : 0; var dt = __scanMs / 1000.0; var err = sp - pv; s._i += err * dt; var d = dt > 0 ? (err - s._errPrev) / dt : 0; s._errPrev = err; s.OUT = kp * err + ki * s._i + kd * d; return s; }`,
+      `function __FB_HYSTERESIS(k, args) { var s = __getFb(k, { Q: false }); var x = args.X !== undefined ? Number(args.X) : (args.IN !== undefined ? Number(args.IN) : 0), hi = args.HIGH !== undefined ? Number(args.HIGH) : (args.HI !== undefined ? Number(args.HI) : 0), lo = args.LOW !== undefined ? Number(args.LOW) : (args.LO !== undefined ? Number(args.LO) : 0); if (x >= hi) s.Q = true; else if (x <= lo) s.Q = false; return s; }`,
+      `function __FB_SCALE_LIN(k, args) { var s = __getFb(k, { OUT: 0 }); var x = args.X !== undefined ? Number(args.X) : (args.IN !== undefined ? Number(args.IN) : 0), x0 = args.X0 !== undefined ? Number(args.X0) : 0, x1 = args.X1 !== undefined ? Number(args.X1) : 100, y0 = args.Y0 !== undefined ? Number(args.Y0) : 0, y1 = args.Y1 !== undefined ? Number(args.Y1) : 100; s.OUT = (x1 === x0) ? y0 : y0 + ((x - x0) / (x1 - x0)) * (y1 - y0); return s; }`
     );
   }
 
-  const resolveExprIdents = (s: string): string =>
-    s.replace(/(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)(?!\s*\()/g, (full, id) => {
+  const resolveExprIdents = (s: string): string => {
+    // Resolve base identifiers first, then normalize FB instance member pins (.q -> .Q, .out -> .OUT, etc.)
+    const resolved = s.replace(/(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)(?!\s*\()/g, (full, id) => {
       const upper = id.toUpperCase();
       if (IEC_KEYWORDS.has(upper)) return full;
       return identResolveMap.get(upper) ?? full;
     });
+    return resolved.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g, (full, obj, prop) => {
+      if (fbVarTypes.has(obj.toUpperCase()) && STANDARD_FB_OUTPUT_PINS.has(prop.toUpperCase())) {
+        return `${obj}.${prop.toUpperCase()}`;
+      }
+      return full;
+    });
+  };
 
-  const convertExpr = (expr: string): string => {
+  const convertExpr = (expr: string, forceBoolTop = false): string => {
     const { masked, literals } = maskIecStrings(expr);
     let converted = masked.replace(/\b(?:TIME|T)#(?:(?:\d+(?:\.\d+)?(?:ms|d|h|m|s)))+/gi, (lit) =>
       String(parseIecTimeLiteralMs(lit))
@@ -1789,47 +2231,51 @@ export function transpileStToHaiwellJs(
       .replace(/\b2#([01_]+)\b/g, (_, bin) => String(Number.parseInt(bin.replace(/_/g, ''), 2)))
       .replace(/\b(\d[\d_]*\d)\b/g, (m) => m.replace(/_/g, ''));
 
-    // Bitwise vs Boolean heuristic: if expression references BYTE/WORD/DWORD/LWORD vars, translate AND/OR/XOR to &/|/^
-    const isBitwiseExpr = [...converted.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g)].some((m) =>
-      bitwiseVars.has(m[1].toUpperCase())
-    );
+    // Multi-dimensional array indexing Arr[i, j] -> Arr[i][j]
+    converted = converted.replace(/\[([^\]]+)\]/g, (_, inside) => {
+      const parts = splitTopLevelArgs(inside);
+      if (parts.length > 1) {
+        return parts.map((p) => `[${p.trim()}]`).join('');
+      }
+      return `[${inside}]`;
+    });
 
-    converted = convertXorAndPrecedence(converted);
-    if (isBitwiseExpr) {
-      converted = converted.replace(/\bAND\b/gi, '&').replace(/\bOR\b/gi, '|').replace(/\bNOT\b/gi, '~');
-    } else {
-      converted = converted.replace(/\bAND\b/gi, '&&').replace(/\bOR\b/gi, '||').replace(/\bNOT\b/gi, '!');
-    }
+    // Context-aware boolean vs bitwise AND/OR/XOR/NOT + comparison operators
+    converted = rewriteLogicAndBitwiseExpr(converted, bitwiseVars, boolVars, forceBoolTop);
+
+    // Balanced right-associative exponentiation (**) BEFORE remaining math rewrites
+    converted = rewritePowerOperators(converted);
+
+    // Rewrite LOG(...) BEFORE LN(...) using balanced parens so Math.log(...) is never re-matched
+    converted = rewriteBalancedCall(converted, 'LOG', (inner) => `(Math.log(${inner}) / Math.LN10)`);
 
     converted = converted
-      .replace(/([A-Za-z0-9_.)]+)\s*\*\*\s*([A-Za-z0-9_.()+-]+)/g, 'Math.pow($1, $2)')
       .replace(/\bMOD\b/gi, '%')
       .replace(/\bTRUE\b/gi, 'true')
       .replace(/\bFALSE\b/gi, 'false')
       .replace(/<>/g, '!==')
       .replace(/(?<![<>!=:])=(?!=)/g, '===')
-      .replace(/\bABS\s*\(/gi, 'Math.abs(')
-      .replace(/\bSQRT\s*\(/gi, 'Math.sqrt(')
-      .replace(/\bMIN\s*\(/gi, 'Math.min(')
-      .replace(/\bMAX\s*\(/gi, 'Math.max(')
-      .replace(/\bSIN\s*\(/gi, 'Math.sin(')
-      .replace(/\bCOS\s*\(/gi, 'Math.cos(')
-      .replace(/\bTAN\s*\(/gi, 'Math.tan(')
-      .replace(/\bASIN\s*\(/gi, 'Math.asin(')
-      .replace(/\bACOS\s*\(/gi, 'Math.acos(')
-      .replace(/\bATAN\s*\(/gi, 'Math.atan(')
-      .replace(/\bLN\s*\(/gi, 'Math.log(')
-      .replace(/\bLOG\s*\(([^()]+)\)/gi, '(Math.log($1)/Math.LN10)')
-      .replace(/\bEXP\s*\(/gi, 'Math.exp(')
-      .replace(/\bTRUNC\s*\(/gi, '__TRUNC(')
-      .replace(/\bROUND\s*\(/gi, 'Math.round(')
-      .replace(/\bLIMIT\s*\(/gi, '__LIMIT(')
-      .replace(/\bSEL\s*\(/gi, '__SEL(')
-      .replace(/\bMUX\s*\(/gi, '__MUX(')
-      .replace(/\b(?:REAL_TO_INT|REAL_TO_DINT|DINT_TO_INT|REAL_TO_UINT)\s*\(/gi, '__TRUNC(')
-      .replace(/\b(?:INT_TO_DINT|BOOL_TO_INT|WORD_TO_INT|BYTE_TO_INT|INT_TO_BYTE|INT_TO_WORD|DWORD_TO_DINT|DINT_TO_DWORD|INT_TO_REAL|DINT_TO_REAL|UINT_TO_REAL)\s*\(/gi, 'Number(')
-      .replace(/\bINT_TO_STRING\s*\(/gi, 'String(')
-      .replace(/\bSTRING_TO_INT\s*\(/gi, 'Number(');
+      .replace(/(?<![.\w])ABS\s*\(/gi, 'Math.abs(')
+      .replace(/(?<![.\w])SQRT\s*\(/gi, 'Math.sqrt(')
+      .replace(/(?<![.\w])MIN\s*\(/gi, 'Math.min(')
+      .replace(/(?<![.\w])MAX\s*\(/gi, 'Math.max(')
+      .replace(/(?<![.\w])SIN\s*\(/gi, 'Math.sin(')
+      .replace(/(?<![.\w])COS\s*\(/gi, 'Math.cos(')
+      .replace(/(?<![.\w])TAN\s*\(/gi, 'Math.tan(')
+      .replace(/(?<![.\w])ASIN\s*\(/gi, 'Math.asin(')
+      .replace(/(?<![.\w])ACOS\s*\(/gi, 'Math.acos(')
+      .replace(/(?<![.\w])ATAN\s*\(/gi, 'Math.atan(')
+      .replace(/(?<![.\w])LN\s*\(/gi, 'Math.log(')
+      .replace(/(?<![.\w])EXP\s*\(/gi, 'Math.exp(')
+      .replace(/(?<![.\w])TRUNC\s*\(/gi, '__TRUNC(')
+      .replace(/(?<![.\w])ROUND\s*\(/gi, 'Math.round(')
+      .replace(/(?<![.\w])LIMIT\s*\(/gi, '__LIMIT(')
+      .replace(/(?<![.\w])SEL\s*\(/gi, '__SEL(')
+      .replace(/(?<![.\w])MUX\s*\(/gi, '__MUX(')
+      .replace(/(?<![.\w])(?:REAL_TO_INT|REAL_TO_DINT|DINT_TO_INT|REAL_TO_UINT)\s*\(/gi, '__TRUNC(')
+      .replace(/(?<![.\w])(?:INT_TO_DINT|BOOL_TO_INT|WORD_TO_INT|BYTE_TO_INT|INT_TO_BYTE|INT_TO_WORD|DWORD_TO_DINT|DINT_TO_DWORD|INT_TO_REAL|DINT_TO_REAL|UINT_TO_REAL)\s*\(/gi, 'Number(')
+      .replace(/(?<![.\w])INT_TO_STRING\s*\(/gi, 'String(')
+      .replace(/(?<![.\w])STRING_TO_INT\s*\(/gi, 'Number(');
 
     converted = resolveExprIdents(converted);
     const jsLiterals = literals.map(translateIecStringLiteral);
@@ -1862,7 +2308,7 @@ export function transpileStToHaiwellJs(
       jsLines.push(`var ${jsName} = ${readCall(scadaTag)};`);
     } else if (IEC_STANDARD_FBS.has(v.dataType)) {
       jsLines.push(
-        `var ${jsName} = __getFb(${JSON.stringify(`${validation.pouName ?? 'POU'}.${v.name}`)}, { Q: false, Q1: false, ET: 0, CV: 0, _prev: false });`
+        `var ${jsName} = __getFb(${JSON.stringify(`${validation.pouName ?? 'POU'}.${v.name.toUpperCase()}`)}, { Q: false, Q1: false, QU: false, QD: false, ET: 0, CV: 0, OUT: 0, _prev: false, _prevU: false, _prevD: false, _errPrev: 0, _i: 0 });`
       );
     } else {
       const init = v.initialValue
@@ -1974,13 +2420,13 @@ export function transpileStToHaiwellJs(
 
     if (/^IF\b/i.test(t)) {
       const cond = t.replace(/^IF\s*/i, '').replace(/\bTHEN$/i, '').trim();
-      jsLines.push(`${pad()}if (${convertExpr(cond)}) {`);
+      jsLines.push(`${pad()}if (${convertExpr(cond, true)}) {`);
       indent++;
       blockStack.push({ kind: 'IF' });
     } else if (/^ELSIF\b/i.test(t)) {
       indent = Math.max(0, indent - 1);
       const cond = t.replace(/^ELSIF\s*/i, '').replace(/\bTHEN$/i, '').trim();
-      jsLines.push(`${pad()}} else if (${convertExpr(cond)}) {`);
+      jsLines.push(`${pad()}} else if (${convertExpr(cond, true)}) {`);
       indent++;
     } else if (/^ELSE\b/i.test(t)) {
       if (top && top.kind === 'CASE') {
@@ -2081,7 +2527,7 @@ export function transpileStToHaiwellJs(
       const wd = `__wd_${++loopCounter}`;
       const label = `__loop_${loopCounter}`;
       jsLines.push(`${pad()}var ${wd} = 0;`);
-      jsLines.push(`${pad()}${label}: while (${convertExpr(cond)}) {`);
+      jsLines.push(`${pad()}${label}: while (${convertExpr(cond, true)}) {`);
       indent++;
       jsLines.push(`${pad()}if (++${wd} > 10000) break;`);
       blockStack.push({ kind: 'WHILE', watchdogVar: wd, loopLabel: label });
@@ -2100,7 +2546,7 @@ export function transpileStToHaiwellJs(
     } else if (/^UNTIL\b/i.test(t)) {
       const cond = t.replace(/^UNTIL\s+/i, '').replace(/;$/, '').trim();
       indent = Math.max(0, indent - 1);
-      jsLines.push(`${pad()}} while (!(${convertExpr(cond)}));`);
+      jsLines.push(`${pad()}} while (!(${convertExpr(cond, true)}));`);
       if (top && top.kind === 'REPEAT') blockStack.pop();
     } else if (/^END_REPEAT\b/i.test(t)) {
       if (top && top.kind === 'REPEAT') {
@@ -2110,7 +2556,7 @@ export function transpileStToHaiwellJs(
       }
     } else if (/^EXIT\s*;?$/i.test(t)) {
       const loopLbl = innermostLoopLabel();
-      jsLines.push(top?.kind === 'CASE' && loopLbl ? `${pad()}break ${loopLbl};` : `${pad()}break;`);
+      jsLines.push(loopLbl ? `${pad()}break ${loopLbl};` : `${pad()}break;`);
     } else if (/^RETURN\s*;?$/i.test(t)) {
       jsLines.push(`${pad()}return;`);
     } else {
@@ -2137,7 +2583,7 @@ export function transpileStToHaiwellJs(
           }
         }
         const helper = `__FB_${fbType}`;
-        const keyLit = JSON.stringify(`${validation.pouName ?? 'POU'}.${rawFbName}`);
+        const keyLit = JSON.stringify(`${validation.pouName ?? 'POU'}.${fbKey}`);
         jsLines.push(`${pad()}${fbJsName} = ${helper}(${keyLit}, { ${argPairs.join(', ')} });`);
         for (const oa of outAssigns) {
           jsLines.push(`${pad()}${oa.target} = ${fbJsName}.${oa.pin};`);
@@ -2149,8 +2595,13 @@ export function transpileStToHaiwellJs(
         if (lhs.startsWith('%')) {
           jsLines.push(`${pad()}${writeCall(lhs, convertExpr(rhs))}`);
         } else {
-          const lhsJs = resolveExprIdents(lhs).replace(/\[([^\]]+)\]/g, (_, idxExpr) => `[${convertExpr(idxExpr)}]`);
-          jsLines.push(`${pad()}${lhsJs} = ${convertExpr(rhs)};`);
+          const lhsBaseKey = lhs.replace(/\[[^\]]+\]/, '').replace(/\.[A-Za-z_][A-Za-z0-9_]*$/, '').toUpperCase();
+          const lhsIsBool = boolVars.has(lhsBaseKey);
+          const lhsJs = resolveExprIdents(lhs).replace(/\[([^\]]+)\]/g, (_, idxExpr) => {
+            const parts = splitTopLevelArgs(idxExpr);
+            return parts.map((p) => `[${convertExpr(p.trim())}]`).join('');
+          });
+          jsLines.push(`${pad()}${lhsJs} = ${convertExpr(rhs, lhsIsBool)};`);
         }
       }
     }

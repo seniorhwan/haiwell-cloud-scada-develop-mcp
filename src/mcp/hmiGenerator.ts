@@ -26,6 +26,10 @@ export interface HmiLayoutValidation {
   unresolvedTags: string[];
   brokenNavTargets: string[];
   touchTargetViolations: string[];
+  duplicateWidgetIds: string[];
+  readOnlyWriteWidgets: string[];
+  invalidRanges: string[];
+  disconnectedPipes: string[];
   isa101Notices: string[];
 }
 
@@ -68,6 +72,10 @@ export function validateHmiScreen(
   const unresolvedTags: string[] = [];
   const brokenNavTargets: string[] = [];
   const touchTargetViolations: string[] = [];
+  const duplicateWidgetIds: string[] = [];
+  const readOnlyWriteWidgets: string[] = [];
+  const invalidRanges: string[] = [];
+  const disconnectedPipes: string[] = [];
   const isa101Notices: string[] = [];
 
   const isTouchPanel = Boolean(options.targetHardware?.startsWith('CLOUD_HMI_'));
@@ -77,7 +85,7 @@ export function validateHmiScreen(
 
   for (const w of screen.widgets) {
     if (seenWidgetIds.has(w.id)) {
-      isa101Notices.push(`Duplicate widget ID "${w.id}" detected on screen "${screen.id}".`);
+      duplicateWidgetIds.push(w.id);
     }
     seenWidgetIds.add(w.id);
 
@@ -85,13 +93,13 @@ export function validateHmiScreen(
       outOfBounds.push(w.id);
     }
     if (w.min !== undefined && w.max !== undefined && w.min > w.max) {
-      isa101Notices.push(`Widget "${w.id}" has inverted range (min=${w.min} > max=${w.max}).`);
+      invalidRanges.push(`${w.id} (min=${w.min} > max=${w.max})`);
     }
     if (w.tagName && !hasOwnTag(w.tagName)) {
       unresolvedTags.push(`${w.id}->${w.tagName}`);
     }
     if (w.writeEnabled && w.tagName && hasOwnTag(w.tagName) && knownTags[w.tagName]?.access === 'RO') {
-      isa101Notices.push(`Widget "${w.id}" enables write on read-only tag "${w.tagName}".`);
+      readOnlyWriteWidgets.push(`${w.id}->${w.tagName}`);
     }
     if (w.targetScreenId && options.knownScreenIds && !options.knownScreenIds.has(w.targetScreenId)) {
       brokenNavTargets.push(`${w.id}->${w.targetScreenId}`);
@@ -107,9 +115,14 @@ export function validateHmiScreen(
     }
     if (!widgetIdSet.has(pipe.fromWidgetId)) {
       brokenNavTargets.push(`${pipe.id}.from->${pipe.fromWidgetId}`);
+      disconnectedPipes.push(`${pipe.id}.from->${pipe.fromWidgetId}`);
     }
     if (!widgetIdSet.has(pipe.toWidgetId)) {
       brokenNavTargets.push(`${pipe.id}.to->${pipe.toWidgetId}`);
+      disconnectedPipes.push(`${pipe.id}.to->${pipe.toWidgetId}`);
+    }
+    if (!Array.isArray(pipe.waypoints) || pipe.waypoints.length < 2) {
+      disconnectedPipes.push(`${pipe.id} (fewer than 2 waypoints)`);
     }
   }
 
@@ -126,12 +139,20 @@ export function validateHmiScreen(
       outOfBounds.length === 0 &&
       unresolvedTags.length === 0 &&
       brokenNavTargets.length === 0 &&
-      touchTargetViolations.length === 0,
+      touchTargetViolations.length === 0 &&
+      duplicateWidgetIds.length === 0 &&
+      readOnlyWriteWidgets.length === 0 &&
+      invalidRanges.length === 0 &&
+      disconnectedPipes.length === 0,
     collisions,
     outOfBounds,
     unresolvedTags,
     brokenNavTargets,
     touchTargetViolations,
+    duplicateWidgetIds,
+    readOnlyWriteWidgets,
+    invalidRanges,
+    disconnectedPipes,
     isa101Notices,
   };
 }
@@ -228,6 +249,9 @@ export function generateAutoLayoutScreenDetailed(spec: AutoLayoutSpec): AutoLayo
           break;
         }
       }
+    }
+    if (!placed) {
+      overflowWidgets.push(item.id ?? `w_${idx + 1}_${item.type.toLowerCase()}`);
     }
   });
 
@@ -346,8 +370,21 @@ export function renderScreenToSvg(
   const hasOwnTag = (name: string) => Object.prototype.hasOwnProperty.call(tags, name);
   const pipeElements = (screen.pipes ?? []).map((p) => {
     const pts = p.waypoints.map((pt) => `${pt.x},${pt.y}`).join(' ');
-    const stroke = PIPE_FLUID_COLOR[p.fluid] ?? '#334155';
-    const mid = p.waypoints[Math.floor(p.waypoints.length / 2)] ?? p.waypoints[0];
+    const stroke = Object.prototype.hasOwnProperty.call(PIPE_FLUID_COLOR, p.fluid)
+      ? PIPE_FLUID_COLOR[p.fluid]
+      : '#334155';
+    // Place pipe label at midpoint of the longest straight segment rather than an elbow corner
+    let mid = p.waypoints[0];
+    let bestLen = -1;
+    for (let i = 0; i < p.waypoints.length - 1; i++) {
+      const a = p.waypoints[i];
+      const b = p.waypoints[i + 1];
+      const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+      if (segLen > bestLen) {
+        bestLen = segLen;
+        mid = { x: Math.round((a.x + b.x) / 2), y: Math.round((a.y + b.y) / 2) };
+      }
+    }
     const flowTag = p.flowTagName && hasOwnTag(p.flowTagName) ? tags[p.flowTagName] : undefined;
     const labelText = p.label ?? (flowTag ? `${p.flowTagName}: ${flowTag.currentValue}${flowTag.unit ? ' ' + flowTag.unit : ''}` : '');
     const boxW = Math.max(84, labelText.length * 6 + 12);
@@ -373,13 +410,15 @@ export function renderScreenToSvg(
         : w.type === 'BIT_BUTTON'
           ? '#E2E8F0'
           : '#FFFFFF';
+    const badgeY = w.height >= 44 ? w.y + w.height - 8 : w.y + 18;
+    const valueY = w.height >= 44 ? Math.min(w.y + w.height - 20, w.y + 42) : w.y + Math.min(w.height - 12, 48);
 
     return [
-      `  <g id="${escapeXml(w.id)}" data-type="${w.type}" data-tag="${escapeXml(w.tagName ?? '')}">`,
+      `  <g id="${escapeXml(w.id)}" data-type="${escapeXml(String(w.type))}" data-tag="${escapeXml(w.tagName ?? '')}">`,
       `    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="2" fill="${fill}" stroke="#94A3B8" stroke-width="1" />`,
-      `    <text x="${w.x + 10}" y="${w.y + 20}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="#0F172A">${escapeXml(w.label)}</text>`,
-      `    <text x="${w.x + 10}" y="${w.y + Math.min(w.height - 12, 48)}" font-family="IBM Plex Mono, monospace" font-size="14" fill="#334155">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`,
-      `    <text x="${w.x + w.width - 10}" y="${w.y + 18}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="10" fill="#64748B">${escapeXml(w.type)}</text>`,
+      `    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="#0F172A">${escapeXml(w.label)}</text>`,
+      `    <text x="${w.x + 10}" y="${valueY}" font-family="IBM Plex Mono, monospace" font-size="14" fill="#334155">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`,
+      `    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="9" fill="#64748B">${escapeXml(String(w.type))}</text>`,
       `  </g>`,
     ].join('\n');
   });

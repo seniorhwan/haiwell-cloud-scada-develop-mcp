@@ -240,7 +240,7 @@ export const HAIWELL_RESOURCE_TEMPLATES = [
     uriTemplate: 'haiwell://project/{projectId}/{section}',
     name: 'Dynamic Haiwell Project Artifact',
     mimeType: 'application/json',
-    description: 'Read live project artifacts for ANY projectId: section in {tree, opcua-nodeset2, safety-audit, export-bundle, tags-csv}.',
+    description: 'Read live project artifacts for ANY projectId: section in {summary, tree, opcua-nodeset2, safety-audit, export-bundle, tags-csv}.',
   },
   {
     uriTemplate: 'haiwell://project/{projectId}/screen/{screenId}/svg',
@@ -470,20 +470,21 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
 export function generateAgentSkillMarkdown(mcpEndpointUrl: string): string {
   return `---
 name: haiwell-cloud-scada-develop
-description: Zero-UI, production-grade headless MCP server for Haiwell Cloud SCADA Develop. Covers 15 industrial automation domains across ${HAIWELL_TOOLS.length} strictly validated tools for VS Code, Google Antigravity, Claude Code, and Codex.
+version: 2.8.0
+description: Zero-UI, production-grade headless MCP server (v2.8.0) for Haiwell Cloud SCADA Develop. Covers 15 industrial automation domains across ${HAIWELL_TOOLS.length} strictly validated tools for VS Code, Google Antigravity, Claude Code, and Codex.
 mcp_endpoint: ${mcpEndpointUrl}
 transports: [streamable-http, stdio]
 ---
 
-# Haiwell Cloud SCADA Develop — Headless MCP Agent Skill
+# Haiwell Cloud SCADA Develop — Headless MCP Agent Skill (v2.8.0)
 
 ## Mandatory Safety & Reliability Protocol
 1. **Snapshot before bulk edits**: call \`haiwell_project_snapshot_rollback\` (\`CREATE\`) before mutating tags, logic, or screens; roll back immediately if audit fails.
-2. **Validate multi-vendor PLC addresses**: call \`haiwell_device_validate_address\` with the device protocol (Haiwell, Modbus, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, BACnet) before creating tags. Never overlap 32-bit/64-bit multi-word register spans.
-3. **Dry-run control writes**: invoke \`haiwell_tag_read_write\` or \`haiwell_tag_batch_io\` with \`dryRun: true\` before committing live writes.
-4. **Gate PLC logic on IEC 61131-3 validation**: resolve all \`ERROR\` diagnostics from \`haiwell_iec61131_validate\` before \`haiwell_iec61131_pou_save\`.
-5. **Compile HMI spatially (never blind drag-and-drop)**: use \`haiwell_hmi_pid_compile\` / \`haiwell_hmi_screen_generate\`, verify with \`haiwell_hmi_spatial_verify\`, auto-repair with \`haiwell_hmi_layout_solve\`, calibrate live WinForms selectors once via \`haiwell_desktop_uia_calibrate\`, and export calibrated UIA plans with \`haiwell_hmi_desktop_bridge_export\` (plus native \`haiwell_variables_import.csv\` via \`haiwell_project_export\`).
-6. **Run FAT simulation + safety audit**: run \`haiwell_simulation_step\` (E-Stop trip test) and \`haiwell_project_audit_safety\` (\`deploymentReady: true\`) before \`haiwell_project_export\`.
+2. **Validate multi-vendor PLC addresses**: call \`haiwell_device_validate_address\` with the device protocol and \`addressOffset\` (Haiwell, Modbus, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, BACnet) before creating tags. Never overlap 32-bit/64-bit multi-word register spans.
+3. **Dry-run control writes & recipes**: invoke \`haiwell_tag_read_write\` or \`haiwell_tag_batch_io\` with \`dryRun: true\` before committing live writes; use \`action: "DOWNLOAD_RECIPE"\` in \`haiwell_recipe_transfer\` with \`dryRun: true\` first.
+4. **Gate PLC logic & Haiwell JS on validation**: resolve all \`ERROR\` diagnostics from \`haiwell_iec61131_validate\` before \`haiwell_iec61131_pou_save\`, and author Strict-ES5 Haiwell JS using native \`Variable.GetByFullName\` / \`Variable.SetByFullName\` validated by \`haiwell_script_validate\`.
+5. **Compile HMI spatially (never blind drag-and-drop)**: use \`haiwell_hmi_pid_compile\` / \`haiwell_hmi_screen_generate\`, verify with \`haiwell_hmi_spatial_verify\` (0 collisions, 0 port gaps, 0 pipe-widget crossings), auto-repair with \`haiwell_hmi_layout_solve\`, calibrate live WinForms selectors once via \`haiwell_desktop_uia_calibrate\`, and export native \`haiwell_variables_import.csv\` + \`haiwell_internal_variables.csv\` via \`haiwell_project_export\` and calibrated UIA plans with \`haiwell_hmi_desktop_bridge_export\` / \`haiwell_open_project_bridge_export\`.
+6. **Run FAT simulation + safety audit**: run \`haiwell_simulation_step\` (E-Stop trip test & alarm delay verification) and \`haiwell_project_audit_safety\` (\`deploymentReady: true\`) before \`haiwell_project_export\`.
 
 ## Complete Tool Index (${HAIWELL_TOOLS.length} Tools across 15 Domains)
 ${HAIWELL_CAPABILITY_MATRIX.map(

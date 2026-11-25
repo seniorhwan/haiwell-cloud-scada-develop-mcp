@@ -365,6 +365,17 @@ export async function probeTcpEndpoint(
   const targets: Array<{ ip: string; family?: number }> = [];
 
   if (net.isIP(cleanHost) !== 0) {
+    if (net.isIP(cleanHost) === 6) {
+      const hextets = expandIpv6ToHextets(cleanHost);
+      const embedded = hextets ? extractEmbeddedIpv4FromIpv6(hextets) : null;
+      if (embedded && /^127\./.test(embedded)) {
+        return {
+          reachable: false,
+          latencyMs: 0,
+          error: `SSRF_BLOCK: Obfuscated IPv6 loopback alias "${host}" (${embedded}) is forbidden.`,
+        };
+      }
+    }
     targets.push({ ip: cleanHost });
   } else {
     const decoded = decodeNumericIpv4(cleanHost);
@@ -476,36 +487,44 @@ function escapeXml(str: string): string {
 
 export function generateOpcUaNodeSet2Xml(project: HaiwellProject): string {
   const { opcua } = project;
-  const nsIdx = Math.max(1, opcua.namespaceIndex || 1);
-  const folderNodeId = `ns=${nsIdx};s=${project.id}.Folder`;
+  const nsIdx = Math.max(1, opcua?.namespaceIndex || 1);
+  const namespaceUri = String(opcua?.namespaceUri || `urn:haiwell:scada:${project.id}`);
+  const folderNodeId = `ns=${nsIdx};s=${project.id || 'haiwell_project'}.Folder`;
   const seenNodeIds = new Set<string>([folderNodeId]);
 
   const namespaceUrisXml: string[] = [];
   for (let i = 1; i < nsIdx; i++) {
     namespaceUrisXml.push(`    <Uri>urn:haiwell:scada:ns${i}</Uri>`);
   }
-  namespaceUrisXml.push(`    <Uri>${escapeXml(opcua.namespaceUri)}</Uri>`);
+  namespaceUrisXml.push(`    <Uri>${escapeXml(namespaceUri)}</Uri>`);
 
-  const variableXml = opcua.nodes
+  const variableXml = (opcua?.nodes ?? [])
     .filter((node) => {
+      if (!node || !node.nodeId) return false;
       if (seenNodeIds.has(node.nodeId)) return false;
       seenNodeIds.add(node.nodeId);
       return true;
     })
     .map((node: OpcUaNodeMapping) => {
-      const tag = Object.prototype.hasOwnProperty.call(project.tags, node.tagName)
-        ? project.tags[node.tagName]
-        : undefined;
+      const tagName = String(node.tagName ?? '');
+      const tag =
+        tagName && Object.prototype.hasOwnProperty.call(project.tags, tagName)
+          ? project.tags[tagName]
+          : undefined;
       const uaType = tag
         ? mapTagTypeToOpcUa(tag.dataType)
-        : { name: node.dataType || 'Double', nodeId: 'i=11' };
+        : { name: String(node.dataType || 'Double'), nodeId: 'i=11' };
       const accessBits = node.accessLevel === 'CurrentReadWrite' ? 3 : node.accessLevel === 'HistoryRead' ? 5 : 1;
+      const browseName = String(node.browseName || tagName || node.nodeId);
+      const displayName = String(node.displayName || browseName);
+      const samplingMs = Number.isFinite(node.samplingIntervalMs) ? node.samplingIntervalMs : 500;
+      const parentId = folderNodeId;
       return [
-        `  <UAVariable NodeId="${escapeXml(node.nodeId)}" BrowseName="${nsIdx}:${escapeXml(node.browseName)}" ParentNodeId="${escapeXml(folderNodeId)}" DataType="${escapeXml(uaType.name)}" AccessLevel="${accessBits}" UserAccessLevel="${accessBits}" MinimumSamplingInterval="${node.samplingIntervalMs}">`,
-        `    <DisplayName>${escapeXml(node.displayName)}</DisplayName>`,
+        `  <UAVariable NodeId="${escapeXml(String(node.nodeId))}" BrowseName="${nsIdx}:${escapeXml(browseName)}" ParentNodeId="${escapeXml(parentId)}" DataType="${escapeXml(uaType.name)}" AccessLevel="${accessBits}" UserAccessLevel="${accessBits}" MinimumSamplingInterval="${samplingMs}">`,
+        `    <DisplayName>${escapeXml(displayName)}</DisplayName>`,
         `    <References>`,
         `      <Reference ReferenceType="HasTypeDefinition">i=63</Reference>`,
-        `      <Reference ReferenceType="Organizes" IsForward="false">${escapeXml(folderNodeId)}</Reference>`,
+        `      <Reference ReferenceType="Organizes" IsForward="false">${escapeXml(parentId)}</Reference>`,
         `    </References>`,
         `  </UAVariable>`,
       ].join('\n');
@@ -530,10 +549,10 @@ export function generateOpcUaNodeSet2Xml(project: HaiwellProject): string {
     `    <Alias Alias="HasTypeDefinition">i=40</Alias>`,
     `  </Aliases>`,
     `  <Models>`,
-    `    <Model ModelUri="${escapeXml(opcua.namespaceUri)}" Version="${escapeXml(project.version)}" PublicationDate="${new Date().toISOString()}" />`,
+    `    <Model ModelUri="${escapeXml(namespaceUri)}" Version="${escapeXml(String(project.version || '1.0.0'))}" PublicationDate="${new Date().toISOString()}" />`,
     `  </Models>`,
-    `  <UAObject NodeId="${escapeXml(folderNodeId)}" BrowseName="${nsIdx}:${escapeXml(project.name)}" ParentNodeId="i=85">`,
-    `    <DisplayName>${escapeXml(project.name)}</DisplayName>`,
+    `  <UAObject NodeId="${escapeXml(folderNodeId)}" BrowseName="${nsIdx}:${escapeXml(String(project.name || project.id))}" ParentNodeId="i=85">`,
+    `    <DisplayName>${escapeXml(String(project.name || project.id))}</DisplayName>`,
     `    <References>`,
     `      <Reference ReferenceType="HasTypeDefinition">i=61</Reference>`,
     `      <Reference ReferenceType="Organizes" IsForward="false">i=85</Reference>`,

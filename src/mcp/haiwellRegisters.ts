@@ -185,9 +185,11 @@ export interface ParsedHaiwellAddress {
   bitOffset?: number;
   kind: 'BIT' | 'WORD';
   readOnly: boolean;
+  modbusArea: 'COIL' | 'DI' | 'IR' | 'HR';
   modbusOffset0Based: number;
   modbusHexAddress: string;
   modbusAddress1Based: number;
+  modbusAddressFormatted: string;
   functionCodes: number[];
   iecDirectAddress: string;
 }
@@ -248,17 +250,26 @@ export function parseHaiwellRegister(address: string): ParsedHaiwellAddress | In
 
   const modbusOffset0Based = spec.modbusDecBase + index;
   const modbusHexAddress = `0x${modbusOffset0Based.toString(16).toUpperCase().padStart(4, '0')}`;
-  const effective1BasedPrefix =
-    modbusOffset0Based >= 9999
-      ? spec.oneBasedPrefix === 1
-        ? 1
-        : spec.oneBasedPrefix === 10001
-          ? 100001
-          : spec.oneBasedPrefix === 30001
-            ? 300001
-            : 400001
-      : spec.oneBasedPrefix;
+  const modbusArea: 'COIL' | 'DI' | 'IR' | 'HR' =
+    spec.oneBasedPrefix === 1
+      ? 'COIL'
+      : spec.oneBasedPrefix === 10001
+        ? 'DI'
+        : spec.oneBasedPrefix === 30001
+          ? 'IR'
+          : 'HR';
+  const extended = modbusOffset0Based >= 9999;
+  const effective1BasedPrefix = extended
+    ? modbusArea === 'COIL'
+      ? 1
+      : modbusArea === 'DI'
+        ? 100001
+        : modbusArea === 'IR'
+          ? 300001
+          : 400001
+    : spec.oneBasedPrefix;
   const modbusAddress1Based = effective1BasedPrefix + modbusOffset0Based;
+  const modbusAddressFormatted = String(modbusAddress1Based).padStart(extended ? 6 : 5, '0');
   const effectiveKind: 'BIT' | 'WORD' = bitOffset !== undefined ? 'BIT' : spec.kind;
 
   let iecDirectAddress: string;
@@ -296,9 +307,11 @@ export function parseHaiwellRegister(address: string): ParsedHaiwellAddress | In
     bitOffset,
     kind: effectiveKind,
     readOnly: spec.readOnly,
+    modbusArea,
     modbusOffset0Based,
     modbusHexAddress,
     modbusAddress1Based,
+    modbusAddressFormatted,
     functionCodes: spec.functionCodes,
     iecDirectAddress,
   };

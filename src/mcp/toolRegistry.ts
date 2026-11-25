@@ -203,6 +203,10 @@ const LITERAL_STRING_ARG_KEYS = new Set([
   'label',
   'reason',
   'filePathOrTtsText',
+  'lwtPayload',
+  'value',
+  'actionValue',
+  'svgMarkup',
 ]);
 
 export function normalizeAgentArgs(raw: unknown): Record<string, unknown> {
@@ -277,19 +281,54 @@ export function buildProjectExportBundle(project: HaiwellProject) {
     ].join(',')
   );
 
+  const deviceMap = new Map(project.devices.map((d) => [d.id, d]));
+
   const formatHaiwellRegisterType = (t: TagDefinition): string => {
     if (t.scope !== 'PLC') return t.scope === 'INTERNAL' ? 'Internal' : t.scope;
+    const dev = t.deviceId ? deviceMap.get(t.deviceId) : undefined;
+    if (dev && t.address) {
+      const parsed = validatePlcAddress(dev.protocol, t.address, {
+        addressOffset: dev.addressOffset ?? 'BASE_0',
+      });
+      if (parsed.valid && parsed.modbusArea) {
+        if (parsed.modbusArea === 'DI') return '1X(Digital input,Function code 02)';
+        if (parsed.modbusArea === 'COIL') return '0X(Digital output,Function code 01 05)';
+        if (parsed.modbusArea === 'IR') return '3X(Analog input,Function code 04)';
+        if (parsed.modbusArea === 'HR') return '4X(Analog output,Function code 03 06)';
+      }
+    }
     const addr = (t.address ?? '').trim().toUpperCase();
-    if (/^(1X|X|I|DI)/.test(addr) || (t.modbusAddress1Based && t.modbusAddress1Based >= 10001 && t.modbusAddress1Based < 20000)) {
-      return '1X(Digital input,Function code 02)';
-    }
-    if (/^(0X|Y|Q|M|COIL)/.test(addr) || (t.modbusAddress1Based && t.modbusAddress1Based >= 1 && t.modbusAddress1Based < 10000)) {
-      return '0X(Digital output,Function code 01 05)';
-    }
-    if (/^(3X|AI|IW|PIW)/.test(addr) || (t.modbusAddress1Based && t.modbusAddress1Based >= 30001 && t.modbusAddress1Based < 40000)) {
+    const m1 = t.modbusAddress1Based;
+    // Check 3X/IR and 4X/HR BEFORE 1X/I and 0X/COIL so "IR:0" is never captured by /^I/
+    if (/^(IR:|3X|AI|IW|PIW)/.test(addr) || (m1 !== undefined && ((m1 >= 30001 && m1 < 40000) || (m1 >= 300001 && m1 <= 365536)))) {
       return '3X(Analog input,Function code 04)';
     }
+    if (/^(HR:|4X|AQ|MW|QW|VW|DB|V\d|TV\d|CV\d|SV\d|DM\d|D\d)/.test(addr) || (m1 !== undefined && ((m1 >= 40001 && m1 < 50000) || (m1 >= 400001 && m1 <= 465536)))) {
+      return '4X(Analog output,Function code 03 06)';
+    }
+    if (/^(DI:|1X|X\d|I\d|%I)/.test(addr) || (m1 !== undefined && ((m1 >= 10001 && m1 < 20000) || (m1 >= 100001 && m1 <= 165536)))) {
+      return '1X(Digital input,Function code 02)';
+    }
+    if (/^(COIL:|0X|Y\d|Q\d|M\d|T\d|C\d|S\d|%Q)/.test(addr) || (m1 !== undefined && m1 >= 1 && m1 < 10000)) {
+      return '0X(Digital output,Function code 01 05)';
+    }
     return '4X(Analog output,Function code 03 06)';
+  };
+  const formatHaiwellRegisterAddress = (t: TagDefinition): string => {
+    const rawAddr = (t.address ?? '').trim();
+    const bitSuffixMatch = /\.(\d+)$/.exec(rawAddr);
+    if (t.modbusOffset0Based !== undefined) {
+      // Preserve bit-slice suffix on word registers (e.g., V200.3 -> "200.3")
+      if (bitSuffixMatch && t.dataType === 'BOOL' && /^(?:V|TV|CV|SV|4X|3X|HR:|IR:|D|DM|MW|QW)/i.test(rawAddr)) {
+        return `${t.modbusOffset0Based}.${bitSuffixMatch[1]}`;
+      }
+      return String(t.modbusOffset0Based);
+    }
+    const prefixedMatch = /^(?:HR:|IR:|COIL:|DI:|4X|3X|1X|0X)(\d+(?:\.\d+)?)$/i.exec(rawAddr);
+    if (prefixedMatch) {
+      return prefixedMatch[1];
+    }
+    return rawAddr;
   };
   const formatHaiwellDataType = (dt: TagDefinition['dataType']): string => {
     switch (dt) {
@@ -322,16 +361,15 @@ export function buildProjectExportBundle(project: HaiwellProject) {
 
   const haiwellVarHeader =
     'Variable name,Register type,Address format,Register address,Address length,Data type,Read-write mode,Acquisition frequency,Always Collect,Description';
-  const haiwellVarRows = Object.values(project.tags).map((t) => {
-    const rawAddr =
-      t.modbusOffset0Based !== undefined
-        ? String(t.modbusOffset0Based)
-        : (t.address ?? '');
-    return [
+  const allTags = Object.values(project.tags);
+  const plcTags = allTags.filter((t) => t.scope === 'PLC');
+  const internalTags = allTags.filter((t) => t.scope !== 'PLC');
+  const formatHaiwellRow = (t: TagDefinition) =>
+    [
       escapeCsvCell(t.name, true),
       escapeCsvCell(formatHaiwellRegisterType(t)),
       escapeCsvCell('Decimal'),
-      escapeCsvCell(rawAddr, true),
+      escapeCsvCell(formatHaiwellRegisterAddress(t), true),
       escapeCsvCell(Math.max(1, t.wordSpan ?? getWordSpanForType(t.dataType))),
       escapeCsvCell(formatHaiwellDataType(t.dataType)),
       escapeCsvCell(formatHaiwellAccess(t.access)),
@@ -339,10 +377,20 @@ export function buildProjectExportBundle(project: HaiwellProject) {
       escapeCsvCell(t.alwaysCollect ? 'TRUE' : 'FALSE'),
       escapeCsvCell(t.description ?? '', true),
     ].join(',');
-  });
+  const haiwellVarRows = plcTags.map(formatHaiwellRow);
+  const haiwellInternalHeader = 'Variable name,Scope,Data type,Initial value,Description';
+  const haiwellInternalRows = internalTags.map((t) =>
+    [
+      escapeCsvCell(t.name, true),
+      escapeCsvCell(t.scope),
+      escapeCsvCell(formatHaiwellDataType(t.dataType)),
+      escapeCsvCell(t.currentValue ?? '', true),
+      escapeCsvCell(t.description ?? '', true),
+    ].join(',')
+  );
 
   return {
-    format: 'haiwell-cloud-scada-bundle/v2.3',
+    format: 'haiwell-cloud-scada-bundle/v2.8',
     exportedAt: new Date().toISOString(),
     projectMeta: {
       id: project.id,
@@ -367,13 +415,14 @@ export function buildProjectExportBundle(project: HaiwellProject) {
         hwdevBinaryFormatNote:
           'Real .hwdev files are encrypted proprietary binary containers (1024-byte page-aligned ciphertext) and cannot be written directly offline; use haiwell_open_project_bridge_export against an open Haiwell Cloud Scada window.',
         variablesCsvNote:
-          'haiwell_variables_import.csv headers match the Haiwell Cloud Scada 3.50.1.19 Device Variable Grid (Variable name, Register type, Address format, Register address, Address length, Data type, The mode of reading and writing, Collect frequency, Always collect, Description).',
+          'haiwell_variables_import.csv exports PLC device variables with headers matching the Haiwell Cloud Scada 3.50.1.19 Device Variable Grid (Variable name, Register type, Address format, Register address, Address length, Data type, Read-write mode, Acquisition frequency, Always Collect, Description). Non-PLC internal/system variables are exported separately in haiwell_internal_variables.csv.',
         hwdevFileName: project.hwdevFileName,
         projectBrowserNodesCovered: [...REAL_HAIWELL_350_TREE_NODES],
         project,
       },
       'project.hwsp.json': project,
       'haiwell_variables_import.csv': [haiwellVarHeader, ...haiwellVarRows].join('\n'),
+      'haiwell_internal_variables.csv': [haiwellInternalHeader, ...haiwellInternalRows].join('\n'),
       'tags.csv': [tagCsvHeader, ...tagCsvRows].join('\n'),
       'opcua/nodeset2.xml': generateOpcUaNodeSet2Xml(project),
       'mqtt/bindings.json': project.mqtt,
@@ -397,9 +446,12 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
   }[] = [];
 
   const deviceProtocols = new Map<string, PlcDriverProtocol>(project.devices.map((d) => [d.id, d.protocol]));
+  const deviceOffsets = new Map<string, 'BASE_0' | 'BASE_1'>(
+    project.devices.map((d) => [d.id, d.addressOffset ?? 'BASE_0'])
+  );
 
-  // 1. Multi-word & exact register overlap check
-  for (const conflict of detectWordOverlapConflicts(project.tags, deviceProtocols)) {
+  // 1. Multi-word & exact register overlap check (honoring per-device BASE_0 / BASE_1 addressOffset)
+  for (const conflict of detectWordOverlapConflicts(project.tags, deviceProtocols, deviceOffsets)) {
     findings.push({
       code: 'AUD-TAG-OVERLAP',
       severity: 'CRITICAL',
@@ -422,7 +474,9 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
           remediation: 'Add the missing device via haiwell_device_add or rebind deviceId.',
         });
       } else if (tag.address) {
-        const parsed = validatePlcAddress(deviceProtocols.get(tag.deviceId)!, tag.address);
+        const parsed = validatePlcAddress(deviceProtocols.get(tag.deviceId)!, tag.address, {
+          addressOffset: deviceOffsets.get(tag.deviceId) ?? 'BASE_0',
+        });
         if (!parsed.valid) {
           findings.push({
             code: 'AUD-TAG-BAD-ADDR',
@@ -488,7 +542,7 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
     }
   }
 
-  // 3. Validate HMI screens (collisions, bounds, tags, nav links, touch targets)
+  // 3. Validate HMI screens (collisions, bounds, tags, nav links, touch targets, RO writes, duplicates, ranges, pipes)
   const screenIds = new Set(project.screens.map((s) => s.id));
   if (project.startupScreenId && !screenIds.has(project.startupScreenId)) {
     findings.push({
@@ -498,6 +552,15 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
       target: project.startupScreenId,
       message: `Project startupScreenId "${project.startupScreenId}" does not match any HMI screen in project "${project.id}".`,
       remediation: 'Create the missing startup screen or update startupScreenId to an existing screen ID.',
+    });
+  } else if (!project.startupScreenId && project.screens.length > 0) {
+    findings.push({
+      code: 'AUD-STARTUP-SCREEN',
+      severity: 'MEDIUM',
+      domain: 'hmi',
+      target: project.id,
+      message: `Project "${project.id}" defines ${project.screens.length} HMI screen(s) but has no startupScreenId configured.`,
+      remediation: 'Assign startupScreenId to the primary operator overview screen.',
     });
   }
   for (const screen of project.screens) {
@@ -511,8 +574,8 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
         severity: 'HIGH',
         domain: 'hmi',
         target: screen.id,
-        message: `Screen "${screen.name}" issues: collisions=${res.collisions.length}, outOfBounds=${res.outOfBounds.length}, unresolvedTags=${res.unresolvedTags.length}, brokenNav=${res.brokenNavTargets.length}, touchTargets=${res.touchTargetViolations.length}.`,
-        remediation: 'Regenerate or fix widget geometry, bindings, and navigation links.',
+        message: `Screen "${screen.name}" issues: collisions=${res.collisions.length}, outOfBounds=${res.outOfBounds.length}, unresolvedTags=${res.unresolvedTags.length}, brokenNav=${res.brokenNavTargets.length}, touchTargets=${res.touchTargetViolations.length}, duplicateIds=${res.duplicateWidgetIds.length}, roWriteWidgets=${res.readOnlyWriteWidgets.length}, invalidRanges=${res.invalidRanges.length}, disconnectedPipes=${res.disconnectedPipes.length}.`,
+        remediation: 'Regenerate or fix widget geometry, bindings, read-only write flags, ranges, pipes, and navigation links.',
       });
     }
   }
@@ -772,6 +835,7 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
       pushDangling('operations', `audio:${aud.id}`, aud.triggerTag);
     }
   }
+  const dataGroupIds = new Set((project.dataGroups ?? []).map((dg) => dg.id));
   for (const srv of project.dataReportingServers ?? []) {
     if (srv.enabled && !srv.tlsRequired && (srv.protocol === 'HTTP_REST' || srv.protocol === 'MQTT')) {
       findings.push({
@@ -782,6 +846,30 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
         message: `Data reporting server "${srv.id}" pushes plant data over unencrypted ${srv.protocol}.`,
         remediation: 'Enable tlsRequired=true and use https:// or mqtts://.',
       });
+    }
+    for (const dgId of srv.dataGroupIds ?? []) {
+      if (!dataGroupIds.has(dgId)) {
+        pushDanglingRef('datalink', `data_reporting_server:${srv.id}`, 'data_group', dgId);
+      }
+    }
+  }
+  for (const cam of project.cameras ?? []) {
+    if (cam.screenId && !screenIds.has(cam.screenId)) {
+      pushDanglingRef('operations', `camera:${cam.id}`, 'screen', cam.screenId);
+    }
+  }
+  if (project.transparentTunnel?.targetDeviceId && !deviceProtocols.has(project.transparentTunnel.targetDeviceId)) {
+    pushDanglingRef('devices', 'transparent_tunnel', 'device', project.transparentTunnel.targetDeviceId);
+  }
+  const userGroupNames = new Set((project.security?.userGroups ?? []).map((g) => g.groupName));
+  for (const card of project.rfid?.cards ?? []) {
+    if (card.userGroup && !userGroupNames.has(card.userGroup)) {
+      pushDanglingRef('security', `rfid_card:${card.cardUid}`, 'user_group', card.userGroup);
+    }
+  }
+  for (const pou of project.pous ?? []) {
+    for (const tn of pou.boundTags ?? []) {
+      if (!hasOwnTag(project, tn)) pushDangling('iec61131', `pou:${pou.name}`, tn);
     }
   }
 
@@ -853,6 +941,16 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
         });
       }
     }
+    if (project.rfid?.enabled && project.rfid.transport === 'SERIAL_COM') {
+      findings.push({
+        code: 'AUD-HW-COMPAT-A8',
+        severity: 'HIGH',
+        domain: 'security',
+        target: `rfid:${project.rfid.portOrHost}`,
+        message: `Serial COM RFID reader (${project.rfid.portOrHost}) is not supported on CLOUD_HMI_A8 (Haiwell A8 does not support COM serial devices).`,
+        remediation: 'Use USB_HID / NETWORK_TCP RFID transport or select a non-A8 targetHardware.',
+      });
+    }
   }
 
   // Official Haiwell en.lng (ERROR_AUDIO_PLAY_IPC): IPC does not support audio playing
@@ -923,16 +1021,27 @@ function checkTagWriteSafety(
       };
     }
   }
+  const isPhysicalPlcOutput =
+    tag.scope === 'PLC' && /^(?:Y\d|AQ\d|%Q|Q\d|QW\d)/i.test((tag.address ?? '').trim());
+  const effectiveRequiresInterlock =
+    tag.requiresInterlock || (Boolean(project.security?.requireInterlockForOutputs) && isPhysicalPlcOutput);
   const interlockName = (tag as TagDefinition & { interlockTag?: string }).interlockTag || 'EStop_OK';
   const estop = getOwnTag(project, interlockName);
-  if (tag.requiresInterlock && estop && (estop.currentValue === false || estop.currentValue === 0)) {
+  if (effectiveRequiresInterlock && !estop) {
+    return {
+      ok: false as const,
+      blockedBy: 'ESTOP_TAG_MISSING',
+      message: `Write to "${tag.name}" blocked (fail-closed): required safety interlock tag "${interlockName}" is not defined in project.`,
+    };
+  }
+  if (effectiveRequiresInterlock && estop && (estop.currentValue === false || estop.currentValue === 0)) {
     return {
       ok: false as const,
       blockedBy: 'ESTOP_INTERLOCK_ACTIVE',
       message: `Write to "${tag.name}" blocked: ${interlockName} is FALSE.`,
     };
   }
-  if (tag.requiresInterlock && !confirmSafetyOverride) {
+  if (effectiveRequiresInterlock && !confirmSafetyOverride) {
     return {
       ok: false as const,
       blockedBy: 'INTERLOCK_CONFIRMATION_REQUIRED',
@@ -1048,7 +1157,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         },
         opcua: {
           role: 'SERVER',
-          endpointUrl: `opc.tcp://0.0.0.0:4840/haiwell/${input.id}`,
+          endpointUrl: `opc.tcp://localhost:4840/haiwell/${input.id}`,
           namespaceUri: `urn:haiwell:scada:${input.id}`,
           namespaceIndex: 2,
           securityPolicy: 'Basic256Sha256',
@@ -1383,6 +1492,15 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           project.audioClips = (project.audioClips ?? []).map((aud) =>
             aud.triggerTag === input.entityId ? { ...aud, triggerTag: undefined } : aud
           );
+          project.faceplates = (project.faceplates ?? []).map((fp) => ({
+            ...fp,
+            widgets: fp.widgets.filter((w) => w.tagName !== input.entityId),
+          }));
+          const tagTokenRe = new RegExp(`\\{\\{\\s*${input.entityId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\}\\}`, 'g');
+          project.webhooks = (project.webhooks ?? []).map((wh) => ({
+            ...wh,
+            payloadTemplate: wh.payloadTemplate.replace(tagTokenRe, ''),
+          }));
         }
         store.saveProject(project);
         return { deleted: true, entityType: 'tag', entityId: input.entityId, cascadedDependents: deps };
@@ -1421,6 +1539,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           throw new Error(`screen "${input.entityId}" not found.`);
         }
         const screenDeps: string[] = [];
+        if (project.startupScreenId === input.entityId) {
+          screenDeps.push('project:startupScreenId');
+        }
         for (const s of project.screens) {
           if (s.id === input.entityId) continue;
           for (const w of s.widgets) {
@@ -1445,6 +1566,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         }
         project.screens = project.screens.filter((s) => s.id !== input.entityId);
         if (input.cascade) {
+          if (project.startupScreenId === input.entityId) {
+            project.startupScreenId = project.screens[0]?.id;
+          }
           for (const s of project.screens) {
             s.widgets = s.widgets.map((w) =>
               w.targetScreenId === input.entityId ? { ...w, targetScreenId: undefined } : w
@@ -1464,11 +1588,25 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (input.entityType === 'widget') {
         const scr = project.screens.find((s) => s.id === input.parentScreenId);
         if (!scr) throw new Error(`Widget deletion requires valid parentScreenId.`);
+        const pipeDeps = (scr.pipes ?? [])
+          .filter((p) => p.fromWidgetId === input.entityId || p.toWidgetId === input.entityId)
+          .map((p) => `pipe:${p.id}`);
+        if (pipeDeps.length > 0 && !input.cascade) {
+          return {
+            deleted: false,
+            blockedBy: 'REFERENTIAL_INTEGRITY',
+            dependents: pipeDeps,
+            message: `Cannot delete widget "${input.entityId}" because ${pipeDeps.length} pipe(s) connect to it. Pass cascade=true to prune.`,
+          };
+        }
         const before = scr.widgets.length;
         scr.widgets = scr.widgets.filter((w) => w.id !== input.entityId);
         if (scr.widgets.length === before) throw new Error(`Widget "${input.entityId}" not found.`);
+        if (input.cascade && scr.pipes) {
+          scr.pipes = scr.pipes.filter((p) => p.fromWidgetId !== input.entityId && p.toWidgetId !== input.entityId);
+        }
         store.saveProject(project);
-        return { deleted: true, entityType: 'widget', entityId: input.entityId };
+        return { deleted: true, entityType: 'widget', entityId: input.entityId, cascadedDependents: pipeDeps };
       }
 
       const removeById = <T extends { id: string }>(arr: T[]): T[] => {
@@ -1477,13 +1615,67 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         return next;
       };
 
+      const checkEntityDeps = (deps: string[]) => {
+        if (deps.length > 0 && !input.cascade) {
+          return {
+            deleted: false,
+            blockedBy: 'REFERENTIAL_INTEGRITY',
+            dependents: deps,
+            message: `Cannot delete ${input.entityType} "${input.entityId}" because ${deps.length} object(s) reference it. Pass cascade=true to prune.`,
+          };
+        }
+        return null;
+      };
+
       switch (input.entityType) {
         case 'pou': project.pous = removeById(project.pous); break;
         case 'faceplate': project.faceplates = removeById(project.faceplates); break;
-        case 'script': project.scripts = removeById(project.scripts); break;
+        case 'script': {
+          const targetScript = project.scripts.find((s) => s.id === input.entityId);
+          if (!targetScript) throw new Error(`script "${input.entityId}" not found.`);
+          const deps = [
+            ...project.eventTriggers
+              .filter((ev) => ev.actionType === 'RUN_SCRIPT' && (ev.targetId === input.entityId || ev.targetId === targetScript.name))
+              .map((ev) => `event_trigger:${ev.id}`),
+            ...project.schedules
+              .filter((sch) => sch.actionType === 'RUN_SCRIPT' && (sch.targetId === input.entityId || sch.targetId === targetScript.name))
+              .map((sch) => `schedule:${sch.id}`),
+          ];
+          const blocked = checkEntityDeps(deps);
+          if (blocked) return blocked;
+          project.scripts = removeById(project.scripts);
+          if (input.cascade) {
+            project.eventTriggers = project.eventTriggers.filter(
+              (ev) => !(ev.actionType === 'RUN_SCRIPT' && (ev.targetId === input.entityId || ev.targetId === targetScript.name))
+            );
+            project.schedules = project.schedules.filter(
+              (sch) => !(sch.actionType === 'RUN_SCRIPT' && (sch.targetId === input.entityId || sch.targetId === targetScript.name))
+            );
+          }
+          break;
+        }
         case 'event_trigger': project.eventTriggers = removeById(project.eventTriggers); break;
-        case 'webhook': project.webhooks = removeById(project.webhooks); break;
-        case 'alarm': project.alarms = removeById(project.alarms); break;
+        case 'webhook': {
+          const deps = project.eventTriggers
+            .filter((ev) => ev.actionType === 'SEND_WEBHOOK' && ev.targetId === input.entityId)
+            .map((ev) => `event_trigger:${ev.id}`);
+          const blocked = checkEntityDeps(deps);
+          if (blocked) return blocked;
+          project.webhooks = removeById(project.webhooks);
+          if (input.cascade) {
+            project.eventTriggers = project.eventTriggers.filter(
+              (ev) => !(ev.actionType === 'SEND_WEBHOOK' && ev.targetId === input.entityId)
+            );
+          }
+          break;
+        }
+        case 'alarm': {
+          project.alarms = removeById(project.alarms);
+          if (input.cascade) {
+            project.alarmHistory = project.alarmHistory.filter((h) => h.alarmId !== input.entityId);
+          }
+          break;
+        }
         case 'mqtt_binding': project.mqtt.bindings = removeById(project.mqtt.bindings); break;
         case 'opcua_node': {
           const before = project.opcua.nodes.length;
@@ -1491,13 +1683,64 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           if (project.opcua.nodes.length === before) throw new Error(`OPC UA node "${input.entityId}" not found.`);
           break;
         }
-        case 'recipe_group': project.recipes = removeById(project.recipes); break;
+        case 'recipe_group': {
+          const prefix = `${input.entityId}:`;
+          const deps = [
+            ...project.eventTriggers
+              .filter((ev) => ev.actionType === 'DOWNLOAD_RECIPE' && ev.targetId.startsWith(prefix))
+              .map((ev) => `event_trigger:${ev.id}`),
+            ...project.schedules
+              .filter((sch) => sch.actionType === 'DOWNLOAD_RECIPE' && sch.targetId.startsWith(prefix))
+              .map((sch) => `schedule:${sch.id}`),
+          ];
+          const blocked = checkEntityDeps(deps);
+          if (blocked) return blocked;
+          project.recipes = removeById(project.recipes);
+          if (input.cascade) {
+            project.eventTriggers = project.eventTriggers.filter(
+              (ev) => !(ev.actionType === 'DOWNLOAD_RECIPE' && ev.targetId.startsWith(prefix))
+            );
+            project.schedules = project.schedules.filter(
+              (sch) => !(sch.actionType === 'DOWNLOAD_RECIPE' && sch.targetId.startsWith(prefix))
+            );
+          }
+          break;
+        }
         case 'trend': project.trends = removeById(project.trends); break;
-        case 'data_group': project.dataGroups = removeById(project.dataGroups); break;
+        case 'data_group': {
+          const deps = (project.dataReportingServers ?? [])
+            .filter((srv) => srv.dataGroupIds.includes(input.entityId))
+            .map((srv) => `data_reporting_server:${srv.id}`);
+          const blocked = checkEntityDeps(deps);
+          if (blocked) return blocked;
+          project.dataGroups = removeById(project.dataGroups);
+          if (input.cascade) {
+            project.dataReportingServers = (project.dataReportingServers ?? [])
+              .map((srv) => ({
+                ...srv,
+                dataGroupIds: srv.dataGroupIds.filter((id) => id !== input.entityId),
+              }))
+              .filter((srv) => srv.dataGroupIds.length > 0);
+          }
+          break;
+        }
         case 'datalink': project.dataLinks = removeById(project.dataLinks); break;
         case 'data_reporting_server': project.dataReportingServers = removeById(project.dataReportingServers); break;
         case 'schedule': project.schedules = removeById(project.schedules); break;
-        case 'report': project.reports = removeById(project.reports); break;
+        case 'report': {
+          const deps = project.schedules
+            .filter((sch) => sch.actionType === 'EXPORT_REPORT' && sch.targetId === input.entityId)
+            .map((sch) => `schedule:${sch.id}`);
+          const blocked = checkEntityDeps(deps);
+          if (blocked) return blocked;
+          project.reports = removeById(project.reports);
+          if (input.cascade) {
+            project.schedules = project.schedules.filter(
+              (sch) => !(sch.actionType === 'EXPORT_REPORT' && sch.targetId === input.entityId)
+            );
+          }
+          break;
+        }
         case 'font': project.fonts = removeById(project.fonts); break;
         case 'shape': project.shapeLibrary = removeById(project.shapeLibrary); break;
         case 'peripheral': project.peripherals = removeById(project.peripherals); break;
@@ -1559,8 +1802,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (input.includeArtifacts.includes('hwdev_manifest'))
         selected['project.hwdev.manifest.json'] = bundle.artifacts['project.hwdev.manifest.json'];
       if (input.includeArtifacts.includes('project_json')) selected['project.hwsp.json'] = bundle.artifacts['project.hwsp.json'];
-      if (input.includeArtifacts.includes('haiwell_variables_csv'))
+      if (input.includeArtifacts.includes('haiwell_variables_csv')) {
         selected['haiwell_variables_import.csv'] = bundle.artifacts['haiwell_variables_import.csv'];
+        selected['haiwell_internal_variables.csv'] = bundle.artifacts['haiwell_internal_variables.csv'];
+      }
       if (input.includeArtifacts.includes('tags_csv')) selected['tags.csv'] = bundle.artifacts['tags.csv'];
       if (input.includeArtifacts.includes('opcua_xml')) selected['opcua/nodeset2.xml'] = bundle.artifacts['opcua/nodeset2.xml'];
       if (input.includeArtifacts.includes('mqtt_json')) selected['mqtt/bindings.json'] = bundle.artifacts['mqtt/bindings.json'];
@@ -1689,6 +1934,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     inputSchema: z.object({
       protocol: z.enum(PLC_PROTOCOLS).default('HAIWELL_PLC_TCP'),
       addresses: z.array(z.string().min(1)).min(1).max(200),
+      addressOffset: z.enum(['BASE_0', 'BASE_1']).default('BASE_0'),
       includeAreaTable: z.boolean().default(false),
     }),
     sampleInput: {
@@ -1696,9 +1942,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       addresses: ['X0', 'Y0', 'M100', 'AI0', 'AQ2', 'V100', 'V100.3', 'SV10'],
     },
     handler: (input) => {
-      const results = input.addresses.map((addr) => validatePlcAddress(input.protocol, addr));
+      const results = input.addresses.map((addr) =>
+        validatePlcAddress(input.protocol, addr, { addressOffset: input.addressOffset })
+      );
       return {
         protocol: input.protocol,
+        addressOffset: input.addressOffset,
         allValid: results.every((r) => r.valid),
         results,
         ...(input.includeAreaTable
@@ -1828,6 +2077,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       const deviceProtocols = new Map<string, PlcDriverProtocol>(project.devices.map((d) => [d.id, d.protocol]));
+      const deviceOffsets = new Map<string, 'BASE_0' | 'BASE_1'>(
+        project.devices.map((d) => [d.id, d.addressOffset ?? 'BASE_0'])
+      );
       const now = new Date().toISOString();
       const errors: { tag: string; code: string; error: string }[] = [];
       const upserted: string[] = [];
@@ -1863,7 +2115,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             continue;
           }
           const protocol = deviceProtocols.get(t.deviceId)!;
-          const parsed = validatePlcAddress(protocol, t.address);
+          const addressOffset = deviceOffsets.get(t.deviceId) ?? 'BASE_0';
+          const parsed = validatePlcAddress(protocol, t.address, { addressOffset });
           if (!parsed.valid) {
             errors.push({ tag: t.name, code: 'INVALID_PLC_ADDRESS', error: `${parsed.error} ${parsed.hint}` });
             continue;
@@ -1924,6 +2177,24 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           errors.push({ tag: t.name, code: valCheck.code, error: valCheck.error });
           continue;
         }
+        if (t.initialValue !== undefined && typeof valCheck.normalizedValue === 'number') {
+          if (t.safeMin !== undefined && valCheck.normalizedValue < t.safeMin) {
+            errors.push({
+              tag: t.name,
+              code: 'INITIAL_VALUE_OUT_OF_SAFE_RANGE',
+              error: `initialValue (${valCheck.normalizedValue}) is below safeMin (${t.safeMin}).`,
+            });
+            continue;
+          }
+          if (t.safeMax !== undefined && valCheck.normalizedValue > t.safeMax) {
+            errors.push({
+              tag: t.name,
+              code: 'INITIAL_VALUE_OUT_OF_SAFE_RANGE',
+              error: `initialValue (${valCheck.normalizedValue}) exceeds safeMax (${t.safeMax}).`,
+            });
+            continue;
+          }
+        }
 
         const candidate = {
           name: t.name,
@@ -1951,7 +2222,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         };
 
         const testMap = { ...candidateTags, [t.name]: candidate };
-        const overlaps = detectWordOverlapConflicts(testMap, deviceProtocols).filter(
+        const overlaps = detectWordOverlapConflicts(testMap, deviceProtocols, deviceOffsets).filter(
           (c) => c.tagA === t.name || c.tagB === t.name
         );
         if (overlaps.length > 0) {
@@ -1995,6 +2266,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       deviceId: z.string().optional(),
       scope: z.enum(['PLC', 'INTERNAL', 'SYSTEM', 'CLOUD_SHARED']).optional(),
       safetyClass: z.enum(['SIL0', 'SIL1', 'SIL2', 'SIL3']).optional(),
+      dataType: z.enum(['BOOL', 'INT16', 'UINT16', 'INT32', 'UINT32', 'FLOAT32', 'FLOAT64', 'STRING', 'BCD16', 'BCD32']).optional(),
       compact: z.boolean().default(true),
     }),
     sampleInput: { projectId: DEFAULT_PROJECT_ID, compact: true },
@@ -2005,6 +2277,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         if (input.deviceId && t.deviceId !== input.deviceId) return false;
         if (input.scope && t.scope !== input.scope) return false;
         if (input.safetyClass && t.safetyClass !== input.safetyClass) return false;
+        if (input.dataType && t.dataType !== input.dataType) return false;
         return true;
       });
       return {
@@ -3129,12 +3402,17 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       alarmId: z.string().optional(),
       shelveMinutes: z.number().int().min(1).max(1440).default(30),
       operator: z.string().default('mcp-agent'),
+      scanIntervalMs: z.number().int().min(10).max(60000).optional(),
+      enforceDelays: z.boolean().optional(),
     }),
     sampleInput: { projectId: DEFAULT_PROJECT_ID, action: 'EVALUATE' },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
       if (input.action === 'EVALUATE') {
-        const summary = evaluateProjectAlarms(project);
+        const summary = evaluateProjectAlarms(project, {
+          scanIntervalMs: input.scanIntervalMs,
+          enforceDelays: input.enforceDelays,
+        });
         store.saveProject(project);
         return summary;
       }
@@ -3356,7 +3634,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
       role: 'SERVER',
-      endpointUrl: 'opc.tcp://0.0.0.0:4840/haiwell/chiller01',
+      endpointUrl: 'opc.tcp://localhost:4840/haiwell/chiller01',
       namespaceUri: 'urn:haiwell:scada:chiller01',
       securityPolicy: 'Basic256Sha256',
       securityMode: 'SignAndEncrypt',
@@ -3483,12 +3761,19 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           sourceTimestamp: tag.updatedAt,
         };
       }
-      if (node.accessLevel === 'CurrentRead') {
+      if (node.accessLevel !== 'CurrentReadWrite') {
+        store.appendAudit(project, {
+          actor: 'mcp-agent',
+          action: 'OPCUA_WRITE_NODE',
+          target: node.nodeId,
+          outcome: 'BLOCKED',
+          detail: `Blocked write to OPC UA node ${node.nodeId} with non-writable accessLevel=${node.accessLevel}.`,
+        });
         return {
           simulatedAddressSpace: true,
           written: false,
           statusCode: 'BadNotWritable (0x803B0000)',
-          message: `OPC UA Node ${node.nodeId} is CurrentRead only.`,
+          message: `OPC UA Node ${node.nodeId} has accessLevel "${node.accessLevel}" and is not writable (requires CurrentReadWrite).`,
         };
       }
       if (input.value === undefined) throw new Error('WRITE_NODE requires value.');
@@ -3502,6 +3787,13 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
               : guard.blockedBy.startsWith('TYPE_MISMATCH')
                 ? 'BadTypeMismatch (0x80740000)'
                 : 'BadUserAccessDenied (0x801F0000)';
+        store.appendAudit(project, {
+          actor: 'mcp-agent',
+          action: 'OPCUA_WRITE_NODE',
+          target: node.nodeId,
+          outcome: 'BLOCKED',
+          detail: `OPC UA write to ${tag.name} blocked by ${guard.blockedBy}: ${guard.message}`,
+        });
         return {
           simulatedAddressSpace: true,
           written: false,
@@ -3514,6 +3806,13 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       tag.currentValue = guard.normalizedValue;
       tag.updatedAt = new Date().toISOString();
       store.saveProject(project);
+      store.appendAudit(project, {
+        actor: 'mcp-agent',
+        action: 'OPCUA_WRITE_NODE',
+        target: node.nodeId,
+        outcome: 'ALLOWED',
+        detail: `OPC UA write ${tag.name}=${JSON.stringify(tag.currentValue)}`,
+      });
       return {
         simulatedAddressSpace: true,
         written: true,
@@ -4462,8 +4761,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       }
       if (!input.shape) throw new Error('UPSERT requires shape object.');
       if (input.shape.svgMarkup) {
-        if (/<script\b|javascript:|on[a-z]+\s*=/i.test(input.shape.svgMarkup)) {
-          throw new Error('SVG_SECURITY_REJECTED: Shape svgMarkup contains forbidden <script>, javascript:, or inline event handler.');
+        const svgError = validateSafeSvgMarkup(input.shape.svgMarkup);
+        if (svgError) {
+          throw new Error(`SVG_SECURITY_REJECTED: ${svgError}`);
         }
       }
       const idx = project.shapeLibrary.findIndex((s) => s.id === input.shape!.id);
@@ -4806,6 +5106,81 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   }),
 ];
 
+const SAFE_SVG_TAGS = new Set([
+  'svg', 'g', 'defs', 'title', 'desc', 'symbol', 'use',
+  'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon',
+  'text', 'tspan', 'lineargradient', 'radialgradient', 'stop',
+  'clippath', 'mask', 'marker', 'pattern', 'filter',
+  'fegaussianblur', 'feoffset', 'feblend', 'fedropshadow', 'fecolormatrix',
+]);
+
+function decodeXmlEntities(raw: string): string {
+  return raw
+    .replace(/&#x([0-9a-f]+);?/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16) || 0))
+    .replace(/&#(\d+);?/g, (_, dec) => String.fromCodePoint(Number.parseInt(dec, 10) || 0))
+    .replace(/&colon;?/gi, ':')
+    .replace(/&tab;?/gi, '\t')
+    .replace(/&newline;?/gi, '\n')
+    .replace(/&lt;?/gi, '<')
+    .replace(/&gt;?/gi, '>')
+    .replace(/&quot;?/gi, '"')
+    .replace(/&apos;?/gi, "'")
+    .replace(/&amp;?/gi, '&');
+}
+
+function validateSafeSvgMarkup(svg: string): string | null {
+  if (/<!(?:DOCTYPE|ENTITY|\[CDATA\[)/i.test(svg) || /<\?xml-stylesheet\b/i.test(svg)) {
+    return 'SVG markup cannot contain DOCTYPE, ENTITY, CDATA, or xml-stylesheet directives.';
+  }
+  // Remove XML comments before tag/attribute parsing
+  const stripped = svg.replace(/<!--[\s\S]*?-->/g, '');
+  const tagRegex = /<\s*\/?\s*([a-zA-Z_][a-zA-Z0-9_:-]*)([^>]*)>/g;
+  let match: RegExpExecArray | null;
+  let sawSvgRoot = false;
+  while ((match = tagRegex.exec(stripped)) !== null) {
+    const rawTag = match[1];
+    const attrsRaw = match[2] ?? '';
+    const localTag = (rawTag.includes(':') ? rawTag.split(':').pop()! : rawTag).toLowerCase();
+    if (localTag === 'svg') sawSvgRoot = true;
+    if (!SAFE_SVG_TAGS.has(localTag)) {
+      return `Disallowed SVG/XML element <${rawTag}> (only static vector graphics elements are permitted).`;
+    }
+    const attrRegex = /([a-zA-Z_][a-zA-Z0-9_:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
+    let attrMatch: RegExpExecArray | null;
+    while ((attrMatch = attrRegex.exec(attrsRaw)) !== null) {
+      const attrNameRaw = attrMatch[1];
+      const attrName = (attrNameRaw.includes(':') ? attrNameRaw.split(':').pop()! : attrNameRaw).toLowerCase();
+      const attrValRaw = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? '';
+      const decodedVal = decodeXmlEntities(attrValRaw);
+      const compactVal = decodedVal.replace(/[\u0000-\u0020]+/g, '').toLowerCase();
+
+      if (attrName.startsWith('on')) {
+        return `Inline event handler attribute "${attrNameRaw}" is forbidden in SVG markup.`;
+      }
+      if (attrName === 'style') {
+        return 'Inline style attributes are forbidden in SVG shapes; use explicit SVG presentation attributes (fill, stroke, opacity).';
+      }
+      if (attrName === 'href' || attrName === 'src' || attrName === 'from' || attrName === 'to' || attrName === 'values') {
+        if (
+          compactVal.includes('javascript:') ||
+          compactVal.includes('vbscript:') ||
+          compactVal.includes('data:') ||
+          (attrName === 'href' && !/^#[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(decodedVal.trim()))
+        ) {
+          return `Forbidden URI/reference in attribute "${attrNameRaw}" (only local #id fragment references are allowed).`;
+        }
+      }
+      if (compactVal.includes('javascript:') || compactVal.includes('vbscript:') || compactVal.includes('data:text/html')) {
+        return `Attribute "${attrNameRaw}" contains a forbidden script URI scheme.`;
+      }
+    }
+  }
+  if (!sawSvgRoot) {
+    return 'SVG markup must contain a valid <svg> root element.';
+  }
+  return null;
+}
+
 export interface McpToolAnnotations {
   title: string;
   readOnlyHint: boolean;
@@ -4814,19 +5189,37 @@ export interface McpToolAnnotations {
   openWorldHint: boolean;
 }
 
+const NON_IDEMPOTENT_TOOLS = new Set([
+  'haiwell_project_create',
+  'haiwell_project_snapshot_rollback',
+  'haiwell_entity_delete',
+  'haiwell_tag_read_write',
+  'haiwell_tag_batch_write',
+  'haiwell_alarm_manage',
+  'haiwell_recipe_manage',
+  'haiwell_simulation_step',
+  'haiwell_mqtt_exchange',
+  'haiwell_opcua_browse_read_write',
+  'haiwell_desktop_launch',
+  'haiwell_desktop_new_project',
+]);
+
 export function getToolAnnotations(tool: HaiwellToolDefinition): McpToolAnnotations {
   const isRead = tool.safetyTier === 'read';
   const isDestructive =
     tool.name === 'haiwell_entity_delete' ||
+    tool.name === 'haiwell_project_snapshot_rollback' ||
     tool.safetyTier === 'control_guarded' ||
     tool.name === 'haiwell_mqtt_exchange' ||
     tool.name === 'haiwell_opcua_browse_read_write';
   const isIdempotent =
     isRead ||
-    /(_upsert|_configure|_bind|_define|_save|_map|_policy|_manage|_solve)$/.test(tool.name);
+    (!NON_IDEMPOTENT_TOOLS.has(tool.name) &&
+      /(_upsert|_upsert_batch|_configure|_bind|_define|_save|_map|_policy|_solve|_library_manage)$/.test(tool.name));
   const isOpenWorld =
     tool.name === 'haiwell_mqtt_exchange' ||
     tool.name === 'haiwell_webhook_configure' ||
+    tool.name === 'haiwell_data_reporting_server_configure' ||
     tool.name === 'haiwell_cloud_transparent_tunnel' ||
     tool.name === 'haiwell_desktop_launch' ||
     tool.name === 'haiwell_desktop_new_project';
@@ -4879,16 +5272,32 @@ export function getToolsForProfile(profile: ToolProfile = 'all'): HaiwellToolDef
 }
 
 export function serializeToolCatalog(profile: ToolProfile = 'all') {
-  return getToolsForProfile(profile).map((tool) => ({
-    name: tool.name,
-    domain: tool.domain,
-    haiwellFeature: tool.haiwellFeature,
-    safetyTier: tool.safetyTier,
-    description: tool.description,
-    annotations: getToolAnnotations(tool),
-    inputSchema: z.toJSONSchema(tool.inputSchema),
-    sampleInput: tool.sampleInput,
-  }));
+  return getToolsForProfile(profile).map((tool) => {
+    const schema = z.toJSONSchema(tool.inputSchema) as Record<string, unknown>;
+    if (tool.safetyTier !== 'read' && schema && typeof schema.properties === 'object' && schema.properties !== null) {
+      schema.properties = {
+        ...(schema.properties as Record<string, unknown>),
+        idempotencyKey: {
+          type: 'string',
+          description: 'Optional client-supplied idempotency key for safe retries.',
+        },
+        expectedRevision: {
+          type: 'integer',
+          description: 'Optional optimistic concurrency guard matching project.revision.',
+        },
+      };
+    }
+    return {
+      name: tool.name,
+      domain: tool.domain,
+      haiwellFeature: tool.haiwellFeature,
+      safetyTier: tool.safetyTier,
+      description: tool.description,
+      annotations: getToolAnnotations(tool),
+      inputSchema: schema,
+      sampleInput: tool.sampleInput,
+    };
+  });
 }
 
 /**
@@ -4929,6 +5338,27 @@ function getIdempotencyCache(store: HaiwellProjectStore): Map<string, InvokeTool
   return cache;
 }
 
+function stableJsonForHash(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((v) => stableJsonForHash(v)).join(',')}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJsonForHash(obj[k])}`).join(',')}}`;
+}
+
+function resolveTargetProjectId(toolName: string, args: Record<string, unknown>): string {
+  if (toolName === 'haiwell_entity_delete' && args.entityType === 'project' && typeof args.entityId === 'string') {
+    return args.entityId;
+  }
+  if (toolName === 'haiwell_project_create' && typeof args.id === 'string') {
+    return args.id;
+  }
+  if (typeof args.projectId === 'string' && args.projectId.trim().length > 0) {
+    return args.projectId.trim();
+  }
+  return DEFAULT_PROJECT_ID;
+}
+
 export async function invokeHaiwellTool(
   toolName: string,
   rawArgs: unknown,
@@ -4960,9 +5390,20 @@ export async function invokeHaiwellTool(
       ? normalizedArgs.expectedRevision
       : undefined;
 
-  if (idempotencyKey) {
-    const cacheKey = `${tool.name}:${idempotencyKey}`;
-    const cached = getIdempotencyCache(store).get(cacheKey);
+  const argsForSchema: Record<string, unknown> = { ...normalizedArgs };
+  delete argsForSchema.idempotencyKey;
+  delete argsForSchema.expectedRevision;
+
+  const targetProjectIdPreview = resolveTargetProjectId(tool.name, argsForSchema);
+  const argsSha256 = idempotencyKey
+    ? crypto.createHash('sha256').update(stableJsonForHash(argsForSchema)).digest('hex').slice(0, 16)
+    : '';
+  const idempotencyCacheKey = idempotencyKey
+    ? `${tool.name}:${targetProjectIdPreview}:${argsSha256}:${idempotencyKey}`
+    : undefined;
+
+  if (idempotencyCacheKey) {
+    const cached = getIdempotencyCache(store).get(idempotencyCacheKey);
     if (cached) {
       return {
         ...cached,
@@ -4971,10 +5412,6 @@ export async function invokeHaiwellTool(
       };
     }
   }
-
-  const argsForSchema: Record<string, unknown> = { ...normalizedArgs };
-  delete argsForSchema.idempotencyKey;
-  delete argsForSchema.expectedRevision;
 
   const parsed = tool.inputSchema.safeParse(argsForSchema);
   if (!parsed.success) {
@@ -4998,10 +5435,7 @@ export async function invokeHaiwellTool(
 
   // Optimistic concurrency guard: reject stale writes when expectedRevision != current project.revision
   if (expectedRevision !== undefined && tool.safetyTier !== 'read') {
-    const targetProjectId =
-      typeof (parsed.data as Record<string, unknown>).projectId === 'string'
-        ? ((parsed.data as Record<string, unknown>).projectId as string)
-        : DEFAULT_PROJECT_ID;
+    const targetProjectId = resolveTargetProjectId(tool.name, parsed.data as Record<string, unknown>);
     try {
       const current = store.getProject(targetProjectId);
       if (current.revision !== expectedRevision) {
@@ -5032,10 +5466,9 @@ export async function invokeHaiwellTool(
       executionMs: Number((performance.now() - start).toFixed(3)),
       data,
     };
-    if (idempotencyKey) {
+    if (idempotencyCacheKey) {
       const cache = getIdempotencyCache(store);
-      const cacheKey = `${tool.name}:${idempotencyKey}`;
-      cache.set(cacheKey, result);
+      cache.set(idempotencyCacheKey, result);
       if (cache.size > 500) {
         const oldestKey = cache.keys().next().value;
         if (oldestKey) cache.delete(oldestKey);

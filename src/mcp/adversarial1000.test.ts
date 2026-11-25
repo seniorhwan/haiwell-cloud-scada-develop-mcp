@@ -772,21 +772,21 @@ test('8. Operational safety: ISA-18.2 dedup/hysteresis, atomic aborts, CRON/SQL 
 
   // 8A: ISA-18.2 Alarm deduplication & deadband hysteresis (threshold=14.0, deadband=0.5)
   prj.tags.Supply_Temp_C.currentValue = 14.5; // >= 14.0 threshold
-  const eval1 = evaluateProjectAlarms(prj);
+  const eval1 = evaluateProjectAlarms(prj, { enforceDelays: false });
   assert.equal(eval1.newlyTriggered.length, 1);
   // Evaluating 20 more times MUST NOT duplicate the active alarm!
   for (let i = 0; i < 20; i++) {
-    const evalDup = evaluateProjectAlarms(prj);
+    const evalDup = evaluateProjectAlarms(prj, { enforceDelays: false });
     assert.equal(evalDup.newlyTriggered.length, 0);
     mark();
   }
   // Drop into deadband (13.7 > 14.0 - 0.5 = 13.5): MUST stay active!
   prj.tags.Supply_Temp_C.currentValue = 13.7;
-  const evalInBand = evaluateProjectAlarms(prj);
+  const evalInBand = evaluateProjectAlarms(prj, { enforceDelays: false });
   assert.equal(evalInBand.cleared.length, 0);
   // Drop below 13.5 (13.0): clears to CLEARED_UNACK
   prj.tags.Supply_Temp_C.currentValue = 13.0;
-  const evalCleared = evaluateProjectAlarms(prj);
+  const evalCleared = evaluateProjectAlarms(prj, { enforceDelays: false });
   assert.equal(evalCleared.cleared.length, 1);
   assert.equal(evalCleared.cleared[0].state, 'CLEARED_UNACK');
   mark(3);

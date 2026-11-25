@@ -570,6 +570,17 @@ function sleepSync(ms: number): void {
 function normalizeLoadedProject(rawProj: Partial<HaiwellProject>): HaiwellProject {
   const p = sanitizeJsonProtoKeys(rawProj) as HaiwellProject;
   const id = p.id || 'prj_restored';
+  const rawMqtt = (p.mqtt && typeof p.mqtt === 'object' ? p.mqtt : {}) as Partial<HaiwellProject['mqtt']>;
+  const rawOpcua = (p.opcua && typeof p.opcua === 'object' ? p.opcua : {}) as Partial<HaiwellProject['opcua']>;
+  const rawSec = (p.security && typeof p.security === 'object' ? p.security : {}) as Partial<HaiwellProject['security']>;
+  const rawCloudMon = (p.cloudMonitor && typeof p.cloudMonitor === 'object' ? p.cloudMonitor : {}) as Partial<
+    NonNullable<HaiwellProject['cloudMonitor']>
+  >;
+  const rawOpRec = (p.operationRecordPolicy && typeof p.operationRecordPolicy === 'object'
+    ? p.operationRecordPolicy
+    : {}) as Partial<NonNullable<HaiwellProject['operationRecordPolicy']>>;
+  const rawRfid = (p.rfid && typeof p.rfid === 'object' ? p.rfid : {}) as Partial<NonNullable<HaiwellProject['rfid']>>;
+
   return {
     ...p,
     id,
@@ -592,26 +603,29 @@ function normalizeLoadedProject(rawProj: Partial<HaiwellProject>): HaiwellProjec
     eventTriggers: Array.isArray(p.eventTriggers) ? p.eventTriggers : [],
     alarms: Array.isArray(p.alarms) ? p.alarms : [],
     alarmHistory: Array.isArray(p.alarmHistory) ? p.alarmHistory : [],
-    mqtt: p.mqtt ?? {
-      enabled: false,
-      role: 'CLIENT',
-      brokerUri: 'mqtt://localhost:1883',
-      clientId: `${id}_mqtt`,
-      tlsEnabled: false,
-      keepAliveSec: 60,
-      cleanSession: true,
-      bindings: [],
+    mqtt: {
+      mode: rawMqtt.mode ?? 'EXTERNAL_BROKER',
+      brokerUri: rawMqtt.brokerUri ?? 'mqtts://localhost:8883',
+      clientId: rawMqtt.clientId ?? `${id}_mqtt`,
+      keepAliveSec: rawMqtt.keepAliveSec ?? 60,
+      cleanSession: rawMqtt.cleanSession ?? true,
+      tlsEnabled: rawMqtt.tlsEnabled ?? true,
+      sslBits: rawMqtt.sslBits ?? 128,
+      lwtTopic: rawMqtt.lwtTopic,
+      lwtPayload: rawMqtt.lwtPayload,
+      proxyEnabled: rawMqtt.proxyEnabled ?? false,
+      bindings: Array.isArray(rawMqtt.bindings) ? rawMqtt.bindings : [],
     },
-    opcua: p.opcua ?? {
-      role: 'SERVER',
-      endpointUrl: 'opc.tcp://localhost:4840/haiwell',
-      namespaceUri: `urn:haiwell:scada:${id}`,
-      namespaceIndex: 1,
-      securityPolicy: 'Basic256Sha256',
-      securityMode: 'SignAndEncrypt',
-      authMode: 'Username',
-      publishingIntervalMs: 500,
-      nodes: [],
+    opcua: {
+      role: rawOpcua.role ?? 'SERVER',
+      endpointUrl: rawOpcua.endpointUrl ?? 'opc.tcp://localhost:4840/haiwell',
+      namespaceUri: rawOpcua.namespaceUri ?? `urn:haiwell:scada:${id}`,
+      namespaceIndex: rawOpcua.namespaceIndex ?? 2,
+      securityPolicy: rawOpcua.securityPolicy ?? 'Basic256Sha256',
+      securityMode: rawOpcua.securityMode ?? 'SignAndEncrypt',
+      authMode: rawOpcua.authMode ?? 'Username',
+      publishingIntervalMs: rawOpcua.publishingIntervalMs ?? 500,
+      nodes: Array.isArray(rawOpcua.nodes) ? rawOpcua.nodes : [],
     },
     recipes: Array.isArray(p.recipes) ? p.recipes : [],
     trends: Array.isArray(p.trends) ? p.trends : [],
@@ -622,46 +636,48 @@ function normalizeLoadedProject(rawProj: Partial<HaiwellProject>): HaiwellProjec
     cameras: Array.isArray(p.cameras) ? p.cameras : [],
     translations: p.translations && typeof p.translations === 'object' ? p.translations : {},
     transparentTunnel: p.transparentTunnel ?? null,
-    security: p.security ?? {
-      abKeyEnabled: true,
-      requirePasswordForWrites: true,
-      minWriteLevel: 5,
-      httpsOnly: true,
-      auditTrailEnabled: true,
-      users: [],
+    security: {
+      abKeyEnabled: rawSec.abKeyEnabled ?? true,
+      sslBits: rawSec.sslBits ?? 128,
+      requireInterlockForOutputs: rawSec.requireInterlockForOutputs ?? true,
+      auditTrailEnabled: rawSec.auditTrailEnabled ?? true,
+      userGroups: Array.isArray(rawSec.userGroups) ? rawSec.userGroups : [],
     },
     auditLog: Array.isArray(p.auditLog) ? p.auditLog : [],
     dataGroups: Array.isArray(p.dataGroups) ? p.dataGroups : [],
     dataReportingServers: Array.isArray(p.dataReportingServers) ? p.dataReportingServers : [],
-    cloudMonitor: p.cloudMonitor ?? {
-      enabled: false,
-      platform: 'HAIWELL_CLOUD',
-      machineCode: '',
-      networkProjectPort: 8888,
-      webScadaEnabled: true,
-      mobileAppEnabled: true,
-      remoteAlarmPushEnabled: true,
-      monitoredTags: [],
+    cloudMonitor: {
+      enabled: rawCloudMon.enabled ?? false,
+      platform: rawCloudMon.platform ?? 'HAIWELL_CLOUD',
+      machineCode: rawCloudMon.machineCode ?? '',
+      networkProjectPort: rawCloudMon.networkProjectPort ?? 8888,
+      webScadaEnabled: rawCloudMon.webScadaEnabled ?? true,
+      mobileAppEnabled: rawCloudMon.mobileAppEnabled ?? true,
+      remoteAlarmPushEnabled: rawCloudMon.remoteAlarmPushEnabled ?? true,
+      monitoredTags: Array.isArray(rawCloudMon.monitoredTags) ? rawCloudMon.monitoredTags : [],
     },
-    operationRecordPolicy: p.operationRecordPolicy ?? {
-      enabled: true,
-      recordLogins: true,
-      recordVariableWrites: true,
-      recordScreenChanges: true,
-      recordRecipeTransfers: true,
-      recordAlarmAcks: true,
-      retentionDays: 180,
-      maxRecords: 100000,
-      storageTarget: 'LOCAL_SQLITE',
+    operationRecordPolicy: {
+      enabled: rawOpRec.enabled ?? true,
+      recordLogins: rawOpRec.recordLogins ?? true,
+      recordVariableWrites: rawOpRec.recordVariableWrites ?? true,
+      recordScreenChanges: rawOpRec.recordScreenChanges ?? true,
+      recordRecipeTransfers: rawOpRec.recordRecipeTransfers ?? true,
+      recordAlarmAcks: rawOpRec.recordAlarmAcks ?? true,
+      retentionDays: rawOpRec.retentionDays ?? 180,
+      maxRecords: rawOpRec.maxRecords ?? 100000,
+      storageTarget: rawOpRec.storageTarget ?? 'LOCAL_SQLITE',
     },
     fonts: Array.isArray(p.fonts) ? p.fonts : [],
-    rfid: p.rfid ?? {
-      enabled: false,
-      transport: 'USB_HID',
-      portOrHost: 'USB0',
-      autoLoginEnabled: false,
-      autoLogoutOnRemoveSec: 30,
-      cards: [],
+    rfid: {
+      enabled: rawRfid.enabled ?? false,
+      transport: rawRfid.transport ?? 'USB_HID',
+      portOrHost: rawRfid.portOrHost ?? 'USB0',
+      baudRate: rawRfid.baudRate,
+      autoLoginEnabled: rawRfid.autoLoginEnabled ?? false,
+      autoLogoutOnRemoveSec: rawRfid.autoLogoutOnRemoveSec ?? 30,
+      uidTargetTag: rawRfid.uidTargetTag,
+      cardPresentTag: rawRfid.cardPresentTag,
+      cards: Array.isArray(rawRfid.cards) ? rawRfid.cards : [],
     },
     shapeLibrary: Array.isArray(p.shapeLibrary) ? p.shapeLibrary : [],
     peripherals: Array.isArray(p.peripherals) ? p.peripherals : [],
@@ -795,18 +811,36 @@ export class HaiwellProjectStore {
         `REVISION_CONFLICT: Expected revision ${expectedRevision} on "${project.id}", actual revision is ${current.revision}.`
       );
     }
+    const prevRevision = project.revision;
+    const prevUpdatedAt = project.updatedAt;
     project.revision = Math.max(current?.revision ?? 0, project.revision ?? 0) + 1;
     project.updatedAt = new Date().toISOString();
     this.projects.set(project.id, project);
-    this.persistIfEnabled();
+    try {
+      this.persistIfEnabled();
+    } catch (err) {
+      project.revision = prevRevision;
+      project.updatedAt = prevUpdatedAt;
+      if (current) this.projects.set(project.id, current);
+      else this.projects.delete(project.id);
+      throw err;
+    }
     return project;
   }
 
   deleteProject(projectId: string): boolean {
+    const prevProject = this.projects.get(projectId);
+    const prevSnaps = this.snapshots.get(projectId);
     const ok = this.projects.delete(projectId);
     if (ok) {
       this.snapshots.delete(projectId);
-      this.persistIfEnabled();
+      try {
+        this.persistIfEnabled();
+      } catch (err) {
+        if (prevProject) this.projects.set(projectId, prevProject);
+        if (prevSnaps) this.snapshots.set(projectId, prevSnaps);
+        throw err;
+      }
     }
     return ok;
   }

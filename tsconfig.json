@@ -4,7 +4,8 @@
     "experimentalDecorators": true,
     "useDefineForClassFields": false,
     "module": "ESNext",
-    "types": ["vite/client"],
+    "strict": true,
+    "types": ["node", "vite/client"],
     "lib": [
       "ES2022",
       "DOM",

@@ -697,7 +697,7 @@ export function compilePidScreen(
     if (e.from === e.to) throw new Error(`P&ID self-loop edge on "${e.from}" is not allowed.`);
   }
 
-  // 1. Cycle-safe topological ranking (handles closed chilled-water / boiler recirculation loops cleanly!)
+  // 1. Cycle-safe DFS back-edge detection + longest-path DAG ranking (handles diamond DAGs & closed loops!)
   const adj = new Map<string, string[]>(input.nodes.map((n) => [n.id, []]));
   const inDeg = new Map<string, number>(input.nodes.map((n) => [n.id, 0]));
   for (const e of input.edges) {
@@ -705,48 +705,80 @@ export function compilePidScreen(
     inDeg.set(e.to, (inDeg.get(e.to) ?? 0) + 1);
   }
 
-  const rank = new Map<string, number>();
-  const visited = new Set<string>();
-  const queue: string[] = [];
-
-  const runBfs = () => {
-    while (queue.length > 0) {
-      const u = queue.shift()!;
-      const rU = rank.get(u) ?? 0;
-      for (const v of adj.get(u) ?? []) {
-        if (!visited.has(v)) {
-          visited.add(v);
-          rank.set(v, rU + 1);
-          queue.push(v);
-        }
-      }
-    }
-  };
-
-  // Start from connected roots (inDeg === 0 and outDeg > 0) first
   const isolatedNodes: PidNodeInput[] = [];
+  const connectedNodes: PidNodeInput[] = [];
   for (const n of input.nodes) {
     const inD = inDeg.get(n.id) ?? 0;
     const outD = (adj.get(n.id) ?? []).length;
     if (inD === 0 && outD === 0) {
       isolatedNodes.push(n);
-      continue;
-    }
-    if (inD === 0) {
-      rank.set(n.id, 0);
-      visited.add(n.id);
-      queue.push(n.id);
+    } else {
+      connectedNodes.push(n);
     }
   }
-  runBfs();
 
-  // Seed any unvisited cyclic components (e.g., closed P&ID loops alongside standalone control widgets)
-  for (const n of input.nodes) {
-    if (isolatedNodes.includes(n) || visited.has(n.id)) continue;
-    rank.set(n.id, 0);
-    visited.add(n.id);
-    queue.push(n.id);
-    runBfs();
+  // 3-color DFS (0=unvisited, 1=in-stack, 2=done) to identify ONLY true back-edges (cycles)
+  const color = new Map<string, number>();
+  const backEdgeSet = new Set<string>();
+  const dfsVisit = (u: string) => {
+    color.set(u, 1);
+    for (const v of adj.get(u) ?? []) {
+      const c = color.get(v) ?? 0;
+      if (c === 1) {
+        backEdgeSet.add(`${u}->${v}`);
+      } else if (c === 0) {
+        dfsVisit(v);
+      }
+    }
+    color.set(u, 2);
+  };
+
+  // Start DFS from connected roots (inDeg === 0) first, then cyclic components in declaration order
+  for (const n of connectedNodes) {
+    if ((inDeg.get(n.id) ?? 0) === 0 && (color.get(n.id) ?? 0) === 0) {
+      dfsVisit(n.id);
+    }
+  }
+  for (const n of connectedNodes) {
+    if ((color.get(n.id) ?? 0) === 0) {
+      dfsVisit(n.id);
+    }
+  }
+
+  // Build acyclic DAG by excluding back-edges and compute longest-path topological rank
+  const dagAdj = new Map<string, string[]>(connectedNodes.map((n) => [n.id, []]));
+  const dagInDeg = new Map<string, number>(connectedNodes.map((n) => [n.id, 0]));
+  for (const e of input.edges) {
+    if (backEdgeSet.has(`${e.from}->${e.to}`)) continue;
+    dagAdj.get(e.from)!.push(e.to);
+    dagInDeg.set(e.to, (dagInDeg.get(e.to) ?? 0) + 1);
+  }
+
+  const rank = new Map<string, number>();
+  const topoQueue: string[] = [];
+  for (const n of connectedNodes) {
+    if ((dagInDeg.get(n.id) ?? 0) === 0) {
+      rank.set(n.id, 0);
+      topoQueue.push(n.id);
+    }
+  }
+  while (topoQueue.length > 0) {
+    const u = topoQueue.shift()!;
+    const rU = rank.get(u) ?? 0;
+    for (const v of dagAdj.get(u) ?? []) {
+      const nextRank = rU + 1;
+      if (nextRank > (rank.get(v) ?? 0)) {
+        rank.set(v, nextRank);
+      }
+      const rem = (dagInDeg.get(v) ?? 1) - 1;
+      dagInDeg.set(v, rem);
+      if (rem === 0) {
+        topoQueue.push(v);
+      }
+    }
+  }
+  for (const n of connectedNodes) {
+    if (!rank.has(n.id)) rank.set(n.id, 0);
   }
 
   // Distribute isolated standalone control/status widgets evenly across columns
@@ -786,6 +818,7 @@ export function compilePidScreen(
   // Reserve vertical band at bottom of canvas for return recirculation pipelines if needed
   const pipeChannelReserve = 36;
   const equipAreaH = Math.max(120, usableH - pipeChannelReserve);
+  const NUMERIC_WIDGET_TYPES = new Set<HmiWidgetType>(['NUMERIC_DISPLAY', 'NUMERIC_INPUT', 'GAUGE', 'BAR_GRAPH']);
 
   columns.forEach((colNodes, colIdx) => {
     const rowSlotH = Math.floor(equipAreaH / Math.max(1, colNodes.length));
@@ -814,7 +847,7 @@ export function compilePidScreen(
         unit: node.unit,
         min: node.min,
         max: node.max,
-        precision: 2,
+        ...(NUMERIC_WIDGET_TYPES.has(node.type) ? { precision: 2 } : {}),
       };
       widgets.push(eqWidget);
       nodeWidgetMap.set(node.id, eqWidget);
@@ -822,21 +855,30 @@ export function compilePidScreen(
       if (node.calloutTagName) {
         const calloutW = snap(Math.max(96, w));
         const calloutX = snap(Math.max(pad, Math.min(eqWidget.x, input.width - pad - calloutW)));
-        const calloutY = snap(eqWidget.y + eqWidget.height + calloutGap);
-        if (calloutY + calloutH <= bottomSafe - pipeChannelReserve + 8) {
-          widgets.push({
-            id: `${node.id}_callout`,
-            type: 'NUMERIC_DISPLAY',
-            label: node.calloutLabel ?? node.calloutTagName,
-            x: calloutX,
-            y: calloutY,
-            width: calloutW,
-            height: calloutH,
-            tagName: node.calloutTagName,
-            unit: node.calloutUnit ?? (Object.prototype.hasOwnProperty.call(knownTags, node.calloutTagName) ? knownTags[node.calloutTagName]?.unit : undefined),
-            precision: 2,
-          });
+        let calloutY = snap(eqWidget.y + eqWidget.height + calloutGap);
+        const maxCalloutBottom = bottomSafe - pipeChannelReserve + 8;
+        // Never silently drop tight callouts: relocate above or clamp inside usable area
+        if (calloutY + calloutH > maxCalloutBottom) {
+          const aboveY = snap(eqWidget.y - calloutGap - calloutH);
+          if (aboveY >= topSafe) {
+            calloutY = aboveY;
+          } else {
+            eqWidget.y = snap(Math.max(topSafe, maxCalloutBottom - calloutH - calloutGap - eqWidget.height));
+            calloutY = snap(Math.min(maxCalloutBottom - calloutH, eqWidget.y + eqWidget.height + calloutGap));
+          }
         }
+        widgets.push({
+          id: `${node.id}_callout`,
+          type: 'NUMERIC_DISPLAY',
+          label: node.calloutLabel ?? node.calloutTagName,
+          x: calloutX,
+          y: Math.max(topSafe, Math.min(bottomSafe - calloutH, calloutY)),
+          width: calloutW,
+          height: calloutH,
+          tagName: node.calloutTagName,
+          unit: node.calloutUnit ?? (Object.prototype.hasOwnProperty.call(knownTags, node.calloutTagName) ? knownTags[node.calloutTagName]?.unit : undefined),
+          precision: 2,
+        });
       }
     });
   });
@@ -853,7 +895,7 @@ export function compilePidScreen(
     });
   }
 
-  // 2. Route orthogonal Manhattan pipelines with exact port-to-port 0px attachment
+  // 2. Route obstacle-free orthogonal Manhattan pipelines with exact port-to-port 0px attachment
   const pipes: HmiPipeRoute[] = [];
   const recirculationEdges: string[] = [];
   let returnLaneIdx = 0;
@@ -868,41 +910,38 @@ export function compilePidScreen(
       throw new Error(`P&ID edge "${edge.id ?? idx + 1}" references unknown target node "${edge.to}".`);
     }
     const pipeId = edge.id ?? `pipe_${idx + 1}_${edge.from}_to_${edge.to}`;
+    const isBackEdge = backEdgeSet.has(`${edge.from}->${edge.to}`);
     const srcRank = rank.get(edge.from) ?? 0;
     const dstRank = rank.get(edge.to) ?? 0;
 
     let fromPort: HmiPipeRoute['fromPort'];
     let toPort: HmiPipeRoute['toPort'];
-    let waypoints: { x: number; y: number }[];
 
-    if (dstRank > srcRank) {
-      // Forward left-to-right orthogonal Manhattan elbow
+    if (!isBackEdge && dstRank > srcRank) {
       fromPort = 'right';
       toPort = 'left';
-      const p1 = getPortPoint(src, fromPort);
-      const p2 = getPortPoint(dst, toPort);
-      const midX = snap(Math.round((p1.x + p2.x) / 2));
-      waypoints = p1.y === p2.y ? [p1, p2] : [p1, { x: midX, y: p1.y }, { x: midX, y: p2.y }, p2];
-    } else if (dstRank === srcRank) {
-      // Same-rank vertical drop/rise
+    } else if (!isBackEdge && dstRank === srcRank) {
       fromPort = dst.y >= src.y ? 'bottom' : 'top';
       toPort = dst.y >= src.y ? 'top' : 'bottom';
-      const p1 = getPortPoint(src, fromPort);
-      const p2 = getPortPoint(dst, toPort);
-      const midY = snap(Math.round((p1.y + p2.y) / 2));
-      waypoints = p1.x === p2.x ? [p1, p2] : [p1, { x: p1.x, y: midY }, { x: p2.x, y: midY }, p2];
     } else {
-      // Recirculation / return loop routed cleanly along bottom pipe bus channel (zero equipment crossing!)
       recirculationEdges.push(pipeId);
       fromPort = 'bottom';
       toPort = 'bottom';
-      const p1 = getPortPoint(src, fromPort);
-      const p2 = getPortPoint(dst, toPort);
-      const rawLaneY = snap(bottomSafe - 12 - (returnLaneIdx % 3) * 10);
-      const laneY = Math.max(topSafe + 8, Math.min(bottomSafe - 8, rawLaneY));
-      returnLaneIdx++;
-      waypoints = [p1, { x: p1.x, y: laneY }, { x: p2.x, y: laneY }, p2];
     }
+
+    const preferredReturnLane = snap(bottomSafe - 12 - (returnLaneIdx % 3) * 10);
+    if (fromPort === 'bottom' && toPort === 'bottom') {
+      returnLaneIdx++;
+    }
+
+    const waypoints = routeObstacleFreePipe(
+      src,
+      dst,
+      fromPort,
+      toPort,
+      widgets,
+      { minX: 8, maxX: input.width - 8, minY: topSafe - 8, maxY: bottomSafe - 4, preferredLaneY: preferredReturnLane }
+    );
 
     pipes.push({
       id: pipeId,
@@ -910,7 +949,7 @@ export function compilePidScreen(
       toWidgetId: dst.id,
       fromPort,
       toPort,
-      fluid: edge.fluid ?? (dstRank < srcRank ? 'RETURN' : 'PROCESS'),
+      fluid: edge.fluid ?? (isBackEdge || dstRank < srcRank ? 'RETURN' : 'PROCESS'),
       label: edge.label,
       flowTagName: edge.flowTagName,
       waypoints,
@@ -931,7 +970,7 @@ export function compilePidScreen(
     createdAt: new Date().toISOString(),
   };
 
-  // Run auto-repair safety pass if any tight viewport caused overlap (and re-anchor pipes!)
+  // Run auto-repair safety pass if any tight viewport caused overlap (and re-anchor pipes obstacle-free!)
   const repaired = solveAndRepairScreenLayout(screen, options.targetHardware);
   const maxPortGapPx = computeMaxPipePortGap(repaired.screen);
   const spatialAudit = auditScreenSpatially(repaired.screen, knownTags, options);
@@ -946,6 +985,273 @@ export function compilePidScreen(
     spatialAudit,
     svg: renderScreenToSvg(repaired.screen, knownTags),
   };
+}
+
+function segmentIntersectsRectInterior(
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  rect: { x: number; y: number; width: number; height: number }
+): boolean {
+  const eps = 0.5;
+  const rx1 = rect.x + eps;
+  const ry1 = rect.y + eps;
+  const rx2 = rect.x + rect.width - eps;
+  const ry2 = rect.y + rect.height - eps;
+  if (rx2 <= rx1 || ry2 <= ry1) return false;
+
+  // Fast path for orthogonal segments
+  if (a.x === b.x) {
+    if (a.x <= rx1 || a.x >= rx2) return false;
+    const minY = Math.min(a.y, b.y);
+    const maxY = Math.max(a.y, b.y);
+    return maxY > ry1 && minY < ry2;
+  }
+  if (a.y === b.y) {
+    if (a.y <= ry1 || a.y >= ry2) return false;
+    const minX = Math.min(a.x, b.x);
+    const maxX = Math.max(a.x, b.x);
+    return maxX > rx1 && minX < rx2;
+  }
+
+  // General Liang-Barsky clipping for diagonal segments
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  let t0 = 0;
+  let t1 = 1;
+  const checks: [number, number][] = [
+    [-dx, a.x - rx1],
+    [dx, rx2 - a.x],
+    [-dy, a.y - ry1],
+    [dy, ry2 - a.y],
+  ];
+  for (const [p, q] of checks) {
+    if (p === 0) {
+      if (q < 0) return false;
+    } else {
+      const r = q / p;
+      if (p < 0) {
+        if (r > t1) return false;
+        if (r > t0) t0 = r;
+      } else {
+        if (r < t0) return false;
+        if (r < t1) t1 = r;
+      }
+    }
+  }
+  return t0 < t1;
+}
+
+export interface PipeWidgetCrossing {
+  pipeId: string;
+  widgetId: string;
+  segmentIndex: number;
+}
+
+export function detectPipeWidgetCrossings(screen: HmiScreen): PipeWidgetCrossing[] {
+  const crossings: PipeWidgetCrossing[] = [];
+  for (const pipe of screen.pipes ?? []) {
+    const pts = pipe.waypoints;
+    for (let k = 0; k < pts.length - 1; k++) {
+      const a = pts[k];
+      const b = pts[k + 1];
+      for (const w of screen.widgets) {
+        if (w.id === pipe.fromWidgetId || w.id === pipe.toWidgetId) continue;
+        if (segmentIntersectsRectInterior(a, b, w)) {
+          crossings.push({ pipeId: pipe.id, widgetId: w.id, segmentIndex: k });
+        }
+      }
+    }
+  }
+  return crossings;
+}
+
+function simplifyWaypoints(pts: { x: number; y: number }[]): { x: number; y: number }[] {
+  const dedup: { x: number; y: number }[] = [];
+  for (const pt of pts) {
+    const prev = dedup[dedup.length - 1];
+    if (!prev || prev.x !== pt.x || prev.y !== pt.y) {
+      dedup.push(pt);
+    }
+  }
+  if (dedup.length <= 2) return dedup;
+  const out: { x: number; y: number }[] = [dedup[0]];
+  for (let i = 1; i < dedup.length - 1; i++) {
+    const prev = out[out.length - 1];
+    const curr = dedup[i];
+    const next = dedup[i + 1];
+    const sameX = prev.x === curr.x && curr.x === next.x;
+    const sameY = prev.y === curr.y && curr.y === next.y;
+    if (!sameX && !sameY) {
+      out.push(curr);
+    }
+  }
+  out.push(dedup[dedup.length - 1]);
+  return out;
+}
+
+function countPolylineCrossings(
+  pts: { x: number; y: number }[],
+  obstacles: HmiWidget[]
+): number {
+  let count = 0;
+  for (let k = 0; k < pts.length - 1; k++) {
+    for (const obs of obstacles) {
+      if (segmentIntersectsRectInterior(pts[k], pts[k + 1], obs)) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+function polylineLength(pts: { x: number; y: number }[]): number {
+  let total = 0;
+  for (let k = 0; k < pts.length - 1; k++) {
+    total += Math.abs(pts[k + 1].x - pts[k].x) + Math.abs(pts[k + 1].y - pts[k].y);
+  }
+  return total;
+}
+
+function routeObstacleFreePipe(
+  src: HmiWidget,
+  dst: HmiWidget,
+  fromPort: HmiPipeRoute['fromPort'],
+  toPort: HmiPipeRoute['toPort'],
+  allWidgets: HmiWidget[],
+  bounds: { minX: number; maxX: number; minY: number; maxY: number; preferredLaneY?: number }
+): { x: number; y: number }[] {
+  const p1 = getPortPoint(src, fromPort);
+  const p2 = getPortPoint(dst, toPort);
+  const obstacles = allWidgets.filter((w) => w.id !== src.id && w.id !== dst.id);
+
+  const clampX = (x: number) => Math.max(bounds.minX, Math.min(bounds.maxX, Math.round(x)));
+  const clampY = (y: number) => Math.max(bounds.minY, Math.min(bounds.maxY, Math.round(y)));
+
+  // Collect candidate vertical gutters (left/right edges of all widgets + midpoints + screen margins)
+  const candXs = new Set<number>([
+    clampX(bounds.minX + 4),
+    clampX(bounds.maxX - 4),
+    clampX(src.x - 12),
+    clampX(src.x + src.width + 12),
+    clampX(dst.x - 12),
+    clampX(dst.x + dst.width + 12),
+    clampX(snap(Math.round((p1.x + p2.x) / 2))),
+  ]);
+  for (const w of allWidgets) {
+    if (w.type === 'ALARM_BANNER' || w.type === 'NAV_BAR') continue;
+    candXs.add(clampX(w.x - 10));
+    candXs.add(clampX(w.x + w.width + 10));
+  }
+
+  // Collect candidate horizontal corridors (bottom return channel, top corridor, inter-row gutters)
+  const candYs = new Set<number>([
+    clampY(bounds.preferredLaneY ?? bounds.maxY - 8),
+    clampY(bounds.maxY - 6),
+    clampY(bounds.maxY - 14),
+    clampY(bounds.minY + 6),
+    clampY(snap(Math.round((p1.y + p2.y) / 2))),
+  ]);
+  for (const w of allWidgets) {
+    if (w.type === 'ALARM_BANNER') {
+      candYs.add(clampY(w.y + w.height + 8));
+    } else if (w.type === 'NAV_BAR') {
+      candYs.add(clampY(w.y - 10));
+      candYs.add(clampY(w.y - 20));
+    } else {
+      candYs.add(clampY(w.y - 8));
+      candYs.add(clampY(w.y + w.height + 8));
+    }
+  }
+
+  let bestPath: { x: number; y: number }[] | null = null;
+  let bestCrossings = Infinity;
+  let bestLen = Infinity;
+
+  const evaluate = (rawPts: { x: number; y: number }[]) => {
+    const pts = simplifyWaypoints(rawPts);
+    const c = countPolylineCrossings(pts, obstacles);
+    const len = polylineLength(pts);
+    if (c < bestCrossings || (c === bestCrossings && len < bestLen)) {
+      bestCrossings = c;
+      bestLen = len;
+      bestPath = pts;
+    }
+  };
+
+  if (fromPort === 'right' && toPort === 'left') {
+    const midX = clampX(snap(Math.round((p1.x + p2.x) / 2)));
+    evaluate(p1.y === p2.y ? [p1, p2] : [p1, { x: midX, y: p1.y }, { x: midX, y: p2.y }, p2]);
+    if (bestCrossings > 0) {
+      const gx1List = [clampX(src.x + src.width + 10), clampX(src.x + src.width + 18), ...candXs].slice(0, 12);
+      const gx2List = [clampX(dst.x - 10), clampX(dst.x - 18), ...candXs].slice(0, 12);
+      for (const laneY of candYs) {
+        for (const gx1 of gx1List) {
+          if (gx1 < p1.x) continue;
+          for (const gx2 of gx2List) {
+            if (gx2 > p2.x) continue;
+            evaluate([p1, { x: gx1, y: p1.y }, { x: gx1, y: laneY }, { x: gx2, y: laneY }, { x: gx2, y: p2.y }, p2]);
+          }
+        }
+        if (bestCrossings === 0) break;
+      }
+    }
+  } else if (fromPort === 'bottom' && toPort === 'bottom') {
+    const laneYPref = clampY(bounds.preferredLaneY ?? Math.max(p1.y, p2.y) + 24);
+    evaluate([p1, { x: p1.x, y: laneYPref }, { x: p2.x, y: laneYPref }, p2]);
+    if (bestCrossings > 0) {
+      // Stub 8px down (safely above any 16px-gapped callout!) and route via clear vertical gutters to return lane
+      const yStub1 = clampY(p1.y + 8);
+      const yStub2 = clampY(p2.y + 8);
+      const localGx1 = [
+        clampX(src.x + src.width + 10),
+        clampX(src.x - 10),
+        clampX(src.x + src.width + 18),
+        clampX(src.x - 18),
+        ...candXs,
+      ];
+      const localGx2 = [
+        clampX(dst.x - 10),
+        clampX(dst.x + dst.width + 10),
+        clampX(dst.x - 18),
+        clampX(dst.x + dst.width + 18),
+        ...candXs,
+      ];
+      // Prefer lanes below lower equipment / callouts first
+      const sortedLanes = [...candYs].sort((a, b) => Math.abs(a - laneYPref) - Math.abs(b - laneYPref));
+      for (const laneY of sortedLanes) {
+        for (const gx1 of localGx1) {
+          for (const gx2 of localGx2) {
+            evaluate([
+              p1,
+              { x: p1.x, y: yStub1 },
+              { x: gx1, y: yStub1 },
+              { x: gx1, y: laneY },
+              { x: gx2, y: laneY },
+              { x: gx2, y: yStub2 },
+              { x: p2.x, y: yStub2 },
+              p2,
+            ]);
+            if (bestCrossings === 0) break;
+          }
+          if (bestCrossings === 0) break;
+        }
+        if (bestCrossings === 0) break;
+      }
+    }
+  } else {
+    const midY = clampY(snap(Math.round((p1.y + p2.y) / 2)));
+    evaluate(p1.x === p2.x ? [p1, p2] : [p1, { x: p1.x, y: midY }, { x: p2.x, y: midY }, p2]);
+    if (bestCrossings > 0) {
+      const yStub1 = clampY(fromPort === 'bottom' ? p1.y + 8 : p1.y - 8);
+      const yStub2 = clampY(toPort === 'top' ? p2.y - 8 : p2.y + 8);
+      for (const gx of candXs) {
+        evaluate([p1, { x: p1.x, y: yStub1 }, { x: gx, y: yStub1 }, { x: gx, y: yStub2 }, { x: p2.x, y: yStub2 }, p2]);
+        if (bestCrossings === 0) break;
+      }
+    }
+  }
+
+  return bestPath ?? [p1, p2];
 }
 
 function computeMaxPipePortGap(screen: HmiScreen): number {
@@ -969,23 +1275,26 @@ function computeMaxPipePortGap(screen: HmiScreen): number {
 function reanchorScreenPipes(screen: HmiScreen): void {
   if (!screen.pipes || screen.pipes.length === 0) return;
   const byId = new Map(screen.widgets.map((w) => [w.id, w]));
+  const alarmBanner = screen.widgets.find((w) => w.type === 'ALARM_BANNER');
+  const navBar = screen.widgets.find((w) => w.type === 'NAV_BAR');
+  const minY = alarmBanner ? alarmBanner.y + alarmBanner.height + 6 : 8;
+  const maxY = navBar ? navBar.y - 6 : screen.height - 8;
+  let returnLaneIdx = 0;
   for (const pipe of screen.pipes) {
     const src = byId.get(pipe.fromWidgetId);
     const dst = byId.get(pipe.toWidgetId);
     if (!src || !dst) continue;
-    const p1 = getPortPoint(src, pipe.fromPort);
-    const p2 = getPortPoint(dst, pipe.toPort);
-    if (pipe.fromPort === 'right' && pipe.toPort === 'left') {
-      const midX = snap(Math.round((p1.x + p2.x) / 2));
-      pipe.waypoints = p1.y === p2.y ? [p1, p2] : [p1, { x: midX, y: p1.y }, { x: midX, y: p2.y }, p2];
-    } else if (pipe.fromPort === 'bottom' && pipe.toPort === 'bottom') {
-      const rawLaneY = pipe.waypoints[1]?.y ?? snap(Math.max(p1.y, p2.y) + 24);
-      const laneY = Math.max(16, Math.min(screen.height - 16, rawLaneY));
-      pipe.waypoints = [p1, { x: p1.x, y: laneY }, { x: p2.x, y: laneY }, p2];
-    } else {
-      const midY = snap(Math.round((p1.y + p2.y) / 2));
-      pipe.waypoints = p1.x === p2.x ? [p1, p2] : [p1, { x: p1.x, y: midY }, { x: p2.x, y: midY }, p2];
-    }
+    const prefLaneY =
+      pipe.fromPort === 'bottom' && pipe.toPort === 'bottom'
+        ? Math.max(minY + 8, Math.min(maxY - 4, snap(maxY - 8 - (returnLaneIdx++ % 3) * 10)))
+        : undefined;
+    pipe.waypoints = routeObstacleFreePipe(src, dst, pipe.fromPort, pipe.toPort, screen.widgets, {
+      minX: 8,
+      maxX: screen.width - 8,
+      minY,
+      maxY,
+      preferredLaneY: prefLaneY,
+    });
   }
 }
 
@@ -1017,17 +1326,35 @@ export function solveAndRepairScreenLayout(
   const movedWidgets = new Set<string>();
   const resizedForTouch: string[] = [];
 
+  const clampSnapped = (val: number, minVal: number, maxVal: number): number => {
+    const safeMin = Math.max(0, minVal);
+    const safeMax = Math.max(safeMin, maxVal);
+    const clamped = Math.max(safeMin, Math.min(val, safeMax));
+    const snapped = snap(clamped);
+    if (snapped >= safeMin && snapped <= safeMax) return snapped;
+    const floored = Math.floor(safeMax / GRID_STEP) * GRID_STEP;
+    if (floored >= safeMin && floored <= safeMax) return floored;
+    const ceiled = Math.ceil(safeMin / GRID_STEP) * GRID_STEP;
+    if (ceiled >= safeMin && ceiled <= safeMax) return ceiled;
+    return Math.round(clamped);
+  };
+
   const alarmBanner = screen.widgets.find((w) => w.type === 'ALARM_BANNER');
   const navBar = screen.widgets.find((w) => w.type === 'NAV_BAR');
   if (alarmBanner) {
     alarmBanner.width = Math.min(alarmBanner.width, screen.width - pad * 2);
-    alarmBanner.x = snap(Math.max(pad, Math.min(alarmBanner.x, screen.width - pad - alarmBanner.width)));
-    alarmBanner.y = snap(Math.max(pad, Math.min(alarmBanner.y, screen.height - pad - alarmBanner.height)));
+    alarmBanner.x = clampSnapped(alarmBanner.x, pad, screen.width - pad - alarmBanner.width);
+    alarmBanner.y = clampSnapped(alarmBanner.y, pad, screen.height - pad - alarmBanner.height);
   }
   if (navBar) {
+    if (isTouch && (navBar.height < 48 || navBar.width < 48)) {
+      navBar.width = Math.max(navBar.width, 48);
+      navBar.height = Math.max(navBar.height, 48);
+      resizedForTouch.push(navBar.id);
+    }
     navBar.width = Math.min(navBar.width, screen.width - pad * 2);
-    navBar.x = snap(Math.max(pad, Math.min(navBar.x, screen.width - pad - navBar.width)));
-    navBar.y = snap(Math.max(pad, Math.min(navBar.y, screen.height - pad - navBar.height)));
+    navBar.x = clampSnapped(navBar.x, pad, screen.width - pad - navBar.width);
+    navBar.y = clampSnapped(navBar.y, pad, screen.height - pad - navBar.height);
   }
   const minY = alarmBanner ? alarmBanner.y + alarmBanner.height + gap : pad;
   const maxY = navBar ? navBar.y - gap : screen.height - pad;
@@ -1061,8 +1388,8 @@ export function solveAndRepairScreenLayout(
 
     w.width = Math.min(w.width, screen.width - pad * 2);
     w.height = Math.min(w.height, Math.max(48, maxY - minY));
-    w.x = snap(Math.max(pad, Math.min(w.x, screen.width - pad - w.width)));
-    w.y = snap(Math.max(minY, Math.min(w.y, maxY - w.height)));
+    w.x = clampSnapped(w.x, pad, screen.width - pad - w.width);
+    w.y = clampSnapped(w.y, minY, maxY - w.height);
 
     if (overlapsAny(w)) {
       // Deterministic spiral / scanline search for nearest non-overlapping 8px-aligned slot
@@ -1070,7 +1397,7 @@ export function solveAndRepairScreenLayout(
       let bestY = w.y;
       let bestDist = Infinity;
       for (const stepPx of [GRID_STEP * 2, GRID_STEP]) {
-        for (let y = snap(minY); y <= maxY - w.height; y += stepPx) {
+        for (let y = clampSnapped(minY, minY, maxY - w.height); y <= maxY - w.height; y += stepPx) {
           for (let x = pad; x <= screen.width - pad - w.width; x += stepPx) {
             if (!overlapsAny({ x, y, width: w.width, height: w.height })) {
               const dist = Math.hypot(x - origX, y - origY);
@@ -1089,6 +1416,10 @@ export function solveAndRepairScreenLayout(
         w.y = bestY;
       }
     }
+
+    // Final hard clamp AFTER snapping so odd viewport sizes never clip past screen bounds
+    w.x = Math.max(0, Math.min(w.x, screen.width - w.width));
+    w.y = Math.max(0, Math.min(w.y, screen.height - w.height));
 
     if (w.x !== origX || w.y !== origY) movedWidgets.add(w.id);
     placed.push(w);
@@ -1116,6 +1447,7 @@ export interface SpatialAuditReport {
   widgetCount: number;
   pipeCount: number;
   maxPipePortGapPx: number;
+  pipeWidgetCrossings: PipeWidgetCrossing[];
   coveragePercent: number;
   minPairwiseClearancePx: number | null;
   validation: ReturnType<typeof validateHmiScreen>;
@@ -1212,18 +1544,20 @@ export function auditScreenSpatially(
   const asciiMap = [border, ...grid.map((row) => '|' + row.join('') + '|'), border].join('\n');
 
   const maxPipePortGapPx = computeMaxPipePortGap(screen);
+  const pipeWidgetCrossings = detectPipeWidgetCrossings(screen);
   const widgetIds = new Set(screen.widgets.map((w) => w.id));
   const hasDanglingPipes = (screen.pipes ?? []).some(
     (p) => !widgetIds.has(p.fromWidgetId) || !widgetIds.has(p.toWidgetId)
   );
 
   return {
-    valid: validation.valid && maxPipePortGapPx <= 1 && !hasDanglingPipes,
+    valid: validation.valid && maxPipePortGapPx <= 1 && !hasDanglingPipes && pipeWidgetCrossings.length === 0,
     screenId: screen.id,
     viewport: { width: screen.width, height: screen.height },
     widgetCount: screen.widgets.length,
     pipeCount: screen.pipes?.length ?? 0,
     maxPipePortGapPx,
+    pipeWidgetCrossings,
     coveragePercent,
     minPairwiseClearancePx: minClearance,
     validation,
@@ -1263,7 +1597,7 @@ export const REAL_HAIWELL_350_TREE_NODES = [
   'Project language center',
   'Peripheral',
   'Data reporting server',
-  'Cloud platform data monitor',
+  'Cloud platform data monitoring',
   'Audio',
   'OPC UA',
 ] as const;
@@ -1363,6 +1697,7 @@ export function compileDesktopAutomationBridge(
     }
 
     const modalFieldWrites: Record<string, string | number | boolean> = {};
+    const NUMERIC_MODAL_TYPES = new Set<HmiWidgetType>(['NUMERIC_DISPLAY', 'NUMERIC_INPUT', 'GAUGE', 'BAR_GRAPH']);
     if (w.label) modalFieldWrites['Display text'] = w.label;
     if (w.tagName) {
       if (w.type === 'BIT_BUTTON' || (w.writeEnabled && w.type !== 'NUMERIC_INPUT')) {
@@ -1377,7 +1712,9 @@ export function compileDesktopAutomationBridge(
     if (w.unit) modalFieldWrites['Unit'] = w.unit;
     if (w.min !== undefined) modalFieldWrites['Minimum'] = w.min;
     if (w.max !== undefined) modalFieldWrites['Maximum'] = w.max;
-    if (w.precision !== undefined) modalFieldWrites['Decimal digits'] = w.precision;
+    if (w.precision !== undefined && NUMERIC_MODAL_TYPES.has(w.type)) {
+      modalFieldWrites['Decimal digits'] = w.precision;
+    }
     if (w.targetScreenId) modalFieldWrites['Target display'] = w.targetScreenId;
 
     return {
@@ -1468,11 +1805,11 @@ export function compileDesktopAutomationBridge(
     ``,
     `def resolve_pane(win, auto_id: str, fallback_title: str, pane_label: str):`,
     `    if auto_id:`,
-    `        ctrl = win.child_window(auto_id=auto_id)`,
+    `        ctrl = win.child_window(auto_id=auto_id, found_index=0)`,
     `        if ctrl.exists(timeout=2):`,
     `            return ctrl`,
     `    if fallback_title:`,
-    `        ctrl = win.child_window(title_re=f"(?i).*{re.escape(fallback_title)}.*")`,
+    `        ctrl = win.child_window(title_re=f"(?i).*{re.escape(fallback_title)}.*", found_index=0)`,
     `        if ctrl.exists(timeout=2):`,
     `            return ctrl`,
     `    raise RuntimeError(f"Could not locate Haiwell {pane_label} pane (auto_id={auto_id!r}, title={fallback_title!r}). Run calibrate_haiwell_uia.py first.")`,
@@ -1480,19 +1817,36 @@ export function compileDesktopAutomationBridge(
     `def escape_send_keys(text: str) -> str:`,
     `    return re.sub(r"([+^%~(){}])", r"{\\1}", text)`,
     ``,
+    `def _is_visible_ctrl(ctrl) -> bool:`,
+    `    try:`,
+    `        if hasattr(ctrl, "is_visible") and not ctrl.is_visible():`,
+    `            return False`,
+    `        r = ctrl.rectangle()`,
+    `        return r.width() > 0 and r.height() > 0`,
+    `    except Exception:`,
+    `        return False`,
+    ``,
     `def resolve_input_near_label(dlg, label: str):`,
-    `    """Finds the WinForms Edit/ComboBox/CheckBox/Spinner closest to the right of a matching Text label."""`,
-    `    pat = re.compile(re.escape(label), re.IGNORECASE)`,
-    `    labels = [c for c in dlg.descendants(control_type="Text") if pat.search(c.window_text() or "")]`,
+    `    """Finds the visible WinForms Edit/ComboBox/CheckBox/Spinner closest to the right of a matching Text label."""`,
+    `    exact_pat = re.compile(rf"^\\s*{re.escape(label)}\\s*:?\\s*$", re.IGNORECASE)`,
+    `    sub_pat = re.compile(re.escape(label), re.IGNORECASE)`,
+    `    # Check direct visible CheckBox match first (e.g. 'Input', 'Always Collect')`,
+    `    for cb in dlg.descendants(control_type="CheckBox"):`,
+    `        if _is_visible_ctrl(cb) and (exact_pat.match(cb.window_text() or "") or sub_pat.search(cb.window_text() or "")):`,
+    `            return cb`,
+    `    all_texts = [c for c in dlg.descendants(control_type="Text") if _is_visible_ctrl(c)]`,
+    `    labels = [c for c in all_texts if exact_pat.match(c.window_text() or "")]`,
+    `    if not labels:`,
+    `        labels = [c for c in all_texts if sub_pat.search(c.window_text() or "")]`,
     `    if labels:`,
     `        lr = labels[0].rectangle()`,
     `        l_mid_y = (lr.top + lr.bottom) / 2.0`,
     `        best, best_score = None, float("inf")`,
     `        for ctype in ("Edit", "ComboBox", "CheckBox", "Spinner"):`,
     `            for ctrl in dlg.descendants(control_type=ctype):`,
-    `                cr = ctrl.rectangle()`,
-    `                if cr.width() <= 0 or cr.height() <= 0:`,
+    `                if not _is_visible_ctrl(ctrl):`,
     `                    continue`,
+    `                cr = ctrl.rectangle()`,
     `                c_mid_y = (cr.top + cr.bottom) / 2.0`,
     `                dy = abs(c_mid_y - l_mid_y)`,
     `                dx = cr.left - lr.right`,
@@ -1504,10 +1858,29 @@ export function compileDesktopAutomationBridge(
     `        if best is not None:`,
     `            return best`,
     `    for ctype in ("Edit", "ComboBox", "CheckBox"):`,
-    `        direct = dlg.child_window(title_re=f"(?i).*{re.escape(label)}.*", control_type=ctype)`,
-    `        if direct.exists(timeout=0.5):`,
+    `        direct = dlg.child_window(title_re=f"(?i).*{re.escape(label)}.*", control_type=ctype, found_index=0)`,
+    `        if direct.exists(timeout=0.5) and _is_visible_ctrl(direct):`,
     `            return direct`,
     `    return None`,
+    ``,
+    `def _read_control_value(ctrl) -> str:`,
+    `    try:`,
+    `        val = str(ctrl.legacy_properties().get("Value", "") or "").strip()`,
+    `        if val:`,
+    `            return val`,
+    `    except Exception:`,
+    `        pass`,
+    `    try:`,
+    `        if hasattr(ctrl, "selected_text"):`,
+    `            sel = str(ctrl.selected_text() or "").strip()`,
+    `            if sel:`,
+    `                return sel`,
+    `    except Exception:`,
+    `        pass`,
+    `    try:`,
+    `        return str(ctrl.window_text() or "").strip()`,
+    `    except Exception:`,
+    `        return ""`,
     ``,
     `def set_and_verify_property(modal_dlg, prop_name: str, expected_val, retries: int = 3):`,
     `    expected_str = str(expected_val)`,
@@ -1520,13 +1893,19 @@ export function compileDesktopAutomationBridge(
     `            try:`,
     `                if bool(ctrl.get_toggle_state()) != bool(expected_val):`,
     `                    ctrl.toggle()`,
+    `                if bool(ctrl.get_toggle_state()) == bool(expected_val):`,
+    `                    return True`,
     `            except Exception:`,
     `                ctrl.click_input()`,
-    `            return True`,
+    `                return True`,
+    `            continue`,
     `        if ctype == "combobox" and hasattr(ctrl, "select"):`,
     `            try:`,
     `                ctrl.select(expected_str)`,
-    `                return True`,
+    `                time.sleep(0.06)`,
+    `                actual_cb = _read_control_value(ctrl)`,
+    `                if actual_cb and (actual_cb == expected_str or expected_str.lower() in actual_cb.lower()):`,
+    `                    return True`,
     `            except Exception:`,
     `                pass`,
     `        ctrl.click_input()`,
@@ -1538,17 +1917,28 @@ export function compileDesktopAutomationBridge(
     `                ctrl.type_keys("^a{BACKSPACE}" + escape_send_keys(expected_str) + "{TAB}", with_spaces=True)`,
     `        else:`,
     `            ctrl.type_keys("^a{BACKSPACE}" + escape_send_keys(expected_str) + "{TAB}", with_spaces=True)`,
-    `        time.sleep(0.06)`,
-    `        actual = str(ctrl.legacy_properties().get("Value", "")).strip()`,
-    `        if not actual or actual == expected_str:`,
+    `        time.sleep(0.08)`,
+    `        actual = _read_control_value(ctrl)`,
+    `        if actual == expected_str or (expected_str == "" and actual == ""):`,
     `            return True`,
     `        time.sleep(0.1 * attempt)`,
     `    raise RuntimeError(f"UIA verification failed for modal field {prop_name}: expected={expected_str!r}")`,
     ``,
-    `def map_canvas_point(canvas_rect, x: int, y: int):`,
-    `    scale_x = canvas_rect.width() / float(SCREEN_WIDTH)`,
-    `    scale_y = canvas_rect.height() / float(SCREEN_HEIGHT)`,
-    `    return (int(canvas_rect.left + x * scale_x), int(canvas_rect.top + y * scale_y))`,
+    `def map_canvas_point(canvas_rect, x: int, y: int, canvas_ctrl=None):`,
+    `    # Subtract scrollbar/non-client chrome insets so mapped points land inside drawable canvas`,
+    `    inset_r, inset_b = 18, 18`,
+    `    if canvas_ctrl is not None:`,
+    `        try:`,
+    `            vsb = canvas_ctrl.child_window(control_type="ScrollBar", found_index=0)`,
+    `            if not vsb.exists(timeout=0.1):`,
+    `                inset_r, inset_b = 4, 4`,
+    `        except Exception:`,
+    `            pass`,
+    `    usable_w = max(1.0, float(canvas_rect.width() - inset_r))`,
+    `    usable_h = max(1.0, float(canvas_rect.height() - inset_b))`,
+    `    scale_x = usable_w / float(SCREEN_WIDTH)`,
+    `    scale_y = usable_h / float(SCREEN_HEIGHT)`,
+    `    return (int(canvas_rect.left + 2 + x * scale_x), int(canvas_rect.top + 2 + y * scale_y))`,
     ``,
     `def verify_toolbox_items(steps, catalog_overrides):`,
     `    unresolved = []`,
@@ -1563,27 +1953,41 @@ export function compileDesktopAutomationBridge(
     `    if unresolved:`,
     `        raise RuntimeError("Unverified Graphics Library placeholder items detected: " + ", ".join(unresolved) + ". Pass catalogOverrides or add overrides to haiwell_graphics_catalog_dump.json.")`,
     ``,
-    `def draw_pipes(toolbox, canvas_rect, pipe_steps, win=None):`,
-    `    if not pipe_steps:`,
-    `        return`,
+    `def _select_pipe_tool(toolbox, win=None):`,
     `    cat_link = toolbox.child_window(title_re=r"(?i)^Trace[·.]Pipe$", control_type="Hyperlink", found_index=0)`,
     `    if cat_link.exists(timeout=1.5):`,
     `        cat_link.click_input()`,
     `        time.sleep(0.15)`,
     `    pipe_item = toolbox.child_window(title_re=r"(?i)^Pipe 1$", control_type="ListItem", found_index=0)`,
     `    if not pipe_item.exists(timeout=0.8) and win is not None:`,
-    `        pipe_item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=r"(?i).*Pipe 1.*", control_type="Button", found_index=0)`,
-    `    if pipe_item.exists(timeout=0.8):`,
-    `        pipe_item.click_input()`,
-    `        time.sleep(0.1)`,
+    `        pipe_item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=r"(?i)^Pipe 1$", control_type="Button", found_index=0)`,
+    `    if not pipe_item.exists(timeout=0.8):`,
+    `        raise RuntimeError("Could not locate 'Pipe 1' in Trace·Pipe Graphics library category.")`,
+    `    pipe_item.click_input()`,
+    `    time.sleep(0.1)`,
+    ``,
+    `def draw_pipes(toolbox, canvas_rect, pipe_steps, win=None, canvas_ctrl=None):`,
+    `    if not pipe_steps:`,
+    `        return`,
     `    for pipe in pipe_steps:`,
     `        pts = pipe.get("waypoints", [])`,
     `        for idx in range(len(pts) - 1):`,
-    `            p1 = map_canvas_point(canvas_rect, pts[idx]["x"], pts[idx]["y"])`,
-    `            p2 = map_canvas_point(canvas_rect, pts[idx + 1]["x"], pts[idx + 1]["y"])`,
-    `            mouse.press(coords=p1)`,
+    `            # Re-select Pipe 1 before EVERY segment because Haiwell exits draw mode after one drag`,
+    `            _select_pipe_tool(toolbox, win)`,
+    `            p1 = map_canvas_point(canvas_rect, pts[idx]["x"], pts[idx]["y"], canvas_ctrl)`,
+    `            p2 = map_canvas_point(canvas_rect, pts[idx + 1]["x"], pts[idx + 1]["y"], canvas_ctrl)`,
+    `            # Guarantee non-zero drag bounding box thickness (>= 8px) for straight H/V pipe segments`,
+    `            x1, y1 = p1`,
+    `            x2, y2 = p2`,
+    `            if abs(y2 - y1) < 8:`,
+    `                y1 -= 4`,
+    `                y2 += 4`,
+    `            if abs(x2 - x1) < 8:`,
+    `                x1 -= 4`,
+    `                x2 += 4`,
+    `            mouse.press(coords=(x1, y1))`,
     `            time.sleep(0.04)`,
-    `            mouse.release(coords=p2)`,
+    `            mouse.release(coords=(x2, y2))`,
     `            time.sleep(0.08)`,
     `        print(f"[OK] Pipe {pipe['pipeId']} ({pipe['fluid']}, {len(pts)} waypoints) drawn")`,
     ``,
@@ -1602,17 +2006,21 @@ export function compileDesktopAutomationBridge(
     `    for step in STEPS:`,
     `        cat = step.get("graphicsLibraryCategory")`,
     `        if cat and cat != active_cat:`,
-    `            cat_link = toolbox.child_window(title_re=f"(?i).*{re.escape(cat)}.*")`,
+    `            cat_link = toolbox.child_window(title_re=f"(?i)^{re.escape(cat)}$", control_type="Hyperlink", found_index=0)`,
     `            if cat_link.exists(timeout=1.5):`,
     `                cat_link.click_input()`,
     `                time.sleep(0.15)`,
     `                active_cat = cat`,
-    `        item = toolbox.child_window(title_re=f"(?i).*{re.escape(step['toolboxItemName'])}.*")`,
+    `        item = toolbox.child_window(title_re=f"(?i)^{re.escape(step['toolboxItemName'])}$", control_type="ListItem", found_index=0)`,
+    `        if not item.exists(timeout=1.0):`,
+    `            item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=f"(?i)^{re.escape(step['toolboxItemName'])}$", control_type="Button", found_index=0)`,
+    `        if not item.exists(timeout=1.0):`,
+    `            raise RuntimeError(f"Could not find Graphics library item {step['toolboxItemName']!r} in category {cat!r}")`,
     `        item.click_input()`,
     `        time.sleep(0.10)`,
     `        b = step["canvasBounds"]`,
-    `        p1 = map_canvas_point(canvas_rect, b["x"], b["y"])`,
-    `        p2 = map_canvas_point(canvas_rect, b["x"] + b["width"], b["y"] + b["height"])`,
+    `        p1 = map_canvas_point(canvas_rect, b["x"], b["y"], canvas)`,
+    `        p2 = map_canvas_point(canvas_rect, b["x"] + b["width"], b["y"] + b["height"], canvas)`,
     `        mouse.press(coords=p1)`,
     `        time.sleep(0.05)`,
     `        mouse.release(coords=p2)`,
@@ -1621,20 +2029,22 @@ export function compileDesktopAutomationBridge(
     `        mouse.double_click(coords=mid)`,
     `        time.sleep(0.20)`,
     `        dlg = app.window(title_re="(?i).*(Property|Setting|Attribute).*")`,
-    `        if dlg.exists(timeout=2.5):`,
-    `            for k, v in step["modalFieldWrites"].items():`,
-    `                set_and_verify_property(dlg, k, v)`,
-    `            for k, v in step["postConditionAssertions"].items():`,
-    `                ctrl = resolve_input_near_label(dlg, k)`,
-    `                if ctrl is not None:`,
-    `                    actual = str(ctrl.legacy_properties().get("Value", "")).strip()`,
-    `                    if actual:`,
-    `                        assert actual == str(v), f"Mismatch on {step['widgetId']}.{k}: {actual!r} != {v!r}"`,
-    `            ok_btn = dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button")`,
-    `            if ok_btn.exists(timeout=1.5):`,
-    `                ok_btn.click_input()`,
+    `        if not dlg.exists(timeout=2.5):`,
+    `            raise RuntimeError(f"Property modal failed to open for widget {step['widgetId']} ({step['toolboxItemName']})")`,
+    `        for k, v in step["modalFieldWrites"].items():`,
+    `            set_and_verify_property(dlg, k, v)`,
+    `        for k, v in step["postConditionAssertions"].items():`,
+    `            ctrl = resolve_input_near_label(dlg, k)`,
+    `            if ctrl is None:`,
+    `                raise RuntimeError(f"Post-condition field {k!r} not found on {step['widgetId']}")`,
+    `            actual = _read_control_value(ctrl)`,
+    `            assert actual and actual == str(v), f"Mismatch on {step['widgetId']}.{k}: {actual!r} != {v!r}"`,
+    `        ok_btn = dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button", found_index=0)`,
+    `        if not ok_btn.exists(timeout=1.5):`,
+    `            raise RuntimeError(f"OK button not found in Property modal for {step['widgetId']}")`,
+    `        ok_btn.click_input()`,
     `        print(f"[OK] Step {step['step']}/{len(STEPS)}: {step['widgetId']} placed & configured via Property modal")`,
-    `    draw_pipes(toolbox, canvas_rect, PIPE_STEPS, win)`,
+    `    draw_pipes(toolbox, canvas_rect, PIPE_STEPS, win, canvas)`,
     `    win.type_keys("^s")`,
     `    if run_offline_sim:`,
     `        win.type_keys("{F6}")`,
@@ -1738,13 +2148,22 @@ export function generateDesktopUiaCalibrator(options: {
     `            if name in EXPECTED_TREE_NODES and name not in detected["matchedTreeNodes"]:`,
     `                detected["matchedTreeNodes"].append(name)`,
     `            lower = f"{name} {auto_id}".lower()`,
-    `            if not detected["projectBrowserAutoId"] and auto_id in ("treeView1", "ProjectPanel"):`,
+    `            # HIGH-18: Prioritize exact inner controls over outer parent containers`,
+    `            if auto_id == "treeView1":`,
     `                detected["projectBrowserAutoId"] = auto_id`,
-    `            if not detected["toolboxAutoId"] and auto_id in ("SymbolPanel", "tbrSymbolControl"):`,
+    `            elif not detected["projectBrowserAutoId"] and auto_id == "ProjectPanel":`,
+    `                detected["projectBrowserAutoId"] = auto_id`,
+    `            if auto_id == "SymbolPanel":`,
     `                detected["toolboxAutoId"] = auto_id`,
-    `            if not detected["canvasAutoId"] and auto_id in ("vectorControl1", "FrmWindow"):`,
+    `            elif not detected["toolboxAutoId"] and auto_id == "tbrSymbolControl":`,
+    `                detected["toolboxAutoId"] = auto_id`,
+    `            if auto_id == "vectorControl1":`,
     `                detected["canvasAutoId"] = auto_id`,
-    `            if not detected["propertyGridAutoId"] and auto_id in ("fg", "FrmVariableEditor"):`,
+    `            elif not detected["canvasAutoId"] and auto_id == "FrmWindow":`,
+    `                detected["canvasAutoId"] = auto_id`,
+    `            if auto_id == "fg":`,
+    `                detected["propertyGridAutoId"] = auto_id`,
+    `            elif not detected["propertyGridAutoId"] and auto_id == "FrmVariableEditor":`,
     `                detected["propertyGridAutoId"] = auto_id`,
     `            if not detected["projectBrowserAutoId"] and ("project browser" in lower or ctype == "Tree"):`,
     `                detected["projectBrowserAutoId"] = auto_id`,
@@ -1760,7 +2179,9 @@ export function generateDesktopUiaCalibrator(options: {
     `        json.dump(detected, fh, indent=2)`,
     `    with open("haiwell_uia_dump.json", "w", encoding="utf-8") as fh:`,
     `        json.dump(controls[:2000], fh, indent=2)`,
+    `    categories = []`,
     `    graphics_items = []`,
+    `    category_items = {}`,
     `    for tb_id in [detected["toolboxAutoId"], "SymbolPanel", "tbrSymbolControl"]:`,
     `        if not tb_id:`,
     `            continue`,
@@ -1768,7 +2189,28 @@ export function generateDesktopUiaCalibrator(options: {
     `            tb = win.child_window(auto_id=tb_id, found_index=0)`,
     `            if not tb.exists(timeout=0.5):`,
     `                continue`,
-    `            for ctype_name in ("ListItem", "Button", "Hyperlink"):`,
+    `            # Separate category Hyperlinks from actual symbol ListItem/Button controls and expand collapsed categories`,
+    `            links = tb.descendants(control_type="Hyperlink")`,
+    `            for link in links:`,
+    `                cat_name = (link.element_info.name or "").strip()`,
+    `                if not cat_name:`,
+    `                    continue`,
+    `                if cat_name not in categories:`,
+    `                    categories.append(cat_name)`,
+    `                try:`,
+    `                    link.click_input()`,
+    `                    import time as _t; _t.sleep(0.12)`,
+    `                except Exception:`,
+    `                    pass`,
+    `                cat_bucket = category_items.setdefault(cat_name, [])`,
+    `                for ctype_name in ("ListItem", "Button"):`,
+    `                    for child in tb.descendants(control_type=ctype_name):`,
+    `                        cname = (child.element_info.name or "").strip()`,
+    `                        if cname and cname not in cat_bucket:`,
+    `                            cat_bucket.append(cname)`,
+    `                        if cname and cname not in graphics_items:`,
+    `                            graphics_items.append(cname)`,
+    `            for ctype_name in ("ListItem", "Button"):`,
     `                for child in tb.descendants(control_type=ctype_name):`,
     `                    cname = (child.element_info.name or "").strip()`,
     `                    if cname and cname not in graphics_items:`,
@@ -1776,8 +2218,8 @@ export function generateDesktopUiaCalibrator(options: {
     `        except Exception:`,
     `            pass`,
     `    with open("haiwell_graphics_catalog_dump.json", "w", encoding="utf-8") as fh:`,
-    `        json.dump({"visibleGraphicsLibraryItems": graphics_items, "overrides": {}}, fh, indent=2)`,
-    `    print(json.dumps({"ok": True, "windowTitle": title, "matchedTreeNodes": len(detected["matchedTreeNodes"]), "expectedTreeNodes": len(EXPECTED_TREE_NODES), "visibleGraphicsItems": len(graphics_items), "mapFile": "haiwell_uia_map.json", "graphicsCatalogFile": "haiwell_graphics_catalog_dump.json"}, indent=2))`,
+    `        json.dump({"categories": categories, "itemsByCategory": category_items, "visibleGraphicsLibraryItems": graphics_items, "overrides": {}}, fh, indent=2)`,
+    `    print(json.dumps({"ok": True, "windowTitle": title, "matchedTreeNodes": len(detected["matchedTreeNodes"]), "expectedTreeNodes": len(EXPECTED_TREE_NODES), "categories": len(categories), "visibleGraphicsItems": len(graphics_items), "mapFile": "haiwell_uia_map.json", "graphicsCatalogFile": "haiwell_graphics_catalog_dump.json"}, indent=2))`,
     ``,
     `if __name__ == "__main__":`,
     `    calibrate()`,
@@ -1808,23 +2250,23 @@ export type OpenProjectBridgeSection = 'devices' | 'variables' | 'tasks' | 'even
 
 function mapHaiwellRegisterTypeLabel(address?: string): { registerType: string; registerAddress: string } {
   const raw = (address ?? '').trim().toUpperCase();
-  const m = /^(0X|1X|3X|4X)(\d+)(?:\.\d+)?$/.exec(raw);
+  const m = /^(0X|1X|3X|4X)(\d+(?:\.\d+)?)$/.exec(raw);
   if (m) {
     const map: Record<string, string> = {
       '0X': '0X(Digital output,Function code 01 05)',
       '1X': '1X(Digital input,Function code 02)',
-      '3X': '3X(Input register,Function code 04)',
-      '4X': '4X(Holding register,Function code 03 06 16)',
+      '3X': '3X(Analog input,Function code 04)',
+      '4X': '4X(Analog output,Function code 03 06)',
     };
     return { registerType: map[m[1]], registerAddress: m[2] };
   }
-  const typed = /^(COIL|DI|IR|HR):(\d+)$/.exec(raw);
+  const typed = /^(COIL|DI|IR|HR):(\d+(?:\.\d+)?)$/.exec(raw);
   if (typed) {
     const map: Record<string, string> = {
       COIL: '0X(Digital output,Function code 01 05)',
       DI: '1X(Digital input,Function code 02)',
-      IR: '3X(Input register,Function code 04)',
-      HR: '4X(Holding register,Function code 03 06 16)',
+      IR: '3X(Analog input,Function code 04)',
+      HR: '4X(Analog output,Function code 03 06)',
     };
     return { registerType: map[typed[1]], registerAddress: typed[2] };
   }
@@ -1886,7 +2328,7 @@ export function compileFullOpenProjectBridge(
               d.protocol === 'MODBUS_RTU' || d.protocol === 'DELTA_DVP_MODBUS'
                 ? 'Modbus Master(RTU/ASCII)'
                 : d.protocol === 'MODBUS_TCP'
-                  ? 'Modbus TCP'
+                  ? 'Modbus Master(TCP/UDP)'
                   : d.protocol,
           },
           'Communication port':
@@ -1912,9 +2354,9 @@ export function compileFullOpenProjectBridge(
             'High speed frequency(ms)': d.highSpeedMs ?? 50,
             'Low speed frequency(ms)': d.lowSpeedMs ?? 1000,
             'Communication timeout(ms)': d.timeoutMs,
-            'High and Low Word': `${d.byteOrder.slice(0, 2)} ${d.byteOrder.slice(2, 4)}`,
+            'High and Low Word': d.byteOrder,
             'Block length': d.blockLength ?? 48,
-            'Address offset': d.addressOffset === 'BASE_1' ? 'base 1' : 'base 0',
+            'Address offset': d.addressOffset === 'BASE_1' ? '1' : '0',
             'Batch write instructions': d.batchWriteSupported === false ? 'Not supported' : 'Supported',
           },
           Other: {
@@ -1929,26 +2371,35 @@ export function compileFullOpenProjectBridge(
     ? Object.values(project.tags).map((t) => {
         const dev = t.deviceId ? project.devices.find((d) => d.id === t.deviceId) : undefined;
         const reg = mapHaiwellRegisterTypeLabel(t.address);
+        const isInternal = t.scope !== 'PLC';
         return {
           variableName: t.name,
+          isInternal,
           scopeNode:
             t.scope === 'PLC'
               ? `Variable -> External variables -> ${dev?.name ?? t.deviceId ?? 'Device'}`
               : t.scope === 'INTERNAL'
                 ? 'Variable -> InternalVariable'
                 : 'Variable -> System variable',
-          gridRow: {
-            'Variable name': t.name,
-            'Register type': reg.registerType,
-            'Address format': 'Decimal',
-            'Register address': reg.registerAddress,
-            'Address length': Math.max(1, t.wordSpan ?? 1),
-            'Data type': mapHaiwellDataTypeLabel(t.dataType),
-            'Read-write mode': t.access === 'RO' ? 'Read only' : 'Read and write',
-            'Acquisition frequency':
-              t.collectFrequency === 'HIGH' ? 'High' : t.collectFrequency === 'LOW' ? 'Low' : 'Normal',
-            'Always Collect': Boolean(t.alwaysCollect),
-          },
+          gridRow: isInternal
+            ? {
+                'Variable name': t.name,
+                'Data type': mapHaiwellDataTypeLabel(t.dataType),
+                'Initial value': t.currentValue ?? '',
+                Description: t.description ?? '',
+              }
+            : {
+                'Variable name': t.name,
+                'Register type': reg.registerType,
+                'Address format': 'Decimal',
+                'Register address': reg.registerAddress,
+                'Address length': Math.max(1, t.wordSpan ?? 1),
+                'Data type': mapHaiwellDataTypeLabel(t.dataType),
+                'Read-write mode': t.access === 'RO' ? 'Read only' : 'Read and write',
+                'Acquisition frequency':
+                  t.collectFrequency === 'HIGH' ? 'High speed' : t.collectFrequency === 'LOW' ? 'Low speed' : 'Normal',
+                'Always Collect': Boolean(t.alwaysCollect),
+              },
         };
       })
     : [];
@@ -1957,7 +2408,7 @@ export function compileFullOpenProjectBridge(
     ? project.scripts.map((s) => ({
         taskId: s.id,
         taskName: s.name,
-        treeNode: 'Task',
+        treeNode: 'Task -> Script task',
         triggerKind: s.trigger,
         intervalMs: s.intervalMs ?? 0,
         code: s.code,
@@ -1982,8 +2433,8 @@ export function compileFullOpenProjectBridge(
               'Execute task': s.name,
               'Event name': `Event_${s.name || idx + 1}`,
               'Execution mode': s.trigger === 'CYCLIC' ? 'Cycle' : 'Run-once',
-              'Interval (Millisecond)': s.trigger === 'CYCLIC' ? (s.intervalMs ?? 1000) : 0,
-              triggerTag: s.triggerTag ?? null,
+              'Execution interval': s.trigger === 'CYCLIC' ? (s.intervalMs ?? 1000) : 0,
+              ...(s.triggerTag ? { 'Specify the variable': s.triggerTag } : {}),
             },
           })),
         ...project.eventTriggers.map((ev) => ({
@@ -2000,8 +2451,8 @@ export function compileFullOpenProjectBridge(
             'Execute task': ev.targetId,
             'Event name': ev.name,
             'Execution mode': ev.executionMode === 'CYCLIC' ? 'Cycle' : 'Run-once',
-            'Interval (Millisecond)': ev.intervalMs ?? 0,
-            triggerTag: ev.sourceTag,
+            'Execution interval': ev.intervalMs ?? 0,
+            'Specify the variable': ev.sourceTag,
           },
         })),
       ]
@@ -2081,6 +2532,17 @@ export function compileFullOpenProjectBridge(
     `    win.set_focus()`,
     `    return app, win`,
     ``,
+    `def _is_tree_item_expanded(item) -> bool:`,
+    `    try:`,
+    `        if hasattr(item, "is_expanded"):`,
+    `            return bool(item.is_expanded())`,
+    `        iface = getattr(item, "iface_expand_collapse", None)`,
+    `        if iface is not None:`,
+    `            return int(iface.CurrentExpandCollapseState) in (1, 2)`,
+    `    except Exception:`,
+    `        pass`,
+    `    return False`,
+    ``,
     `def navigate_tree(win, path_expr: str):`,
     `    parts = [p.strip() for p in path_expr.split("->") if p.strip()]`,
     `    tree_root = win`,
@@ -2092,31 +2554,66 @@ export function compileFullOpenProjectBridge(
     `        pass`,
     `    last = None`,
     `    for idx, part in enumerate(parts):`,
-    `        item = tree_root.child_window(title_re=f"(?i).*{re.escape(part)}.*", control_type="TreeItem")`,
-    `        if not item.exists(timeout=1.5) and tree_root is not win:`,
-    `            item = win.child_window(title_re=f"(?i).*{re.escape(part)}.*", control_type="TreeItem")`,
+    `        item = tree_root.child_window(title_re=f"(?i)^{re.escape(part)}$", control_type="TreeItem", found_index=0)`,
+    `        if not item.exists(timeout=1.2) and tree_root is not win:`,
+    `            item = win.child_window(title_re=f"(?i)^{re.escape(part)}$", control_type="TreeItem", found_index=0)`,
+    `        if not item.exists(timeout=0.8):`,
+    `            item = tree_root.child_window(title_re=f"(?i).*{re.escape(part)}.*", control_type="TreeItem", found_index=0)`,
     `        if item.exists(timeout=2.0):`,
     `            if idx < len(parts) - 1:`,
-    `                item.double_click_input()`,
+    `                if not _is_tree_item_expanded(item):`,
+    `                    try:`,
+    `                        item.expand()`,
+    `                    except Exception:`,
+    `                        item.double_click_input()`,
     `            else:`,
     `                item.click_input()`,
     `            time.sleep(0.15)`,
     `            last = item`,
     `    return last`,
     ``,
+    `def _is_visible_ctrl(ctrl) -> bool:`,
+    `    try:`,
+    `        if hasattr(ctrl, "is_visible") and not ctrl.is_visible():`,
+    `            return False`,
+    `        r = ctrl.rectangle()`,
+    `        return r.width() > 0 and r.height() > 0`,
+    `    except Exception:`,
+    `        return False`,
+    ``,
+    `def _click_context_menu_item(app, win, pattern: str = r"(?i)^(Add|New).*"):`,
+    `    for scope in (app.window(control_type="Menu"), win.child_window(control_type="Menu", found_index=0), app.top_window()):`,
+    `        try:`,
+    `            if scope.exists(timeout=0.6):`,
+    `                mi = scope.child_window(title_re=pattern, control_type="MenuItem", found_index=0)`,
+    `                if mi.exists(timeout=0.8):`,
+    `                    mi.click_input()`,
+    `                    time.sleep(0.2)`,
+    `                    return True`,
+    `        except Exception:`,
+    `            continue`,
+    `    return False`,
+    ``,
     `def resolve_input_near_label(dlg, label: str):`,
-    `    """Finds the WinForms Edit/ComboBox/CheckBox/Spinner closest to the right of a matching Text label."""`,
-    `    pat = re.compile(re.escape(label), re.IGNORECASE)`,
-    `    labels = [c for c in dlg.descendants(control_type="Text") if pat.search(c.window_text() or "")]`,
+    `    """Finds the visible WinForms Edit/ComboBox/CheckBox/Spinner closest to the right of a matching Text label."""`,
+    `    exact_pat = re.compile(rf"^\\s*{re.escape(label)}\\s*:?\\s*$", re.IGNORECASE)`,
+    `    sub_pat = re.compile(re.escape(label), re.IGNORECASE)`,
+    `    for cb in dlg.descendants(control_type="CheckBox"):`,
+    `        if _is_visible_ctrl(cb) and (exact_pat.match(cb.window_text() or "") or sub_pat.search(cb.window_text() or "")):`,
+    `            return cb`,
+    `    all_texts = [c for c in dlg.descendants(control_type="Text") if _is_visible_ctrl(c)]`,
+    `    labels = [c for c in all_texts if exact_pat.match(c.window_text() or "")]`,
+    `    if not labels:`,
+    `        labels = [c for c in all_texts if sub_pat.search(c.window_text() or "")]`,
     `    if labels:`,
     `        lr = labels[0].rectangle()`,
     `        l_mid_y = (lr.top + lr.bottom) / 2.0`,
     `        best, best_score = None, float("inf")`,
     `        for ctype in ("Edit", "ComboBox", "CheckBox", "Spinner"):`,
     `            for ctrl in dlg.descendants(control_type=ctype):`,
-    `                cr = ctrl.rectangle()`,
-    `                if cr.width() <= 0 or cr.height() <= 0:`,
+    `                if not _is_visible_ctrl(ctrl):`,
     `                    continue`,
+    `                cr = ctrl.rectangle()`,
     `                c_mid_y = (cr.top + cr.bottom) / 2.0`,
     `                dy = abs(c_mid_y - l_mid_y)`,
     `                dx = cr.left - lr.right`,
@@ -2128,8 +2625,8 @@ export function compileFullOpenProjectBridge(
     `        if best is not None:`,
     `            return best`,
     `    for ctype in ("Edit", "ComboBox", "CheckBox"):`,
-    `        direct = dlg.child_window(title_re=f"(?i).*{re.escape(label)}.*", control_type=ctype)`,
-    `        if direct.exists(timeout=0.5):`,
+    `        direct = dlg.child_window(title_re=f"(?i).*{re.escape(label)}.*", control_type=ctype, found_index=0)`,
+    `        if direct.exists(timeout=0.5) and _is_visible_ctrl(direct):`,
     `            return direct`,
     `    return None`,
     ``,
@@ -2145,9 +2642,9 @@ export function compileFullOpenProjectBridge(
     `        except Exception:`,
     `            ctrl.click_input()`,
     `        return True`,
-    `    if ctype == "combobox" and hasattr(ctrl, "select") and isinstance(value, str):`,
+    `    if ctype == "combobox" and hasattr(ctrl, "select"):`,
     `        try:`,
-    `            ctrl.select(value)`,
+    `            ctrl.select(str(value))`,
     `            return True`,
     `        except Exception:`,
     `            pass`,
@@ -2168,23 +2665,33 @@ export function compileFullOpenProjectBridge(
     `        if dry_run:`,
     `            print(json.dumps(dev["tabs"], indent=2))`,
     `            continue`,
-    `        navigate_tree(win, dev["treeBranch"])`,
-    `        win.child_window(title_re="(?i)^New$", control_type="Button").click_input()`,
-    `        dlg = app.window(title_re="(?i).*Property Setting.*")`,
+    `        branch_node = navigate_tree(win, dev["treeBranch"])`,
+    `        opened = False`,
+    `        for btn_re in (r"(?i)^Add device$", r"(?i)^New$", r"(?i)^Add$"):`,
+    `            btn = win.child_window(title_re=btn_re, control_type="Button", found_index=0)`,
+    `            if btn.exists(timeout=0.6):`,
+    `                btn.click_input()`,
+    `                opened = True`,
+    `                break`,
+    `        if not opened and branch_node is not None:`,
+    `            branch_node.right_click_input()`,
+    `            time.sleep(0.2)`,
+    `            opened = _click_context_menu_item(app, win, r"(?i)^(Add|New).*")`,
+    `        dlg = app.window(title_re="(?i).*(Add device|Property Setting).*")`,
     `        dlg.wait("visible", timeout=5)`,
     `        for tab_name, fields in dev["tabs"].items():`,
-    `            tab = dlg.child_window(title=tab_name, control_type="TabItem")`,
+    `            tab = dlg.child_window(title=tab_name, control_type="TabItem", found_index=0)`,
     `            if tab.exists(timeout=1.5):`,
     `                tab.select()`,
     `                time.sleep(0.15)`,
     `            for k, v in fields.items():`,
     `                set_dialog_field(dlg, k, v)`,
-    `        dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button").click_input()`,
+    `        dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button", found_index=0).click_input()`,
     `        time.sleep(0.25)`,
     ``,
     `def run_variables(app, win, dry_run: bool):`,
     `    print(f"[VARIABLES] {len(PLAN['variables'])} variables prepared")`,
-    `    grid_column_order = [`,
+    `    plc_column_order = [`,
     `        "Variable name",`,
     `        "Register type",`,
     `        "Address format",`,
@@ -2193,12 +2700,18 @@ export function compileFullOpenProjectBridge(
     `        "Data type",`,
     `        "Read-write mode",`,
     `        "Acquisition frequency",`,
+    `        "Always Collect",`,
     `    ]`,
+    `    internal_column_order = ["Variable name", "Data type", "Initial value", "Description"]`,
     `    last_scope = None`,
     `    for v in PLAN["variables"]:`,
     `        row = v["gridRow"]`,
+    `        cols = internal_column_order if v.get("isInternal") else plc_column_order`,
     `        if dry_run:`,
-    `            print(f"  - {v['variableName']} [{v['scopeNode']}]: {row['Register type']} @ {row['Register address']} ({row['Data type']}, {row['Read-write mode']})")`,
+    `            if v.get("isInternal"):`,
+    `                print(f"  - {v['variableName']} [{v['scopeNode']}]: Internal ({row['Data type']})")`,
+    `            else:`,
+    `                print(f"  - {v['variableName']} [{v['scopeNode']}]: {row['Register type']} @ {row['Register address']} ({row['Data type']}, {row['Read-write mode']})")`,
     `            continue`,
     `        if v["scopeNode"] != last_scope:`,
     `            navigate_tree(win, v["scopeNode"])`,
@@ -2210,31 +2723,37 @@ export function compileFullOpenProjectBridge(
     `                var_host = frm_var`,
     `        except Exception:`,
     `            pass`,
-    `        add_btn = var_host.child_window(title_re="(?i)^Add$", control_type="Button")`,
+    `        add_btn = var_host.child_window(title_re="(?i)^Add$", control_type="Button", found_index=0)`,
     `        if not add_btn.exists(timeout=1.5) and var_host is not win:`,
-    `            add_btn = win.child_window(title_re="(?i)^Add$", control_type="Button")`,
+    `            add_btn = win.child_window(title_re="(?i)^Add$", control_type="Button", found_index=0)`,
     `        if add_btn.exists(timeout=2.0):`,
     `            add_btn.click_input()`,
     `            time.sleep(0.15)`,
     `        # Check if a modal Property dialog opened or inline C1FlexGrid (fg) row became active`,
     `        dlg = app.window(title_re="(?i).*(Variable|Property|Add).*")`,
     `        if dlg.exists(timeout=0.6):`,
-    `            for col in grid_column_order:`,
-    `                set_dialog_field(dlg, col, row[col])`,
-    `            if row.get("Always Collect"):`,
-    `                set_dialog_field(dlg, "Always Collect", True)`,
-    `            ok_btn = dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button")`,
+    `            for col in cols:`,
+    `                if col in row:`,
+    `                    set_dialog_field(dlg, col, row[col])`,
+    `            ok_btn = dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button", found_index=0)`,
     `            if ok_btn.exists(timeout=1.0):`,
     `                ok_btn.click_input()`,
     `        else:`,
     `            fg = var_host.child_window(auto_id="fg", found_index=0)`,
     `            if fg.exists(timeout=0.6):`,
     `                fg.click_input()`,
-    `            for idx, col in enumerate(grid_column_order):`,
-    `                val = str(row[col])`,
-    `                win.type_keys("^a{BACKSPACE}" + escape_send_keys(val) + ("{ENTER}" if idx == len(grid_column_order) - 1 else "{TAB}"), with_spaces=True)`,
+    `            for idx, col in enumerate(cols):`,
+    `                end_key = "{ENTER}" if idx == len(cols) - 1 else "{TAB}"`,
+    `                val = row.get(col, "")`,
+    `                if col == "Always Collect":`,
+    `                    if bool(val):`,
+    `                        win.type_keys("{SPACE}")`,
+    `                    win.type_keys(end_key)`,
+    `                else:`,
+    `                    # Use F2 to enter cell edit mode inside C1FlexGrid (Ctrl+A selects whole grid!)`,
+    `                    win.type_keys("{F2}" + escape_send_keys(str(val)) + end_key, with_spaces=True)`,
     `                time.sleep(0.05)`,
-    `        print(f"[OK] Variable {v['variableName']} populated across {len(grid_column_order)} columns")`,
+    `        print(f"[OK] Variable {v['variableName']} populated across {len(cols)} columns")`,
     ``,
     `def run_tasks(app, win, dry_run: bool):`,
     `    for task in PLAN["tasks"]:`,
@@ -2252,26 +2771,27 @@ export function compileFullOpenProjectBridge(
     `            if task_node is not None:`,
     `                task_node.right_click_input()`,
     `                time.sleep(0.2)`,
-    `            new_mi = app.top_window().child_window(title_re=r"(?i)^(Add|New).*", control_type="MenuItem")`,
-    `            if new_mi.exists(timeout=1.5):`,
-    `                new_mi.click_input()`,
-    `                time.sleep(0.2)`,
+    `            _click_context_menu_item(app, win, r"(?i)^(Add|New).*")`,
     `            name_dlg = app.window(title_re="(?i).*(New Task|Task|Property).*")`,
     `            if name_dlg.exists(timeout=1.5):`,
     `                set_dialog_field(name_dlg, "Task name", task["taskName"])`,
-    `                ok_btn = name_dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button")`,
+    `                ok_btn = name_dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button", found_index=0)`,
     `                if ok_btn.exists(timeout=1.0):`,
     `                    ok_btn.click_input()`,
     `                    time.sleep(0.2)`,
-    `            editor = win.child_window(control_type="Document")`,
+    `            # Scope editor lookup to active MDI child window so we do not paste into unrelated toolbar/search Edit boxes`,
+    `            mdi_host = win.child_window(title_re=f"(?i).*{re.escape(task['taskName'])}.*", control_type="Window", found_index=0)`,
+    `            editor_scope = mdi_host if mdi_host.exists(timeout=1.2) else win`,
+    `            editor = editor_scope.child_window(control_type="Document", found_index=0)`,
     `            if not editor.exists(timeout=1.5):`,
-    `                editor = win.child_window(control_type="Edit")`,
-    `            if editor.exists(timeout=1.5):`,
-    `                editor.click_input()`,
+    `                editor = editor_scope.child_window(control_type="Edit", found_index=0)`,
+    `            if not editor.exists(timeout=1.5):`,
+    `                raise RuntimeError(f"Could not locate script editor for task {task['taskName']!r}")`,
+    `            editor.click_input()`,
     `            pyperclip.copy(task["code"])`,
-    `            time.sleep(0.05)`,
+    `            time.sleep(0.08)`,
     `            win.type_keys("^a^v")`,
-    `            time.sleep(0.1)`,
+    `            time.sleep(0.15)`,
     `            win.type_keys("^s")`,
     `            print(f"[OK] Task {task['taskName']} created, pasted, and saved")`,
     `        finally:`,
@@ -2291,44 +2811,64 @@ export function compileFullOpenProjectBridge(
     `        if node is not None:`,
     `            node.right_click_input()`,
     `            time.sleep(0.2)`,
-    `        new_mi = app.top_window().child_window(title_re=r"(?i)^(Add|New).*", control_type="MenuItem")`,
-    `        if new_mi.exists(timeout=1.5):`,
-    `            new_mi.click_input()`,
-    `            time.sleep(0.25)`,
+    `        _click_context_menu_item(app, win, r"(?i)^(Add|New).*")`,
     `        dlg = app.window(title_re="(?i).*Event selection.*")`,
     `        dlg.wait("visible", timeout=5)`,
     `        for k, v in ev["fields"].items():`,
     `            if v is not None:`,
-    `                set_dialog_field(dlg, k, v)`,
-    `        dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button").click_input()`,
+    `                if not set_dialog_field(dlg, k, v) and k == "Execution interval":`,
+    `                    set_dialog_field(dlg, "Interval", v)`,
+    `        dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button", found_index=0).click_input()`,
     `        time.sleep(0.2)`,
     `        print(f"[OK] Event {ev['eventName']} bound via Event selection modal")`,
     ``,
-    `def map_canvas_point(canvas_rect, screen_w: int, screen_h: int, x: int, y: int):`,
-    `    return (int(canvas_rect.left + x * (canvas_rect.width() / float(screen_w))), int(canvas_rect.top + y * (canvas_rect.height() / float(screen_h))))`,
+    `def map_canvas_point(canvas_rect, screen_w: int, screen_h: int, x: int, y: int, canvas_ctrl=None):`,
+    `    inset_r, inset_b = 18, 18`,
+    `    if canvas_ctrl is not None:`,
+    `        try:`,
+    `            vsb = canvas_ctrl.child_window(control_type="ScrollBar", found_index=0)`,
+    `            if not vsb.exists(timeout=0.1):`,
+    `                inset_r, inset_b = 4, 4`,
+    `        except Exception:`,
+    `            pass`,
+    `    usable_w = max(1.0, float(canvas_rect.width() - inset_r))`,
+    `    usable_h = max(1.0, float(canvas_rect.height() - inset_b))`,
+    `    return (int(canvas_rect.left + 2 + x * (usable_w / float(screen_w))), int(canvas_rect.top + 2 + y * (usable_h / float(screen_h))))`,
     ``,
-    `def draw_pipes(toolbox, canvas_rect, screen_w: int, screen_h: int, pipe_steps, win=None):`,
-    `    from pywinauto import mouse`,
-    `    if not pipe_steps:`,
-    `        return`,
+    `def _select_pipe_tool(toolbox, win=None):`,
     `    cat_link = toolbox.child_window(title_re=r"(?i)^Trace[·.]Pipe$", control_type="Hyperlink", found_index=0)`,
     `    if cat_link.exists(timeout=1.5):`,
     `        cat_link.click_input()`,
     `        time.sleep(0.15)`,
     `    pipe_item = toolbox.child_window(title_re=r"(?i)^Pipe 1$", control_type="ListItem", found_index=0)`,
     `    if not pipe_item.exists(timeout=0.8) and win is not None:`,
-    `        pipe_item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=r"(?i).*Pipe 1.*", control_type="Button", found_index=0)`,
-    `    if pipe_item.exists(timeout=0.8):`,
-    `        pipe_item.click_input()`,
-    `        time.sleep(0.1)`,
+    `        pipe_item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=r"(?i)^Pipe 1$", control_type="Button", found_index=0)`,
+    `    if not pipe_item.exists(timeout=0.8):`,
+    `        raise RuntimeError("Could not locate 'Pipe 1' in Trace·Pipe Graphics library category.")`,
+    `    pipe_item.click_input()`,
+    `    time.sleep(0.1)`,
+    ``,
+    `def draw_pipes(toolbox, canvas_rect, screen_w: int, screen_h: int, pipe_steps, win=None, canvas_ctrl=None):`,
+    `    from pywinauto import mouse`,
+    `    if not pipe_steps:`,
+    `        return`,
     `    for pipe in pipe_steps:`,
     `        pts = pipe.get("waypoints", [])`,
     `        for idx in range(len(pts) - 1):`,
-    `            p1 = map_canvas_point(canvas_rect, screen_w, screen_h, pts[idx]["x"], pts[idx]["y"])`,
-    `            p2 = map_canvas_point(canvas_rect, screen_w, screen_h, pts[idx + 1]["x"], pts[idx + 1]["y"])`,
-    `            mouse.press(coords=p1)`,
+    `            _select_pipe_tool(toolbox, win)`,
+    `            p1 = map_canvas_point(canvas_rect, screen_w, screen_h, pts[idx]["x"], pts[idx]["y"], canvas_ctrl)`,
+    `            p2 = map_canvas_point(canvas_rect, screen_w, screen_h, pts[idx + 1]["x"], pts[idx + 1]["y"], canvas_ctrl)`,
+    `            x1, y1 = p1`,
+    `            x2, y2 = p2`,
+    `            if abs(y2 - y1) < 8:`,
+    `                y1 -= 4`,
+    `                y2 += 4`,
+    `            if abs(x2 - x1) < 8:`,
+    `                x1 -= 4`,
+    `                x2 += 4`,
+    `            mouse.press(coords=(x1, y1))`,
     `            time.sleep(0.04)`,
-    `            mouse.release(coords=p2)`,
+    `            mouse.release(coords=(x2, y2))`,
     `            time.sleep(0.08)`,
     ``,
     `def run_displays(app, win, uia: dict, dry_run: bool):`,
@@ -2354,15 +2894,13 @@ export function compileFullOpenProjectBridge(
     `        if unresolved:`,
     `            raise RuntimeError("Unverified Graphics Library items: " + ", ".join(unresolved) + ". Supply catalogOverrides or haiwell_graphics_catalog_dump.json overrides.")`,
     `        disp_node = navigate_tree(win, scr["treeNode"])`,
-    `        scr_item = win.child_window(title_re=f"(?i).*{re.escape(scr['screenName'])}.*", control_type="TreeItem")`,
+    `        scr_item = win.child_window(title_re=f"(?i)^{re.escape(scr['screenName'])}$", control_type="TreeItem", found_index=0)`,
     `        if scr_item.exists(timeout=1.5):`,
     `            scr_item.double_click_input()`,
     `        elif disp_node is not None:`,
     `            disp_node.right_click_input()`,
     `            time.sleep(0.2)`,
-    `            new_mi = app.top_window().child_window(title_re=r"(?i)^(Add|New).*", control_type="MenuItem")`,
-    `            if new_mi.exists(timeout=1.5):`,
-    `                new_mi.click_input()`,
+    `            _click_context_menu_item(app, win, r"(?i)^(Add|New).*")`,
     `        time.sleep(0.3)`,
     `        tb_id = uia.get("toolboxAutoId", "") or "SymbolPanel"`,
     `        toolbox = win.child_window(auto_id=tb_id, found_index=0)`,
@@ -2375,19 +2913,21 @@ export function compileFullOpenProjectBridge(
     `        for st in scr["widgetSteps"]:`,
     `            cat = st.get("graphicsLibraryCategory")`,
     `            if cat and cat != active_cat:`,
-    `                cat_link = toolbox.child_window(title_re=f"(?i).*{re.escape(cat)}.*", control_type="Hyperlink", found_index=0)`,
+    `                cat_link = toolbox.child_window(title_re=f"(?i)^{re.escape(cat)}$", control_type="Hyperlink", found_index=0)`,
     `                if cat_link.exists(timeout=1.5):`,
     `                    cat_link.click_input()`,
     `                    time.sleep(0.2)`,
     `                    active_cat = cat`,
-    `            item = toolbox.child_window(title_re=f"(?i).*{re.escape(st['toolboxItemName'])}.*", control_type="ListItem", found_index=0)`,
+    `            item = toolbox.child_window(title_re=f"(?i)^{re.escape(st['toolboxItemName'])}$", control_type="ListItem", found_index=0)`,
     `            if not item.exists(timeout=1.0):`,
-    `                item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=f"(?i).*{re.escape(st['toolboxItemName'])}.*", control_type="Button", found_index=0)`,
+    `                item = win.child_window(auto_id="tbrSymbolControl", found_index=0).child_window(title_re=f"(?i)^{re.escape(st['toolboxItemName'])}$", control_type="Button", found_index=0)`,
+    `            if not item.exists(timeout=1.0):`,
+    `                raise RuntimeError(f"Could not locate Graphics library item {st['toolboxItemName']!r} in category {cat!r}")`,
     `            item.click_input()`,
     `            time.sleep(0.1)`,
     `            b = st["canvasBounds"]`,
-    `            p1 = map_canvas_point(canvas_rect, scr["width"], scr["height"], b["x"], b["y"])`,
-    `            p2 = map_canvas_point(canvas_rect, scr["width"], scr["height"], b["x"] + b["width"], b["y"] + b["height"])`,
+    `            p1 = map_canvas_point(canvas_rect, scr["width"], scr["height"], b["x"], b["y"], canvas)`,
+    `            p2 = map_canvas_point(canvas_rect, scr["width"], scr["height"], b["x"] + b["width"], b["y"] + b["height"], canvas)`,
     `            mouse.press(coords=p1)`,
     `            time.sleep(0.05)`,
     `            mouse.release(coords=p2)`,
@@ -2396,14 +2936,16 @@ export function compileFullOpenProjectBridge(
     `            mouse.double_click(coords=mid)`,
     `            time.sleep(0.2)`,
     `            dlg = app.window(title_re="(?i).*(Property|Setting|Attribute).*")`,
-    `            if dlg.exists(timeout=2.5):`,
-    `                for k, v in st["modalFieldWrites"].items():`,
-    `                    set_dialog_field(dlg, k, v)`,
-    `                ok_btn = dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button")`,
-    `                if ok_btn.exists(timeout=1.5):`,
-    `                    ok_btn.click_input()`,
+    `            if not dlg.exists(timeout=2.5):`,
+    `                raise RuntimeError(f"Property modal failed to open for widget {st['widgetId']} on {scr['screenName']}")`,
+    `            for k, v in st["modalFieldWrites"].items():`,
+    `                set_dialog_field(dlg, k, v)`,
+    `            ok_btn = dlg.child_window(title_re="(?i)^(OK|Confirm)$", control_type="Button", found_index=0)`,
+    `            if not ok_btn.exists(timeout=1.5):`,
+    `                raise RuntimeError(f"OK button not found in Property modal for {st['widgetId']}")`,
+    `            ok_btn.click_input()`,
     `            print(f"[OK] Placed {st['widgetId']} on {scr['screenName']}")`,
-    `        draw_pipes(toolbox, canvas_rect, scr["width"], scr["height"], scr.get("pipeSteps", []), win)`,
+    `        draw_pipes(toolbox, canvas_rect, scr["width"], scr["height"], scr.get("pipeSteps", []), win, canvas)`,
     ``,
     `def main():`,
     `    ap = argparse.ArgumentParser()`,

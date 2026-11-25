@@ -715,9 +715,9 @@ test('v2.4.0: haiwell_open_project_bridge_export compiles full 5-section open-.h
   const devTabs = data.plan.devices[0].tabs;
   assert.equal(devTabs['Communication port']['COM port'], 'COM2');
   assert.equal(devTabs['Communication port']['Parity check'], 'None');
-  assert.equal(devTabs['Collect and communicate']['Address offset'], 'base 0');
+  assert.equal(devTabs['Collect and communicate']['Address offset'], '0');
   assert.equal(devTabs['Collect and communicate']['Block length'], 48);
-  assert.equal(devTabs['Collect and communicate']['High and Low Word'], 'CD AB');
+  assert.equal(devTabs['Collect and communicate']['High and Low Word'], 'CDAB');
 
   // Verify exact Device Variable grid Register type strings
   const x0Row = data.plan.variables.find((v) => v.gridRow['Variable name'] === 'X0_Sensor')!.gridRow;

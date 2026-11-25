@@ -5,27 +5,25 @@
   - Pass 1 (Baseline v2.6.0): `4827a779749951fafcd1f65b0d4f310ef49018b8`
   - Pass 2 (Hardened v2.7.0): `c8527bf6708d78a1be4bf2b80edef349833a023e`
   - Pass 3 (Local Remediation): Applied locally on top of `f45191c`
+  - Pass 4 (Forensic Audit Remediation `v2.8.0`): Comprehensive remediation across all 12 CRITICAL, 19 HIGH, 36 MEDIUM, and 20 LOW findings
 - **Target Workstation Environment Verified Against:**
   - Windows 10/11 (`win32`), Node.js `v24.13.0`, npm `11.6.2`
   - Installed Software: `Haiwell Cloud Scada[3.50.1.19]` at `C:\Program Files (x86)\Haiwell\HaiwellScada3\Scada.Develop.exe`
 
 ---
 
-## 1. Executive Scorecard (`4827a77` -> `c8527bf` -> Local Remediation)
+## 1. Executive Scorecard (`4827a77` -> `c8527bf` -> `v2.8.0`)
 
-| # | Audit Category | Pass 1 (`4827a77`) | Pass 2 (`c8527bf`) | Pass 3 (Local Fix) | Summary of Current State |
+| # | Audit Category | Pass 1 (`4827a77`) | Pass 2 (`c8527bf`) | Pass 4 (`v2.8.0`) | Summary of Current State |
 | :- | :--- | :--- | :--- | :--- | :--- |
-| **R1** | **Module Resolution (`src/mcp/version.ts`)** | N/A | **BROKEN (Blocker)** | **Fixed** | Created `src/mcp/version.ts` (`SERVER_VERSION = '2.7.0'`), restoring `npm start`, `npm run lint`, and all test suites. |
-| **1** | **Desktop Bridges (`open_project` / `hmi_desktop`)** | Failed | **Fixed** | **Fixed** | `run_displays`, `run_variables`, `run_tasks`, `run_events`, Label-to-Edit `rectangle()`, `pipeSteps`, and `unverifiedToolboxItems` implemented. |
-| **2** | **IEC 61131-3 ST Validator & JS Transpiler** | Failed | **Fixed** | **Fixed** | `StartDelay` FB state helper, `XOR`, `VAR` initializers, `CASE 1..5:`, `A, B : INT;`, string `;`, and `Variable.GetByFullName` default all pass `new vm.Script()`. |
-| **3** | **Packaging, Startup (`npm start`), `.env` & `npm install`** | Failed | **Partially Fixed** | **Fixed** | Bumped `esbuild` to `^0.28.0` in `package.json`; plain `npm install` now exits 0 cleanly without `--legacy-peer-deps`. |
-| **4** | **Headless PLC/SCADA Simulation Engine** | Failed | **Fixed** | **Fixed** | `haiwell_simulation_step` executes saved ST POUs (`ChillerControl`) and cyclic JS scripts (`ComputePlantDeltaT`) in a sandboxed VM. |
-| **5** | **Safety Audit (`runProjectSafetyAudit`) & HMI Guards** | Failed | **Partially Fixed** | **Fixed** | `AUD-HMI-LAYOUT` is always `HIGH`; `AUD-STARTUP-SCREEN`, `AUD-HW-COMPAT-A8`, `AUD-HW-COMPAT-IPC-AUDIO`, and `AUD-DANGLING-REF` on schedules/triggers added. |
-| **6** | **HTTP Server Security, SSRF & IDE `stdio` Configs** | Failed | **Partially Fixed** | **Fixed** | Full IPv6 expansion/embedded IPv4 extraction, BSD `inet_aton` decoding, and pre-connect `dns.promises.lookup(..., { all: true })` DNS-rebinding guard implemented. |
-| **7** | **Haiwell JavaScript Static Analyzer (`scriptAnalyzer.ts`)** | Failed | **Fixed** | **Fixed** | `acorn` syntax parsing catches `var 123 = @@@`, allows local `var process = 1`, flags `Object.assign`/`.includes`/`for..of`, catches single-level `$InternalTag`, and checks AST for `EStop_OK`. |
-| **8** | **Multi-Vendor PLC Addressing & Overlap Detection** | Failed | **Still Fails** | **Fixed** | Canonicalized Modbus coil/DI keys, added bit-in-word/bit-in-byte overlap detection, multi-word span upper-bound checks, and `%MX{byte}.{0..7}` formatting. |
-| **9** | **Desktop Launch & New Project (`desktopAutomation.ts`)** | Missing | **Fails on Real Host** | **Fixed** | Added Windows Registry + `Haiwell\HaiwellScada3` discovery, numeric `config.ini` `lang` mapping (`0 -> en`), XML `<Group>/<String>` `.lng` parser, and two-step New Project UIA flow (`"New project"` -> `"Project properties"`). *(Note: spawning `Scada.Develop.exe` from a sandboxed shell returns `OS_PERMISSION_DENIED` / `EACCES`, which is an OS sandbox boundary.)* |
-| **10** | **Persistence (`workspace.json`), CSV Export & Assets** | Failed | **Fixed** | **Fixed** | Rollback snapshots persist in `workspace.json`, CSV headers match Haiwell 3.50.x Variable Grid, and `public/assets/aistudio/` personal files were removed. |
+| **R1** | **Module Resolution & Packaging (`version.ts`, `package.json`, `tsconfig.json`)** | N/A | **BROKEN** | **Fixed (`v2.8.0`)** | `SERVER_VERSION = '2.8.0'`, `tsx` in production `dependencies`, unused UI libs removed, `"strict": true` enabled. |
+| **1** | **Desktop Bridges & Calibrator (`hmiSpatialEngine.ts`, `desktopAutomation.ts`)** | Failed | **Partial** | **Fixed (`v2.8.0`)** | Inner-ID calibrator precedence (`vectorControl1`/`fg`/`treeView1`/`SymbolPanel`), `Cloud platform data monitoring`, exact 3.50.1.19 `en.lng` labels (`Modbus Master(TCP/UDP)`, `CDAB`, `'0'`/`'1'`, `Analog input`/`Analog output`, `High speed`/`Low speed`, `Task -> Script task`, `Execution interval`, `Specify the variable`), per-segment `Pipe 1` re-selection, `F2` C1FlexGrid editing, `IsReadOnly` & clipboard settle guards. |
+| **2** | **IEC 61131-3 ST/LD/FBD Validator & ES5 Transpiler (`iec61131.ts`)** | Failed | **Partial** | **Fixed (`v2.8.0`)** | 2D arrays, `EXIT;` outside-loop check, `WHILE (TRUE)`/`NOT FALSE` detection, `FOR` immutability, unguarded `MOD`, balanced `LOG`/`LN` & `**` precedence, context-aware `NOT`/`XOR`, Strict-ES5 FB pre-init & `!== undefined` defaults (no `NaN` or `KP=0` override). |
+| **3** | **HTTP Security & Sandbox Isolation (`server.ts`, `scriptAnalyzer.ts`, `simulationEngine.ts`)** | Failed | **Vulnerable** | **Fixed (`v2.8.0`)** | Normalized path matching on auth/rate-limit/error middleware (blocks `/mcp/`, `/MCP`, `/api/rpc/` bypasses), `?profile=` enforcement on `/api/rpc`, batch token rate limiting, VM-realm membrane isolation + AST `+=`/`Array.join`/`fromCharCode`/`this`-alias/computed-property blocking. |
+| **4** | **Headless PLC/SCADA Simulation & Alarms (`simulationEngine.ts`)** | Failed | **Partial** | **Fixed (`v2.8.0`)** | `RUN_ONCE` latch enforcement, standalone `delayOnMs`/`delayOffMs` enforcement (opt-out `enforceDelays: false`), `DEV` deadband fix, shelved alarm clearing, integer/float32 coercion, `RUN_SCRIPT` by id/name, Step 6/8 change propagation. |
+| **5** | **Safety Audit, HMI Spatial Routing & SVG Security (`hmiGenerator.ts`, `hmiSpatialEngine.ts`, `toolRegistry.ts`)** | Failed | **Partial** | **Fixed (`v2.8.0`)** | Obstacle-aware P&ID routing + `pipeWidgetCrossings` audit, DFS longest-path DAG ranking, strict XML/SVG allowlist sanitizer, blocking validation on duplicate widget IDs / RO write widgets / invalid ranges / disconnected pipes, fail-closed `ESTOP_TAG_MISSING`, physical-output interlock check, scoped idempotency keys. |
+| **6** | **Multi-Vendor PLC Addressing & CSV Export (`plcAddressing.ts`, `haiwellRegisters.ts`, `toolRegistry.ts`)** | Failed | **Partial** | **Fixed (`v2.8.0`)** | `deviceOffsets` (`BASE_0`/`BASE_1`) overlap checks, unified S7 `DBW`/`DBB` byte-width, Delta DVP octal/bounds, Schneider `%MW`/`%QW` separation, OPC UA/MQTT/AB EIP fixes, `IR`/`HR`/`.bit` CSV accuracy & split PLC vs internal CSV export. |
+| **7** | **Store Integrity, OPC UA Write Guard & SSRF (`projectStore.ts`, `protocolAdapters.ts`, `toolRegistry.ts`)** | Failed | **Partial** | **Fixed (`v2.8.0`)** | Deep partial-project normalization & persistence failure rollback, OPC UA `CurrentReadWrite` write guard + audit trail, `LITERAL_STRING_ARG_KEYS` preserving JSON strings (`lwtPayload`/`value`/`actionValue`/`svgMarkup`), obfuscated IPv6 loopback SSRF blocking. |
 
 ---
 

@@ -78,12 +78,20 @@ function timingSafeBearerMatch(headerVal: string | undefined, expectedToken: str
   return crypto.timingSafeEqual(provided, expected);
 }
 
+function normalizeHttpPath(rawPath: string): string {
+  const cleaned = rawPath.toLowerCase().replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+  return cleaned.length > 0 ? cleaned : '/';
+}
+
 export function createApp(
   store: HaiwellProjectStore = defaultProjectStore,
   securityOpts: ServerSecurityOptions = {}
 ) {
   const app = express();
   app.disable('x-powered-by');
+  if (process.env.TRUST_PROXY === 'true') {
+    app.set('trust proxy', 1);
+  }
   app.use(express.json({ limit: '2mb' }));
 
   const authToken = securityOpts.authToken ?? process.env.HAIWELL_MCP_AUTH_TOKEN?.trim() ?? '';
@@ -124,20 +132,24 @@ export function createApp(
 
   // Per-IP Token Bucket rate limiter (prevents runaway agent retry loops)
   const buckets = new Map<string, { tokens: number; lastRefill: number }>();
-  const consumeRateToken = (ip: string): { allowed: boolean; retryAfterSec: number } => {
+  const consumeRateToken = (ip: string, cost = 1): { allowed: boolean; retryAfterSec: number } => {
     if (!Number.isFinite(rateLimitPerMin) || rateLimitPerMin <= 0) return { allowed: true, retryAfterSec: 0 };
     const now = Date.now();
-    const capacity = Math.max(20, Math.min(rateLimitPerMin, 240));
+    const capacity = Math.max(1, Math.min(rateLimitPerMin, 240));
     const refillPerMs = rateLimitPerMin / 60000;
     const entry = buckets.get(ip) ?? { tokens: capacity, lastRefill: now };
     const elapsed = Math.max(0, now - entry.lastRefill);
     entry.tokens = Math.min(capacity, entry.tokens + elapsed * refillPerMs);
     entry.lastRefill = now;
-    if (entry.tokens < 1) {
+    const effectiveCost = Math.max(1, Math.floor(cost));
+    if (entry.tokens < effectiveCost) {
       buckets.set(ip, entry);
-      return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((1 - entry.tokens) / (refillPerMs * 1000))) };
+      return {
+        allowed: false,
+        retryAfterSec: Math.max(1, Math.ceil((effectiveCost - entry.tokens) / (refillPerMs * 1000))),
+      };
     }
-    entry.tokens -= 1;
+    entry.tokens -= effectiveCost;
     buckets.set(ip, entry);
     if (buckets.size > 2000) {
       const oldest = buckets.keys().next().value;
@@ -173,7 +185,9 @@ export function createApp(
     }
 
     // Enforce Bearer auth on execution/export endpoints when HAIWELL_MCP_AUTH_TOKEN is configured
-    const requiresAuth = req.path === '/mcp' || req.path === '/api/rpc' || req.path.startsWith('/api/projects/');
+    const normPath = normalizeHttpPath(req.path);
+    const requiresAuth =
+      normPath === '/mcp' || normPath === '/api/rpc' || normPath.startsWith('/api/projects/');
     if (authToken && requiresAuth && !timingSafeBearerMatch(req.headers.authorization, authToken)) {
       res.setHeader('WWW-Authenticate', 'Bearer realm="haiwell-cloud-scada-mcp"');
       res.status(401).json({
@@ -183,10 +197,14 @@ export function createApp(
       return;
     }
 
-    // Apply token-bucket rate limiting on execution endpoints
-    if (req.path === '/mcp' || req.path === '/api/rpc') {
+    // Apply token-bucket rate limiting on execution endpoints (weighted by batch size for /api/rpc)
+    if (normPath === '/mcp' || normPath === '/api/rpc') {
       const clientKey = req.ip || req.socket.remoteAddress || 'local';
-      const rl = consumeRateToken(clientKey);
+      const batchCost =
+        normPath === '/api/rpc' && Array.isArray(req.body)
+          ? Math.max(1, Math.min(req.body.length, 100))
+          : 1;
+      const rl = consumeRateToken(clientKey, batchCost);
       if (!rl.allowed) {
         res.setHeader('Retry-After', String(rl.retryAfterSec));
         res.status(429).json({
@@ -207,8 +225,9 @@ export function createApp(
   // Strict JSON error middleware: NEVER return HTML error pages on malformed JSON, oversized payloads, or errors!
   app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const errObj = err && typeof err === 'object' ? (err as { type?: string; status?: number; message?: string }) : {};
+    const isMcpPath = normalizeHttpPath(req.path) === '/mcp';
     if (errObj.type === 'entity.parse.failed') {
-      if (req.path === '/mcp') {
+      if (isMcpPath) {
         res.status(400).json({
           jsonrpc: '2.0',
           id: null,
@@ -223,7 +242,7 @@ export function createApp(
       return;
     }
     if (errObj.type === 'entity.too.large') {
-      if (req.path === '/mcp') {
+      if (isMcpPath) {
         res.status(413).json({
           jsonrpc: '2.0',
           id: null,
@@ -238,7 +257,7 @@ export function createApp(
       return;
     }
     const status = typeof errObj.status === 'number' && errObj.status >= 400 && errObj.status < 600 ? errObj.status : 500;
-    if (req.path === '/mcp') {
+    if (isMcpPath) {
       res.status(status).json({
         jsonrpc: '2.0',
         id: null,
@@ -364,18 +383,23 @@ export function createApp(
       enableJsonResponse: true,
     });
 
-    res.on('close', () => {
-      void transport.close();
-      void releaseMcpServer(profile, server);
-    });
+    // Stamp X-Execution-Time-Ms right as response headers are flushed (after tool execution finishes)
+    const origWriteHead = res.writeHead.bind(res);
+    res.writeHead = ((...args: Parameters<typeof res.writeHead>) => {
+      if (!res.headersSent) {
+        res.setHeader('Mcp-Protocol-Version', '2025-03-26');
+        res.setHeader('X-Execution-Time-Ms', (performance.now() - start).toFixed(3));
+      }
+      return origWriteHead(...args);
+    }) as typeof res.writeHead;
 
     try {
       await server.connect(transport);
       res.setHeader('Mcp-Protocol-Version', '2025-03-26');
-      res.setHeader('X-Execution-Time-Ms', (performance.now() - start).toFixed(3));
       await transport.handleRequest(req, res, normalizedBody);
     } catch (err) {
       if (!res.headersSent) {
+        res.setHeader('X-Execution-Time-Ms', (performance.now() - start).toFixed(3));
         res.status(500).json({
           jsonrpc: '2.0',
           id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
@@ -385,6 +409,9 @@ export function createApp(
           },
         });
       }
+    } finally {
+      await transport.close().catch(() => {});
+      await releaseMcpServer(profile, server);
     }
   });
 
@@ -474,6 +501,27 @@ export function createApp(
 
   app.post('/api/rpc', async (req, res) => {
     const start = performance.now();
+    const profile = resolveToolProfile(
+      typeof req.query.profile === 'string' ? req.query.profile : process.env.HAIWELL_MCP_PROFILE
+    );
+    const allowedProfileTools =
+      profile === 'all' ? null : new Set(getToolsForProfile(profile).map((t) => t.name));
+
+    const invokeScoped = async (toolName: string, toolArgs: unknown) => {
+      if (allowedProfileTools && !allowedProfileTools.has(toolName)) {
+        return {
+          ok: false,
+          tool: toolName,
+          executionMs: 0,
+          error: {
+            code: 'TOOL_NOT_IN_PROFILE',
+            message: `Tool "${toolName}" is not available in profile "${profile}".`,
+          },
+        };
+      }
+      return invokeHaiwellTool(toolName, toolArgs, store);
+    };
+
     if (Array.isArray(req.body)) {
       if (req.body.length > 100) {
         res.status(413).json({ ok: false, error: { code: 'BATCH_TOO_LARGE', message: 'Max 100 calls per batch.' } });
@@ -481,10 +529,10 @@ export function createApp(
       }
       const results = [];
       for (const item of req.body) {
-        results.push(await invokeHaiwellTool(String(item?.tool ?? ''), item?.arguments ?? {}, store));
+        results.push(await invokeScoped(String(item?.tool ?? ''), item?.arguments ?? {}));
       }
       res.setHeader('X-Execution-Time-Ms', (performance.now() - start).toFixed(3));
-      res.json({ batch: true, count: results.length, results });
+      res.json({ batch: true, profile, count: results.length, results });
       return;
     }
 
@@ -497,9 +545,10 @@ export function createApp(
       return;
     }
 
-    const result = await invokeHaiwellTool(tool, args ?? {}, store);
+    const result = await invokeScoped(tool, args ?? {});
     res.setHeader('X-Execution-Time-Ms', result.executionMs.toFixed(3));
-    res.status(result.ok ? 200 : 422).json(result);
+    const status = result.ok ? 200 : result.error?.code === 'TOOL_NOT_IN_PROFILE' ? 403 : 422;
+    res.status(status).json(result);
   });
 
   app.get('/api/projects/:projectId/export', (req, res) => {
@@ -611,7 +660,7 @@ export function createApp(
   app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const errObj = err && typeof err === 'object' ? (err as { status?: number; message?: string }) : {};
     const status = typeof errObj.status === 'number' && errObj.status >= 400 && errObj.status < 600 ? errObj.status : 500;
-    if (req.path === '/mcp') {
+    if (normalizeHttpPath(req.path) === '/mcp') {
       res.status(status).json({
         jsonrpc: '2.0',
         id: null,

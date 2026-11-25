@@ -115,6 +115,29 @@ const JS_VALUE_PROPERTIES = new Set([
   'replace',
   'charAt',
   'charCodeAt',
+  'match',
+  'search',
+  'concat',
+]);
+
+const PROTECTED_API_ROOTS = new Set([
+  'Tag',
+  'Variable',
+  'Common',
+  'Object',
+  'Function',
+  'Array',
+  'String',
+  'Number',
+  'Boolean',
+  'Math',
+  'Date',
+  'JSON',
+  'RegExp',
+  'Error',
+  'TypeError',
+  'RangeError',
+  'SyntaxError',
 ]);
 
 type AstNode = acorn.AnyNode & Record<string, unknown>;
@@ -148,6 +171,18 @@ function getStringLiteralValue(node: AstNode | null | undefined): string | undef
   return undefined;
 }
 
+function getNumericLiteralValue(node: AstNode | null | undefined): number | undefined {
+  if (!node) return undefined;
+  if (node.type === 'Literal' && typeof node.value === 'number' && Number.isFinite(node.value)) {
+    return node.value;
+  }
+  if (node.type === 'UnaryExpression' && (node.operator === '-' || node.operator === '+')) {
+    const inner = getNumericLiteralValue(node.argument as AstNode);
+    if (inner !== undefined) return node.operator === '-' ? -inner : inner;
+  }
+  return undefined;
+}
+
 function evalStaticStringExpr(node: AstNode | null | undefined, trackedStrVars?: Map<string, string>): string | undefined {
   const lit = getStringLiteralValue(node);
   if (lit !== undefined) return lit;
@@ -159,6 +194,65 @@ function evalStaticStringExpr(node: AstNode | null | undefined, trackedStrVars?:
     const l = evalStaticStringExpr(node.left as AstNode, trackedStrVars);
     const r = evalStaticStringExpr(node.right as AstNode, trackedStrVars);
     if (l !== undefined && r !== undefined) return l + r;
+  }
+  if (node.type === 'CallExpression') {
+    const callee = node.callee as AstNode | undefined;
+    const args = (node.arguments as AstNode[]) ?? [];
+    if (callee && callee.type === 'MemberExpression') {
+      const method = getMemberPropertyName(callee, trackedStrVars);
+      const obj = callee.object as AstNode | undefined;
+      if (method === 'fromCharCode' && obj?.type === 'Identifier' && String(obj.name) === 'String') {
+        const codes: number[] = [];
+        for (const a of args) {
+          const n = getNumericLiteralValue(a);
+          if (n === undefined) return undefined;
+          codes.push(n);
+        }
+        return String.fromCharCode(...codes);
+      }
+      if (method === 'join' && obj?.type === 'ArrayExpression') {
+        const sep = args.length === 0 ? ',' : evalStaticStringExpr(args[0], trackedStrVars);
+        if (sep === undefined) return undefined;
+        const parts: string[] = [];
+        for (const el of (obj.elements as (AstNode | null)[]) ?? []) {
+          if (!el) {
+            parts.push('');
+            continue;
+          }
+          const part = evalStaticStringExpr(el, trackedStrVars);
+          if (part === undefined) return undefined;
+          parts.push(part);
+        }
+        return parts.join(sep);
+      }
+      const baseStr = evalStaticStringExpr(obj, trackedStrVars);
+      if (baseStr !== undefined && method) {
+        if (method === 'slice' || method === 'substring') {
+          const start = args.length >= 1 ? getNumericLiteralValue(args[0]) : 0;
+          const end = args.length >= 2 ? getNumericLiteralValue(args[1]) : undefined;
+          if (start === undefined || (args.length >= 2 && end === undefined)) return undefined;
+          return method === 'slice' ? baseStr.slice(start, end) : baseStr.substring(start, end);
+        }
+        if (method === 'substr') {
+          const start = args.length >= 1 ? getNumericLiteralValue(args[0]) : 0;
+          const len = args.length >= 2 ? getNumericLiteralValue(args[1]) : undefined;
+          if (start === undefined || (args.length >= 2 && len === undefined)) return undefined;
+          return len === undefined ? baseStr.slice(start) : baseStr.slice(start, start + Math.max(0, len));
+        }
+        if (method === 'concat') {
+          let out = baseStr;
+          for (const a of args) {
+            const s = evalStaticStringExpr(a, trackedStrVars);
+            if (s === undefined) return undefined;
+            out += s;
+          }
+          return out;
+        }
+        if (method === 'toLowerCase') return baseStr.toLowerCase();
+        if (method === 'toUpperCase') return baseStr.toUpperCase();
+        if (method === 'trim') return baseStr.trim();
+      }
+    }
   }
   return undefined;
 }
@@ -172,15 +266,43 @@ function getMemberPropertyName(node: AstNode, trackedStrVars?: Map<string, strin
   return undefined;
 }
 
-function getMemberChain(node: AstNode | null | undefined): string[] | null {
+function getMemberChain(node: AstNode | null | undefined, trackedStrVars?: Map<string, string>): string[] | null {
   if (!node) return null;
   if (node.type === 'Identifier') return [String(node.name)];
   if (node.type === 'MemberExpression') {
-    const objChain = getMemberChain(node.object as AstNode);
-    const propName = getMemberPropertyName(node);
+    const objChain = getMemberChain(node.object as AstNode, trackedStrVars);
+    const propName = getMemberPropertyName(node, trackedStrVars);
     if (objChain && propName) return [...objChain, propName];
   }
   return null;
+}
+
+function isSafeNumericIndexExpr(node: AstNode | null | undefined, taintedStrVars: Set<string>): boolean {
+  if (!node) return false;
+  if (node.type === 'Literal' && typeof node.value === 'number') return true;
+  if (node.type === 'Identifier') return !taintedStrVars.has(String(node.name));
+  if (node.type === 'UnaryExpression' && (node.operator === '+' || node.operator === '-' || node.operator === '~')) {
+    return isSafeNumericIndexExpr(node.argument as AstNode, taintedStrVars);
+  }
+  if (node.type === 'UpdateExpression') {
+    return isSafeNumericIndexExpr(node.argument as AstNode, taintedStrVars);
+  }
+  if (
+    node.type === 'BinaryExpression' &&
+    ['-', '*', '/', '%', '<<', '>>', '>>>', '&', '|', '^'].includes(String(node.operator))
+  ) {
+    return (
+      isSafeNumericIndexExpr(node.left as AstNode, taintedStrVars) &&
+      isSafeNumericIndexExpr(node.right as AstNode, taintedStrVars)
+    );
+  }
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    const left = node.left as AstNode;
+    const right = node.right as AstNode;
+    if (getStringLiteralValue(left) !== undefined || getStringLiteralValue(right) !== undefined) return false;
+    return isSafeNumericIndexExpr(left, taintedStrVars) && isSafeNumericIndexExpr(right, taintedStrVars);
+  }
+  return false;
 }
 
 function collectPatternNames(pattern: AstNode | null | undefined, out: Set<string>): void {
@@ -262,22 +384,33 @@ function isAlwaysTruthyTest(node: AstNode | null | undefined): boolean {
   return false;
 }
 
-function loopBodyHasExit(node: AstNode | null | undefined): boolean {
+function loopBodyHasExit(node: AstNode | null | undefined, inNestedBreakTarget = false): boolean {
   if (!node || typeof node !== 'object') return false;
-  if (node.type === 'BreakStatement' || node.type === 'ReturnStatement' || node.type === 'ThrowStatement') {
+  if (node.type === 'ReturnStatement' || node.type === 'ThrowStatement') {
     return true;
+  }
+  if (node.type === 'BreakStatement') {
+    return !inNestedBreakTarget || Boolean(node.label);
   }
   if (node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression' || node.type === 'FunctionDeclaration') {
     return false;
   }
+  const nextNested =
+    inNestedBreakTarget ||
+    node.type === 'SwitchStatement' ||
+    node.type === 'WhileStatement' ||
+    node.type === 'DoWhileStatement' ||
+    node.type === 'ForStatement' ||
+    node.type === 'ForInStatement' ||
+    node.type === 'ForOfStatement';
   for (const key of Object.keys(node)) {
     if (key === 'loc' || key === 'start' || key === 'end' || key === 'type') continue;
     const val = node[key];
     if (Array.isArray(val)) {
-      if (val.some((item) => item && typeof item === 'object' && 'type' in item && loopBodyHasExit(item as AstNode))) {
+      if (val.some((item) => item && typeof item === 'object' && 'type' in item && loopBodyHasExit(item as AstNode, nextNested))) {
         return true;
       }
-    } else if (val && typeof val === 'object' && 'type' in val && loopBodyHasExit(val as AstNode)) {
+    } else if (val && typeof val === 'object' && 'type' in val && loopBodyHasExit(val as AstNode, nextNested)) {
       return true;
     }
   }
@@ -433,27 +566,33 @@ export function validateHaiwellScript(
   const forbiddenHits = new Set<string>();
   const allIdentifierNames = new Set<string>();
   const trackedStrVars = new Map<string, string>();
+  const taintedStrVars = new Set<string>();
   const localObjVars = new Set<string>();
-  const pendingWrites: { rawRef: string; apiLabel: string }[] = [];
+  const pendingWrites: { rawRef: string; apiLabel: string; nodeStart: number }[] = [];
   let hasGenuineEStopCheck = false;
+  let earliestEStopReadStart = Number.POSITIVE_INFINITY;
   let hasDatabaseCall = false;
   let hasUncoveredAjaxCall = false;
   let hasInfiniteLoop = false;
   let hasBusyWaitLoop = false;
   let nonOfficialLogHit: string | null = null;
 
-  const recordRead = (rawRef: string, apiLabel: string) => {
+  const recordRead = (rawRef: string, apiLabel: string, nodeStart = 0, isDiscarded = false) => {
     const resolved = resolveKnownTagName(rawRef, knownTags);
     const key = resolved ?? rawRef;
     referencedTags.add(key);
     const tagDef = resolved ? knownTags[resolved] : undefined;
     if (
-      resolved === 'EStop_OK' ||
-      rawRef === 'EStop_OK' ||
-      rawRef.endsWith('.EStop_OK') ||
-      (tagDef?.safetyClass === 'SIL3' && /estop|e_stop|emergency/i.test(resolved ?? rawRef))
+      !isDiscarded &&
+      (resolved === 'EStop_OK' ||
+        rawRef === 'EStop_OK' ||
+        rawRef.endsWith('.EStop_OK') ||
+        (tagDef?.safetyClass === 'SIL3' && /estop|e_stop|emergency/i.test(resolved ?? rawRef)))
     ) {
       hasGenuineEStopCheck = true;
+      if (nodeStart < earliestEStopReadStart) {
+        earliestEStopReadStart = nodeStart;
+      }
     }
     if (!resolved) {
       diagnostics.push({
@@ -472,12 +611,12 @@ export function validateHaiwellScript(
     }
   };
 
-  const recordWriteDeferred = (rawRef: string, apiLabel: string) => {
+  const recordWriteDeferred = (rawRef: string, apiLabel: string, nodeStart = 0) => {
     const resolved = resolveKnownTagName(rawRef, knownTags);
     const key = resolved ?? rawRef;
     referencedTags.add(key);
     writtenTags.add(key);
-    pendingWrites.push({ rawRef, apiLabel });
+    pendingWrites.push({ rawRef, apiLabel, nodeStart });
   };
 
   // Lexical scope stack
@@ -560,25 +699,53 @@ export function validateHaiwellScript(
       pushedScope = true;
     }
 
-    // Track static string variables & local object-literal variables
+    // Track static string variables, compound += string mutations & local object-literal variables
     if (node.type === 'VariableDeclarator' && (node.id as AstNode)?.type === 'Identifier') {
       const varName = String((node.id as AstNode).name);
       const init = node.init as AstNode | null | undefined;
       const staticStr = evalStaticStringExpr(init, trackedStrVars);
-      if (staticStr !== undefined) trackedStrVars.set(varName, staticStr);
-      else trackedStrVars.delete(varName);
+      if (staticStr !== undefined) {
+        trackedStrVars.set(varName, staticStr);
+        taintedStrVars.add(varName);
+      } else {
+        trackedStrVars.delete(varName);
+        if (init && !isSafeNumericIndexExpr(init, taintedStrVars)) {
+          taintedStrVars.add(varName);
+        }
+      }
       if (init?.type === 'ObjectExpression') localObjVars.add(varName);
     } else if (
       node.type === 'AssignmentExpression' &&
-      node.operator === '=' &&
+      (node.operator === '=' || node.operator === '+=') &&
       (node.left as AstNode)?.type === 'Identifier'
     ) {
       const varName = String((node.left as AstNode).name);
       const right = node.right as AstNode | null | undefined;
-      const staticStr = evalStaticStringExpr(right, trackedStrVars);
-      if (staticStr !== undefined) trackedStrVars.set(varName, staticStr);
-      else trackedStrVars.delete(varName);
-      if (right?.type === 'ObjectExpression') localObjVars.add(varName);
+      const rightStr = evalStaticStringExpr(right, trackedStrVars);
+      if (node.operator === '=') {
+        if (rightStr !== undefined) {
+          trackedStrVars.set(varName, rightStr);
+          taintedStrVars.add(varName);
+        } else {
+          trackedStrVars.delete(varName);
+          if (right && !isSafeNumericIndexExpr(right, taintedStrVars)) {
+            taintedStrVars.add(varName);
+          }
+        }
+        if (right?.type === 'ObjectExpression') localObjVars.add(varName);
+      } else {
+        // Compound += string concatenation
+        const prevStr = trackedStrVars.get(varName);
+        if (prevStr !== undefined && rightStr !== undefined) {
+          trackedStrVars.set(varName, prevStr + rightStr);
+          taintedStrVars.add(varName);
+        } else {
+          trackedStrVars.delete(varName);
+          if (rightStr !== undefined || (right && !isSafeNumericIndexExpr(right, taintedStrVars))) {
+            taintedStrVars.add(varName);
+          }
+        }
+      }
     }
 
     // Collect ES6+ syntax node features & forbidden statements/patterns
@@ -634,7 +801,16 @@ export function validateHaiwellScript(
       }
     }
 
-    // Forbidden property access (__proto__, constructor, prototype, this.<global>, Object/Reflect prototype APIs) & $Device.Tag / ES6 static APIs
+    // Block indirect `this` aliasing (e.g. `var g = this; g.process;`, `return this;`, `this[dyn]`)
+    if (node.type === 'ThisExpression') {
+      const isDirectStaticMember =
+        parent?.type === 'MemberExpression' && parentKey === 'object' && !parent.computed;
+      if (!isDirectStaticMember) {
+        forbiddenHits.add('this');
+      }
+    }
+
+    // Forbidden property access (__proto__, constructor, prototype, this.<global>, dynamic computed property escapes, Object/Reflect prototype APIs) & $Device.Tag / ES6 static APIs
     if (node.type === 'MemberExpression') {
       const propName = getMemberPropertyName(node, trackedStrVars);
       if (propName && FORBIDDEN_PROPERTIES.has(propName)) {
@@ -644,7 +820,21 @@ export function validateHaiwellScript(
         forbiddenHits.add(propName);
       }
 
-      const chain = getMemberChain(node);
+      if (node.computed && propName === undefined) {
+        const propNode = node.property as AstNode | undefined;
+        const objChainRoot = getMemberChain(node.object as AstNode, trackedStrVars)?.[0];
+        const isProtectedTarget =
+          (node.object as AstNode)?.type === 'ThisExpression' ||
+          (objChainRoot !== undefined && PROTECTED_API_ROOTS.has(objChainRoot) && !isBoundInScope(objChainRoot)) ||
+          (node.object as AstNode)?.type === 'FunctionExpression' ||
+          (node.object as AstNode)?.type === 'ArrowFunctionExpression';
+        const isSafeIndex = isSafeNumericIndexExpr(propNode, taintedStrVars);
+        if (!isSafeIndex || isProtectedTarget) {
+          forbiddenHits.add('computed-property-access');
+        }
+      }
+
+      const chain = getMemberChain(node, trackedStrVars);
       if (chain && chain.length === 2) {
         const [objName, methodName] = chain;
         if (FORBIDDEN_PROTOTYPE_APIS[objName]?.has(methodName) && !isBoundInScope(objName)) {
@@ -665,22 +855,24 @@ export function validateHaiwellScript(
         if (objName.startsWith('$') && objName.length > 1 && isAllowedValueMember) {
           const internalCandidate = objName.slice(1);
           const fullRef = `${internalCandidate}.${methodName}`;
+          const nodeStart = typeof node.start === 'number' ? node.start : 0;
+          const isDiscarded = parent?.type === 'ExpressionStatement' && parentKey === 'expression';
           if (
             JS_VALUE_PROPERTIES.has(methodName) &&
             resolveKnownTagName(internalCandidate, knownTags) &&
             !resolveKnownTagName(fullRef, knownTags)
           ) {
-            recordRead(internalCandidate, objName);
+            recordRead(internalCandidate, objName, nodeStart, isDiscarded);
           } else if (isWriteTarget(parent, parentKey)) {
-            recordWriteDeferred(fullRef, `$${fullRef}`);
+            recordWriteDeferred(fullRef, `$${fullRef}`, nodeStart);
           } else {
-            recordRead(fullRef, `$${fullRef}`);
+            recordRead(fullRef, `$${fullRef}`, nodeStart, isDiscarded);
           }
         }
       }
     }
 
-    // Identifier checks (unbound globals, single-level $InternalTag)
+    // Identifier checks (unbound globals, Object aliasing, single-level $InternalTag)
     if (node.type === 'Identifier') {
       const name = String(node.name);
       const isDeclOrPropKey =
@@ -706,6 +898,13 @@ export function validateHaiwellScript(
           if (FORBIDDEN_UNBOUND_GLOBALS.has(name)) {
             forbiddenHits.add(name);
           }
+          // Block aliasing `Object` global (e.g. `var O = Object; O.getPrototypeOf(...)` or `Object[k]`)
+          if (
+            name === 'Object' &&
+            !(parent?.type === 'MemberExpression' && parentKey === 'object' && !parent.computed)
+          ) {
+            forbiddenHits.add('Object');
+          }
           if (ES6_RUNTIME_GLOBALS.has(name)) {
             es6RuntimeApis.add(name);
           }
@@ -716,10 +915,12 @@ export function validateHaiwellScript(
             !(parent?.type === 'MemberExpression' && parentKey === 'object')
           ) {
             const bare = name.slice(1);
+            const nodeStart = typeof node.start === 'number' ? node.start : 0;
+            const isDiscarded = parent?.type === 'ExpressionStatement' && parentKey === 'expression';
             if (isWriteTarget(parent, parentKey)) {
-              recordWriteDeferred(bare, name);
+              recordWriteDeferred(bare, name, nodeStart);
             } else {
-              recordRead(bare, name);
+              recordRead(bare, name, nodeStart, isDiscarded);
             }
           }
         }
@@ -730,7 +931,9 @@ export function validateHaiwellScript(
     if (node.type === 'CallExpression') {
       const callee = node.callee as AstNode;
       const args = (node.arguments as AstNode[]) ?? [];
-      const chain = getMemberChain(callee);
+      const chain = getMemberChain(callee, trackedStrVars);
+      const nodeStart = typeof node.start === 'number' ? node.start : 0;
+      const isDiscarded = parent?.type === 'ExpressionStatement' && parentKey === 'expression';
 
       if (callee.type === 'MemberExpression') {
         const methodName = getMemberPropertyName(callee, trackedStrVars);
@@ -746,11 +949,20 @@ export function validateHaiwellScript(
       if (chain) {
         const joined = chain.join('.');
         if (joined === 'Tag.Read' || joined === 'Variable.GetByFullName') {
-          const tagArg = getStringLiteralValue(args[0]);
-          if (tagArg) recordRead(tagArg, joined);
+          const tagArg = evalStaticStringExpr(args[0], trackedStrVars);
+          if (tagArg) recordRead(tagArg, joined, nodeStart, isDiscarded);
         } else if (joined === 'Tag.Write' || joined === 'Variable.SetByFullName') {
-          const tagArg = getStringLiteralValue(args[0]);
-          if (tagArg) recordWriteDeferred(tagArg, joined);
+          const tagArg = evalStaticStringExpr(args[0], trackedStrVars);
+          if (tagArg) {
+            recordWriteDeferred(tagArg, joined, nodeStart);
+          } else if (args.length > 0) {
+            diagnostics.push({
+              code: 'HWJS-TAG-003',
+              severity: 'WARNING',
+              message: `${joined} uses a dynamic tag name expression that cannot be statically audited for RO/SIL interlock safety.`,
+              fixHint: 'Use a literal tag name string in Tag.Write / Variable.SetByFullName so RO and SIL2/SIL3 interlocks can be verified.',
+            });
+          }
         } else if (joined === 'Variable.BatchSetByFullNames') {
           const arg0 = args[0];
           if (arg0 && arg0.type === 'ObjectExpression') {
@@ -760,8 +972,8 @@ export function validateHaiwellScript(
                 const tagKey =
                   !prop.computed && k.type === 'Identifier'
                     ? String(k.name)
-                    : getStringLiteralValue(k);
-                if (tagKey) recordWriteDeferred(tagKey, 'Variable.BatchSetByFullNames');
+                    : evalStaticStringExpr(k, trackedStrVars);
+                if (tagKey) recordWriteDeferred(tagKey, 'Variable.BatchSetByFullNames', nodeStart);
               }
             }
           }
@@ -913,7 +1125,7 @@ export function validateHaiwellScript(
   }
 
   // Validate deferred writes now that full AST EStop_OK check is complete
-  for (const { rawRef, apiLabel } of pendingWrites) {
+  for (const { rawRef, apiLabel, nodeStart } of pendingWrites) {
     const resolved = resolveKnownTagName(rawRef, knownTags);
     const tag = resolved ? knownTags[resolved] : undefined;
     if (!tag) {
@@ -932,12 +1144,15 @@ export function validateHaiwellScript(
           fixHint: `Write to a RW coil/register instead of read-only input "${tag.name}".`,
         });
       }
-      if ((tag.safetyClass === 'SIL2' || tag.safetyClass === 'SIL3') && !hasGenuineEStopCheck) {
+      if (
+        (tag.safetyClass === 'SIL2' || tag.safetyClass === 'SIL3') &&
+        (!hasGenuineEStopCheck || earliestEStopReadStart >= nodeStart)
+      ) {
         diagnostics.push({
           code: 'HWJS-SAFE-003',
           severity: 'WARNING',
-          message: `Script writes to ${tag.safetyClass} tag "${tag.name}" without checking EStop_OK interlock.`,
-          fixHint: 'Read EStop_OK (e.g., Variable.GetByFullName("EStop_OK") or $EStop_OK) before writing to safety-critical outputs.',
+          message: `Script writes to ${tag.safetyClass} tag "${tag.name}" without checking EStop_OK interlock beforehand.`,
+          fixHint: 'Read and evaluate EStop_OK (e.g., var ok = Variable.GetByFullName("EStop_OK"); if (ok) { ... }) before writing to safety-critical outputs.',
         });
       }
     }
