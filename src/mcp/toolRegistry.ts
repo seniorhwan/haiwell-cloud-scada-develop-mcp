@@ -5544,22 +5544,43 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_desktop_deploy_hwexport',
     domain: 'hmi',
-    haiwellFeature: 'Zero-Touch .hwExport Auto-Sync Deployer into Live Haiwell .hwdev',
+    haiwellFeature: 'Zero-Touch Headless .hwExport Direct Deployer into Haiwell .hwdev',
     safetyTier: 'design',
     description:
-      'Compiles the project to official Haiwell .hwExport XML (with WordSw->$ShowWindowId navigation) and deploys it automatically via the elevated Haiwell Auto-Sync watch-folder daemon (or writes a 1-click UAC Deploy_To_Haiwell.bat launcher). Supports dryRun=true.',
+      'Compiles the project to official Haiwell .hwExport XML (with WordSw->$ShowWindowId navigation, embedded PNG icons, optional variable groups & tasks) and imports it DIRECTLY and HEADLESSLY into the target encrypted .hwdev via Haiwell 3.50.x official 32-bit .NET assemblies — zero GUI, zero mouse/keyboard, zero UAC, zero Python, with automatic .hwdev.bak backup and rollback on error. Supports dryRun=true and legacy watcher_or_bat fallback.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       hwdevPath: z.string().min(1).max(300),
       outputDir: z.string().min(1).max(300),
       inboxDir: z.string().max(300).optional(),
+      installDir: z.string().max(260).optional(),
       fileName: z.string().max(120).optional(),
       screenIds: z.array(z.string()).optional(),
       startWindowId: z.number().int().min(1).max(9999).default(2),
       language: z.enum(['en_0', 'zh_0']).default('en_0'),
+      variableFullNameOverrides: z.record(z.string(), z.string()).optional(),
+      exportVariableGroups: z
+        .array(
+          z.object({
+            groupName: z.string().min(1).max(80),
+            tagNames: z.array(z.string().min(1)).min(1),
+          })
+        )
+        .optional(),
+      exportTasks: z
+        .array(
+          z.object({
+            name: z.string().min(1).max(80),
+            script: z.string(),
+            memo: z.string().max(200).optional(),
+          })
+        )
+        .optional(),
       deleteWindowPrefixes: z.array(z.string()).optional(),
+      deployMode: z.enum(['auto', 'headless', 'watcher_or_bat']).default('auto'),
+      createBackup: z.boolean().default(true),
       dryRun: z.boolean().default(false),
-      waitTimeoutMs: z.number().int().min(1000).max(120000).default(20000),
+      waitTimeoutMs: z.number().int().min(1000).max(120000).default(45000),
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
@@ -5570,10 +5591,23 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: async (input, store) => {
       const project = store.getProject(input.projectId);
+      const resolvedVarGroups = input.exportVariableGroups?.map((vg) => ({
+        groupName: vg.groupName,
+        tags: vg.tagNames.map((tn) => {
+          const found = getOwnTag(project, tn);
+          if (!found) {
+            throw new Error(`TAG_NOT_FOUND: Tag "${tn}" referenced in exportVariableGroups "${vg.groupName}" does not exist.`);
+          }
+          return found;
+        }),
+      }));
       const compiled = compileProjectToHwExport(project, {
         screenIds: input.screenIds,
         startWindowId: input.startWindowId,
         language: input.language,
+        variableFullNameOverrides: input.variableFullNameOverrides,
+        exportVariableGroups: resolvedVarGroups,
+        exportTasks: input.exportTasks,
       });
       const deployment = await deployHwExportToDesktop({
         xml: compiled.xml,
@@ -5581,7 +5615,10 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         hwdevPath: input.hwdevPath,
         outputDir: input.outputDir,
         inboxDir: input.inboxDir,
+        installDir: input.installDir,
         deleteWindowPrefixes: input.deleteWindowPrefixes,
+        deployMode: input.deployMode,
+        createBackup: input.createBackup,
         dryRun: input.dryRun,
         waitTimeoutMs: input.waitTimeoutMs,
       });

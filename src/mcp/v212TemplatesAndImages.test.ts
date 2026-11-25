@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import {
+  buildHeadlessHwExportDeployScript,
+  canRunHeadlessDotNetDeploy,
+} from './desktopAutomation';
 import { HaiwellProjectStore } from './projectStore';
 import { invokeHaiwellTool } from './toolRegistry';
 import { generateLedLampPng, generatePushbuttonPng } from './hwPngIcons';
@@ -159,11 +166,16 @@ test('v2.12.0: Hard-coded HMI templates instantiate with 0 collisions/OOB at 102
   const depData = dep.data as {
     deployed: boolean;
     mode: string;
+    preferredLiveMode: string;
+    headlessAvailable: boolean;
+    headlessScript: string;
     deployScript: string;
     watcherScript: string;
   };
   assert.equal(depData.deployed, false);
   assert.equal(depData.mode, 'DRY_RUN');
+  assert.ok(depData.headlessScript.includes('HwHeadlessDeployer'));
+  assert.ok(depData.headlessScript.includes('ImportExportWindow'));
   assert.ok(depData.deployScript.includes('"1148"'));
   assert.ok(depData.watcherScript.includes('watcher.heartbeat.json'));
 
@@ -231,4 +243,127 @@ test('v2.12.0: Hard-coded HMI templates instantiate with 0 collisions/OOB at 102
   );
   assert.equal(t8.ok, true);
   assert.equal((t8.data as any).validation.valid, true);
+});
+
+test('v2.12.0 Headless .hwdev Deployer: Base64-safe script generation, missing-.hwdev guard, and live zero-touch .hwdev import', async () => {
+  // 1. Verify paths with quotes/apostrophes/spaces are Base64-encoded and never raw-interpolated into C#
+  const trickyHwdev = `C:\\Users\\O'Brien\\My "HMI" Project\\Line 1.hwdev`;
+  const trickyExport = `C:\\Users\\O'Brien\\Exports\\Line "1".hwExport`;
+  const script = buildHeadlessHwExportDeployScript({
+    hwdevPath: trickyHwdev,
+    hwExportPath: trickyExport,
+    deleteWindowPrefixes: ['2:OLD_SCREEN', `3:O'Brien`],
+  });
+  assert.ok(script.includes('__HW_HEADLESS_RESULT__:'));
+  assert.ok(script.includes('FromBase64String('));
+  assert.ok(!script.includes(`O'Brien`), 'Raw apostrophe path must never appear unencoded in PS/C# source');
+  assert.ok(!script.includes(`My "HMI" Project`), 'Raw quoted path must never appear unencoded in PS/C# source');
+  const b64Match = /FromBase64String\('([^']+)'\)/.exec(script);
+  assert.ok(b64Match);
+  const decoded = JSON.parse(Buffer.from(b64Match[1], 'base64').toString('utf8')) as {
+    hwdevPath: string;
+    hwExportPath: string;
+    deleteWindowPrefixes: string[];
+  };
+  assert.equal(decoded.hwdevPath, trickyHwdev);
+  assert.equal(decoded.hwExportPath, trickyExport);
+  assert.deepEqual(decoded.deleteWindowPrefixes, ['2:OLD_SCREEN', `3:O'Brien`]);
+
+  // 2. Verify deployMode='headless' reports HEADLESS_FAILED cleanly on missing .hwdev (never falls back to UAC .bat)
+  const store = new HaiwellProjectStore();
+  await invokeHaiwellTool('haiwell_project_create', { id: 'prj_hl_test', name: 'HeadlessUnit', targetHardware: 'CLOUD_HMI_B7H' }, store);
+  await invokeHaiwellTool('haiwell_tag_upsert_batch', {
+    projectId: 'prj_hl_test',
+    tags: [
+      { name: 'RUN_OK', scope: 'INTERNAL', dataType: 'BOOL', access: 'RW', initialValue: true },
+      { name: 'CNT', scope: 'INTERNAL', dataType: 'UINT16', access: 'RW', initialValue: 5 },
+    ],
+  }, store);
+  await invokeHaiwellTool('haiwell_hmi_template_instantiate', {
+    projectId: 'prj_hl_test',
+    template: 'STATION_IO_MONITOR',
+    screenId: 'scr_hl_1',
+    name: 'HL_TestScreen',
+    title: 'HEADLESS UNIT TEST',
+    commTagName: 'RUN_OK',
+    outputs: [{ label: 'RUN', tagName: 'RUN_OK', role: 'PRIMARY_ACTION' }],
+    stationCounter: { label: 'CNT', tagName: 'CNT', unit: 'pcs' },
+    inputs: [{ label: 'IN0', tagName: 'RUN_OK' }],
+    outputIndicators: [{ label: 'OUT0', tagName: 'RUN_OK' }],
+  }, store);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'haiwell-hl-test-'));
+  try {
+    const check = canRunHeadlessDotNetDeploy();
+    if (check.available) {
+      const missRes = await invokeHaiwellTool(
+        'haiwell_desktop_deploy_hwexport',
+        {
+          projectId: 'prj_hl_test',
+          hwdevPath: path.join(tmpDir, 'nonexistent.hwdev'),
+          outputDir: path.join(tmpDir, 'out'),
+          deployMode: 'headless',
+          dryRun: false,
+        },
+        store
+      );
+      assert.equal(missRes.ok, true);
+      const missData = missRes.data as { deployed: boolean; mode: string; error?: string };
+      assert.equal(missData.deployed, false);
+      assert.equal(missData.mode, 'HEADLESS_FAILED');
+      assert.match(String(missData.error ?? ''), /HWDEV_NOT_FOUND/);
+
+      // 3. If a real local .hwdev exists on this Windows host, copy it to os.tmpdir() and run a real live zero-touch import!
+      const candidateDirs = [
+        path.join(os.homedir(), 'OneDrive', 'Dokumen', 'Haiwell Scada', 'Projects'),
+        path.join(os.homedir(), 'OneDrive', 'Documents', 'Haiwell Scada', 'Projects'),
+        path.join(os.homedir(), 'Documents', 'Haiwell Scada', 'Projects'),
+      ];
+      let sampleHwdev: string | null = null;
+      for (const dir of candidateDirs) {
+        if (!fs.existsSync(dir)) continue;
+        const found = fs.readdirSync(dir).find((f) => f.toLowerCase().endsWith('.hwdev'));
+        if (found) {
+          sampleHwdev = path.join(dir, found);
+          break;
+        }
+      }
+
+      if (sampleHwdev) {
+        const scratchHwdev = path.join(tmpDir, 'copy_test.hwdev');
+        fs.copyFileSync(sampleHwdev, scratchHwdev);
+        const liveRes = await invokeHaiwellTool(
+          'haiwell_desktop_deploy_hwexport',
+          {
+            projectId: 'prj_hl_test',
+            hwdevPath: scratchHwdev,
+            outputDir: path.join(tmpDir, 'out'),
+            startWindowId: 77,
+            exportVariableGroups: [{ groupName: 'HL_UnitGroup', tagNames: ['RUN_OK'] }],
+            exportTasks: [{ name: 'HL_UnitTask', script: 'var a = 1;', memo: 'Unit test' }],
+            deployMode: 'headless',
+            dryRun: false,
+          },
+          store
+        );
+        assert.equal(liveRes.ok, true);
+        const ld = liveRes.data as {
+          deployed: boolean;
+          mode: string;
+          backupPath: string | null;
+          importedWindows: { windowId: number; name: string; docBytes: number }[];
+          importedVariableGroups: string[];
+          importedTasks: string[];
+        };
+        assert.equal(ld.deployed, true);
+        assert.equal(ld.mode, 'HEADLESS_DOTNET_DIRECT');
+        assert.ok(ld.backupPath && fs.existsSync(ld.backupPath));
+        assert.ok(ld.importedWindows.some((w) => w.name === 'HL_TestScreen' && w.windowId === 77 && w.docBytes > 1000));
+        assert.ok(ld.importedVariableGroups.includes('HL_UnitGroup'));
+        assert.ok(ld.importedTasks.includes('HL_UnitTask'));
+      }
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

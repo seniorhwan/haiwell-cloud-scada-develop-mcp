@@ -10,6 +10,7 @@
 
 import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
@@ -1057,13 +1058,573 @@ while True:
 `;
 }
 
+export interface HeadlessHwExportDeployOptions {
+  hwdevPath: string;
+  hwExportPath: string;
+  installDir?: string;
+  deleteWindowPrefixes?: string[];
+  createBackup?: boolean;
+  timeoutMs?: number;
+}
+
+export interface HeadlessDeployedWindowInfo {
+  id: number;
+  windowId: number;
+  name: string;
+  docBytes?: number;
+}
+
+export interface HeadlessHwExportDeployResult {
+  ok: boolean;
+  projectName: string;
+  hwdevPath: string;
+  hwExportPath: string;
+  installDir: string;
+  backupPath: string | null;
+  deletedWindows: string[];
+  importedWindows: HeadlessDeployedWindowInfo[];
+  allUserWindows: HeadlessDeployedWindowInfo[];
+  importedVariableGroups: string[];
+  importedTasks: string[];
+  importedEventsCount: number;
+  activeGuiWarning: string | null;
+  error?: string | null;
+}
+
+export function getSysWow64PowerShellPath(): string {
+  const sysRoot = process.env.SystemRoot || 'C:\\Windows';
+  const wow64Ps = path.join(sysRoot, 'SysWOW64', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  if (process.platform === 'win32' && fs.existsSync(wow64Ps)) {
+    return wow64Ps;
+  }
+  return 'powershell.exe';
+}
+
+export function canRunHeadlessDotNetDeploy(installDir?: string): {
+  available: boolean;
+  installDir: string;
+  powershell32Path: string;
+  reason?: string;
+} {
+  const info = inspectHaiwellDesktopInstallation(installDir);
+  const powershell32Path = getSysWow64PowerShellPath();
+  if (process.platform !== 'win32') {
+    return {
+      available: false,
+      installDir: info.installDir,
+      powershell32Path,
+      reason: 'NON_WINDOWS_HOST',
+    };
+  }
+  const requiredFiles = ['Scada.Common.dll', 'Scada.Project.dll', 'Scada.Develop.exe'];
+  const missing = requiredFiles.filter((f) => !fs.existsSync(path.join(info.installDir, f)));
+  if (missing.length > 0) {
+    return {
+      available: false,
+      installDir: info.installDir,
+      powershell32Path,
+      reason: `MISSING_HAIWELL_ASSEMBLIES: ${missing.join(', ')} in "${info.installDir}"`,
+    };
+  }
+  return {
+    available: true,
+    installDir: info.installDir,
+    powershell32Path,
+  };
+}
+
+/**
+ * Generates a self-contained 32-bit PowerShell + .NET script that imports a native
+ * .hwExport XML file directly into an encrypted Haiwell .hwdev SQLite project using
+ * Haiwell's own official installed assemblies (Scada.Common.dll, Scada.Project.dll,
+ * Scada.Develop.exe) — with ZERO GUI, ZERO UIA clicking, ZERO mouse/keyboard input,
+ * ZERO UAC/Admin elevation, and ZERO Python dependency.
+ */
+export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeployOptions): string {
+  const info = inspectHaiwellDesktopInstallation(options.installDir);
+  const payload = {
+    installDir: info.installDir,
+    hwdevPath: options.hwdevPath,
+    hwExportPath: options.hwExportPath,
+    deleteWindowPrefixes: (options.deleteWindowPrefixes ?? []).filter((p) => p.trim().length > 0),
+    createBackup: options.createBackup !== false,
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+
+  return [
+    `$ErrorActionPreference = 'Stop'`,
+    `$cfgJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${payloadB64}'))`,
+    `$cfg = $cfgJson | ConvertFrom-Json`,
+    `$deletePrefixes = [string[]]@()`,
+    `if ($null -ne $cfg.deleteWindowPrefixes) { $deletePrefixes = [string[]]@($cfg.deleteWindowPrefixes) }`,
+    ``,
+    `Add-Type -TypeDefinition @'`,
+    `using System;`,
+    `using System.Collections;`,
+    `using System.Collections.Generic;`,
+    `using System.Data;`,
+    `using System.Diagnostics;`,
+    `using System.IO;`,
+    `using System.Reflection;`,
+    `using System.Windows.Forms;`,
+    `using System.Xml;`,
+    ``,
+    `public sealed class HwHeadlessWindowItem {`,
+    `    public int id { get; set; }`,
+    `    public int windowId { get; set; }`,
+    `    public string name { get; set; }`,
+    `    public int docBytes { get; set; }`,
+    `}`,
+    ``,
+    `public sealed class HwHeadlessDeployOutcome {`,
+    `    public bool ok { get; set; }`,
+    `    public string projectName { get; set; }`,
+    `    public string hwdevPath { get; set; }`,
+    `    public string hwExportPath { get; set; }`,
+    `    public string installDir { get; set; }`,
+    `    public string backupPath { get; set; }`,
+    `    public List<string> deletedWindows { get; set; }`,
+    `    public List<HwHeadlessWindowItem> importedWindows { get; set; }`,
+    `    public List<HwHeadlessWindowItem> allUserWindows { get; set; }`,
+    `    public List<string> importedVariableGroups { get; set; }`,
+    `    public List<string> importedTasks { get; set; }`,
+    `    public int importedEventsCount { get; set; }`,
+    `    public string activeGuiWarning { get; set; }`,
+    `    public string error { get; set; }`,
+    `}`,
+    ``,
+    `public static class HwHeadlessDeployer {`,
+    `    private static void ClearSqlitePools(string installDir) {`,
+    `        try {`,
+    `            var sqlDll = Path.Combine(installDir, "System.Data.SQLite.dll");`,
+    `            if (File.Exists(sqlDll)) {`,
+    `                var sqlAsm = Assembly.LoadFrom(sqlDll);`,
+    `                var connType = sqlAsm.GetType("System.Data.SQLite.SQLiteConnection");`,
+    `                if (connType != null) {`,
+    `                    var clearMeth = connType.GetMethod("ClearAllPools", BindingFlags.Public | BindingFlags.Static);`,
+    `                    if (clearMeth != null) clearMeth.Invoke(null, null);`,
+    `                }`,
+    `            }`,
+    `        } catch {}`,
+    `    }`,
+    ``,
+    `    private static string DetectActiveGuiConflict(string openingFile, string hwdevPath, string projectName, out bool isExactOpeningEntry) {`,
+    `        isExactOpeningEntry = false;`,
+    `        try {`,
+    `            if (string.IsNullOrEmpty(openingFile) || !File.Exists(openingFile)) return null;`,
+    `            var doc = new XmlDocument();`,
+    `            doc.Load(openingFile);`,
+    `            string fullTarget = Path.GetFullPath(hwdevPath);`,
+    `            var nodes = doc.SelectNodes("//Project");`,
+    `            if (nodes == null) return null;`,
+    `            foreach (XmlNode node in nodes) {`,
+    `                if (node.Attributes == null) continue;`,
+    `                string pPath = node.Attributes["path"] != null ? node.Attributes["path"].Value : "";`,
+    `                string pName = node.Attributes["name"] != null ? node.Attributes["name"].Value : "";`,
+    `                string pidStr = node.Attributes["processId"] != null ? node.Attributes["processId"].Value : "";`,
+    `                int pid = 0;`,
+    `                if (!int.TryParse(pidStr, out pid) || pid <= 0) continue;`,
+    `                bool alive = false;`,
+    `                try {`,
+    `                    var proc = Process.GetProcessById(pid);`,
+    `                    alive = !proc.HasExited && proc.ProcessName.IndexOf("Scada", StringComparison.OrdinalIgnoreCase) >= 0;`,
+    `                } catch { alive = false; }`,
+    `                if (!alive) continue;`,
+    `                bool pathMatch = false;`,
+    `                try { pathMatch = !string.IsNullOrEmpty(pPath) && string.Equals(Path.GetFullPath(pPath), fullTarget, StringComparison.OrdinalIgnoreCase); } catch {}`,
+    `                bool nameMatch = !string.IsNullOrEmpty(projectName) && string.Equals(pName, projectName, StringComparison.OrdinalIgnoreCase);`,
+    `                if (pathMatch) isExactOpeningEntry = true;`,
+    `                if (pathMatch || nameMatch) {`,
+    `                    return "Haiwell Cloud Scada GUI (PID " + pid + ") currently has project '" + pName + "' open in memory (" + pPath + "). Close and reopen '" + hwdevPath + "' in Haiwell Cloud Scada (do NOT press Ctrl+S in the stale GUI window, or it will overwrite this deployment).";`,
+    `                }`,
+    `            }`,
+    `        } catch {}`,
+    `        return null;`,
+    `    }`,
+    ``,
+    `    public static HwHeadlessDeployOutcome Run(string installDir, string hwdevPath, string hwExportPath, string[] deletePrefixes, bool createBackup) {`,
+    `        var outcome = new HwHeadlessDeployOutcome {`,
+    `            ok = false,`,
+    `            projectName = "",`,
+    `            hwdevPath = hwdevPath,`,
+    `            hwExportPath = hwExportPath,`,
+    `            installDir = installDir,`,
+    `            backupPath = null,`,
+    `            deletedWindows = new List<string>(),`,
+    `            importedWindows = new List<HwHeadlessWindowItem>(),`,
+    `            allUserWindows = new List<HwHeadlessWindowItem>(),`,
+    `            importedVariableGroups = new List<string>(),`,
+    `            importedTasks = new List<string>(),`,
+    `            importedEventsCount = 0,`,
+    `            activeGuiWarning = null,`,
+    `            error = null,`,
+    `        };`,
+    ``,
+    `        if (!Directory.Exists(installDir)) {`,
+    `            outcome.error = "HAIWELL_INSTALL_DIR_NOT_FOUND: " + installDir;`,
+    `            return outcome;`,
+    `        }`,
+    `        if (!File.Exists(hwdevPath)) {`,
+    `            outcome.error = "HWDEV_NOT_FOUND: Target .hwdev project does not exist at " + hwdevPath;`,
+    `            return outcome;`,
+    `        }`,
+    `        if (!File.Exists(hwExportPath)) {`,
+    `            outcome.error = "HWEXPORT_NOT_FOUND: Compiled .hwExport file not found at " + hwExportPath;`,
+    `            return outcome;`,
+    `        }`,
+    ``,
+    `        string backupPath = hwdevPath + ".bak";`,
+    `        bool backupCreated = false;`,
+    `        bool mutationStarted = false;`,
+    `        bool isExactOpeningEntry = false;`,
+    `        object loaded = null;`,
+    `        Type prjType = null;`,
+    `        Form hiddenForm = null;`,
+    ``,
+    `        try {`,
+    `            if (createBackup) {`,
+    `                File.Copy(hwdevPath, backupPath, true);`,
+    `                backupCreated = true;`,
+    `                outcome.backupPath = backupPath;`,
+    `            }`,
+    ``,
+    `            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);`,
+    `            AppDomain.CurrentDomain.AssemblyResolve += (s, e) => {`,
+    `                string name = e.Name.Split(',')[0].Trim();`,
+    `                if (!seen.Add(name)) return null;`,
+    `                foreach (var ext in new[] { ".dll", ".exe" }) {`,
+    `                    string p = Path.Combine(installDir, name + ext);`,
+    `                    if (File.Exists(p)) return Assembly.LoadFrom(p);`,
+    `                }`,
+    `                return null;`,
+    `            };`,
+    ``,
+    `            Environment.CurrentDirectory = installDir;`,
+    `            var startupField = typeof(Application).GetField("startupPath", BindingFlags.Static | BindingFlags.NonPublic);`,
+    `            var execField = typeof(Application).GetField("executablePath", BindingFlags.Static | BindingFlags.NonPublic);`,
+    `            if (startupField != null) startupField.SetValue(null, installDir);`,
+    `            if (execField != null) execField.SetValue(null, Path.Combine(installDir, "Scada.Develop.exe"));`,
+    ``,
+    `            var asmCommon = Assembly.LoadFrom(Path.Combine(installDir, "Scada.Common.dll"));`,
+    `            var asmPrj = Assembly.LoadFrom(Path.Combine(installDir, "Scada.Project.dll"));`,
+    `            var asmDev = Assembly.LoadFrom(Path.Combine(installDir, "Scada.Develop.exe"));`,
+    ``,
+    `            var hwCommon = asmCommon.GetType("Scada.Common.HwCommon");`,
+    `            hwCommon.GetMethod("Init", BindingFlags.Public | BindingFlags.Static).Invoke(null, null);`,
+    `            var chField = hwCommon.GetField("ChangedName", BindingFlags.Public | BindingFlags.Static);`,
+    `            if (chField != null && chField.GetValue(null) == null) {`,
+    `                chField.SetValue(null, Activator.CreateInstance(chField.FieldType));`,
+    `            }`,
+    ``,
+    `            var devCommon = asmDev.GetType("Scada.Develop.DevCommon");`,
+    `            var mfType = devCommon.GetField("MainForm", BindingFlags.Public | BindingFlags.Static).FieldType;`,
+    `            var mf = Activator.CreateInstance(mfType);`,
+    `            hiddenForm = mf as Form;`,
+    `            var ppField = mfType.GetField("panelProject", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);`,
+    `            if (ppField != null) ppField.SetValue(mf, Activator.CreateInstance(ppField.FieldType));`,
+    `            var poField = mfType.GetField("panelOutput", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);`,
+    `            if (poField != null && poField.FieldType.GetConstructor(Type.EmptyTypes) != null) {`,
+    `                poField.SetValue(mf, Activator.CreateInstance(poField.FieldType));`,
+    `            }`,
+    `            devCommon.GetField("MainForm", BindingFlags.Public | BindingFlags.Static).SetValue(null, mf);`,
+    ``,
+    `            prjType = asmPrj.GetType("Scada.Project.Project");`,
+    `            var prj = Activator.CreateInstance(prjType);`,
+    `            loaded = prjType.GetMethod("Load").Invoke(prj, new object[] { hwdevPath, false, hiddenForm, false, null });`,
+    `            if (loaded == null) {`,
+    `                throw new InvalidOperationException("HWDEV_LOAD_FAILED: Scada.Project.Project.Load returned null (file may be password-protected or corrupted).");`,
+    `            }`,
+    `            devCommon.GetField("Project", BindingFlags.Public | BindingFlags.Static).SetValue(null, loaded);`,
+    `            outcome.projectName = Convert.ToString(prjType.GetProperty("Name").GetValue(loaded, null) ?? "");`,
+    ``,
+    `            var hwPathObj = hwCommon.GetField("Path", BindingFlags.Public | BindingFlags.Static).GetValue(null);`,
+    `            string openingFile = hwPathObj != null ? Convert.ToString(hwPathObj.GetType().GetProperty("OpeningFile").GetValue(hwPathObj, null) ?? "") : "";`,
+    `            outcome.activeGuiWarning = DetectActiveGuiConflict(openingFile, hwdevPath, outcome.projectName, out isExactOpeningEntry);`,
+    ``,
+    `            var exportModelType = asmDev.GetType("Scada.Develop.Export.HwExportModel");`,
+    `            var model = exportModelType.GetMethod("GetModel", new[] { typeof(string) }).Invoke(null, new object[] { hwExportPath });`,
+    `            if (model == null) {`,
+    `                throw new InvalidOperationException("HWEXPORT_PARSE_FAILED: HwExportModel.GetModel returned null.");`,
+    `            }`,
+    ``,
+    `            var winType = asmPrj.GetType("Scada.Project.Data.Model.window");`,
+    `            var loadWins = prjType.GetMethod("LoadModelItems", Type.EmptyTypes).MakeGenericMethod(winType);`,
+    `            var delWin = prjType.GetMethod("DeleteModel").MakeGenericMethod(winType);`,
+    `            var getWinDoc = prjType.GetMethod("GetWindowDocument");`,
+    `            var sqlType = asmPrj.GetType("Scada.Project.Data.ProjectSQLite");`,
+    `            var queryTable = sqlType.GetMethod("QueryTable", new[] { typeof(string) });`,
+    `            Func<string, DataTable> Q = (sql) => (DataTable)queryTable.Invoke(null, new object[] { sql });`,
+    ``,
+    `            var preVgNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);`,
+    `            foreach (DataRow r in Q("SELECT Name FROM variableGroup").Rows) preVgNames.Add(Convert.ToString(r["Name"] ?? ""));`,
+    `            var preTaskNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);`,
+    `            foreach (DataRow r in Q("SELECT Name FROM task").Rows) preTaskNames.Add(Convert.ToString(r["Name"] ?? ""));`,
+    `            int preEventCount = Convert.ToInt32(Q("SELECT count(*) FROM eventItem").Rows[0][0]);`,
+    ``,
+    `            mutationStarted = true;`,
+    ``,
+    `            if (deletePrefixes != null && deletePrefixes.Length > 0) {`,
+    `                var existingWins = (IList)loadWins.Invoke(loaded, null);`,
+    `                foreach (var w in existingWins) {`,
+    `                    int hwSys = Convert.ToInt32(winType.GetProperty("HwSys").GetValue(w, null));`,
+    `                    if (hwSys != 0) continue;`,
+    `                    int id = Convert.ToInt32(winType.GetProperty("ID").GetValue(w, null));`,
+    `                    int wid = Convert.ToInt32(winType.GetProperty("WindowID").GetValue(w, null));`,
+    `                    string wName = Convert.ToString(winType.GetProperty("Name").GetValue(w, null) ?? "");`,
+    `                    string label = wid + ":" + wName;`,
+    `                    bool shouldDelete = false;`,
+    `                    foreach (var rawP in deletePrefixes) {`,
+    `                        string p = (rawP ?? "").Trim();`,
+    `                        if (p.Length == 0) continue;`,
+    `                        if (wid == 1) {`,
+    `                            if (p.StartsWith("1:", StringComparison.OrdinalIgnoreCase) || string.Equals(p, wName, StringComparison.OrdinalIgnoreCase)) {`,
+    `                                shouldDelete = true; break;`,
+    `                            }`,
+    `                            continue;`,
+    `                        }`,
+    `                        if (label.StartsWith(p, StringComparison.OrdinalIgnoreCase) || wName.StartsWith(p, StringComparison.OrdinalIgnoreCase)) {`,
+    `                            shouldDelete = true; break;`,
+    `                        }`,
+    `                    }`,
+    `                    if (shouldDelete) {`,
+    `                        bool delOk = (bool)delWin.Invoke(loaded, new object[] { id, true });`,
+    `                        if (delOk) outcome.deletedWindows.Add(label);`,
+    `                    }`,
+    `                }`,
+    `            }`,
+    ``,
+    `            var preWinIds = new HashSet<int>();`,
+    `            foreach (var w in (IList)loadWins.Invoke(loaded, null)) {`,
+    `                if (Convert.ToInt32(winType.GetProperty("HwSys").GetValue(w, null)) == 0) {`,
+    `                    preWinIds.Add(Convert.ToInt32(winType.GetProperty("ID").GetValue(w, null)));`,
+    `                }`,
+    `            }`,
+    ``,
+    `            var vgProp = exportModelType.GetProperty("VariableGroups").GetValue(model, null);`,
+    `            if (vgProp != null && Convert.ToBoolean(vgProp.GetType().GetProperty("HasValue").GetValue(vgProp, null))) {`,
+    `                asmDev.GetType("Scada.Develop.Export.HwExportVariableGroup").GetMethod("AddModel").Invoke(null, new object[] { vgProp });`,
+    `            }`,
+    ``,
+    `            var winProp = exportModelType.GetProperty("Windows").GetValue(model, null);`,
+    `            if (winProp != null && Convert.ToBoolean(winProp.GetType().GetProperty("HasValue").GetValue(winProp, null))) {`,
+    `                var winOk = Convert.ToBoolean(asmDev.GetType("Scada.Develop.Export.ImportExportWindow").GetMethod("AddModel").Invoke(null, new object[] { winProp }));`,
+    `                if (!winOk) {`,
+    `                    throw new InvalidOperationException("HWEXPORT_WINDOW_IMPORT_FAILED: ImportExportWindow.AddModel returned false.");`,
+    `                }`,
+    `            }`,
+    ``,
+    `            var taskProp = exportModelType.GetProperty("Tasks").GetValue(model, null);`,
+    `            var evtProp = exportModelType.GetProperty("Events").GetValue(model, null);`,
+    `            bool hasTasks = taskProp != null && Convert.ToBoolean(taskProp.GetType().GetProperty("HasValue").GetValue(taskProp, null));`,
+    `            bool hasEvents = evtProp != null && Convert.ToBoolean(evtProp.GetType().GetProperty("HasValue").GetValue(evtProp, null));`,
+    `            if (hasTasks) {`,
+    `                object[] tArgs = new object[] { taskProp, evtProp, false, "" };`,
+    `                asmDev.GetType("Scada.Develop.Export.HwExportTask").GetMethod("AddModel").Invoke(null, tArgs);`,
+    `            }`,
+    `            if (hasEvents) {`,
+    `                int midEventCount = Convert.ToInt32(Q("SELECT count(*) FROM eventItem").Rows[0][0]);`,
+    `                if (midEventCount == preEventCount) {`,
+    `                    object[] eArgs = new object[] { evtProp, "" };`,
+    `                    asmDev.GetType("Scada.Develop.Export.HwExportEvent").GetMethod("AddModel").Invoke(null, eArgs);`,
+    `                }`,
+    `            }`,
+    ``,
+    `            foreach (var w in (IList)loadWins.Invoke(loaded, null)) {`,
+    `                if (Convert.ToInt32(winType.GetProperty("HwSys").GetValue(w, null)) != 0) continue;`,
+    `                int id = Convert.ToInt32(winType.GetProperty("ID").GetValue(w, null));`,
+    `                int wid = Convert.ToInt32(winType.GetProperty("WindowID").GetValue(w, null));`,
+    `                string wName = Convert.ToString(winType.GetProperty("Name").GetValue(w, null) ?? "");`,
+    `                outcome.allUserWindows.Add(new HwHeadlessWindowItem { id = id, windowId = wid, name = wName, docBytes = 0 });`,
+    `                if (!preWinIds.Contains(id)) {`,
+    `                    string docXml = Convert.ToString(getWinDoc.Invoke(loaded, new object[] { id, true }) ?? "");`,
+    `                    outcome.importedWindows.Add(new HwHeadlessWindowItem { id = id, windowId = wid, name = wName, docBytes = docXml.Length });`,
+    `                }`,
+    `            }`,
+    ``,
+    `            foreach (DataRow r in Q("SELECT Name FROM variableGroup").Rows) {`,
+    `                string n = Convert.ToString(r["Name"] ?? "");`,
+    `                if (!preVgNames.Contains(n)) outcome.importedVariableGroups.Add(n);`,
+    `            }`,
+    `            foreach (DataRow r in Q("SELECT Name FROM task").Rows) {`,
+    `                string n = Convert.ToString(r["Name"] ?? "");`,
+    `                if (!preTaskNames.Contains(n)) outcome.importedTasks.Add(n);`,
+    `            }`,
+    `            int postEventCount = Convert.ToInt32(Q("SELECT count(*) FROM eventItem").Rows[0][0]);`,
+    `            outcome.importedEventsCount = Math.Max(0, postEventCount - preEventCount);`,
+    `            outcome.ok = true;`,
+    `        } catch (Exception ex) {`,
+    `            Exception root = ex is TargetInvocationException && ex.InnerException != null ? ex.InnerException : ex;`,
+    `            outcome.ok = false;`,
+    `            outcome.error = root.GetType().Name + ": " + root.Message;`,
+    `            ClearSqlitePools(installDir);`,
+    `            if (mutationStarted && backupCreated && File.Exists(backupPath)) {`,
+    `                try {`,
+    `                    GC.Collect();`,
+    `                    GC.WaitForPendingFinalizers();`,
+    `                    File.Copy(backupPath, hwdevPath, true);`,
+    `                } catch {}`,
+    `            }`,
+    `        } finally {`,
+    `            if (loaded != null && prjType != null && !isExactOpeningEntry) {`,
+    `                try { prjType.GetMethod("RemoveFromOpeningProject").Invoke(loaded, new object[] { hwdevPath }); } catch {}`,
+    `            }`,
+    `            ClearSqlitePools(installDir);`,
+    `            if (hiddenForm != null) {`,
+    `                try { hiddenForm.Dispose(); } catch {}`,
+    `            }`,
+    `        }`,
+    `        return outcome;`,
+    `    }`,
+    `}`,
+    `'@ -ReferencedAssemblies System.Windows.Forms, System.Data, System.Xml`,
+    ``,
+    `$res = [HwHeadlessDeployer]::Run($cfg.installDir, $cfg.hwdevPath, $cfg.hwExportPath, $deletePrefixes, [bool]$cfg.createBackup)`,
+    `Write-Output ("__HW_HEADLESS_RESULT__:" + ($res | ConvertTo-Json -Depth 6 -Compress))`,
+    `if (-not $res.ok) { exit 1 }`,
+  ].join('\n');
+}
+
+export async function deployHwExportHeadless(
+  options: HeadlessHwExportDeployOptions
+): Promise<HeadlessHwExportDeployResult> {
+  const check = canRunHeadlessDotNetDeploy(options.installDir);
+  if (!check.available) {
+    return {
+      ok: false,
+      projectName: '',
+      hwdevPath: options.hwdevPath,
+      hwExportPath: options.hwExportPath,
+      installDir: check.installDir,
+      backupPath: null,
+      deletedWindows: [],
+      importedWindows: [],
+      allUserWindows: [],
+      importedVariableGroups: [],
+      importedTasks: [],
+      importedEventsCount: 0,
+      activeGuiWarning: null,
+      error: check.reason ?? 'HEADLESS_DOTNET_UNAVAILABLE',
+    };
+  }
+
+  const psScript = buildHeadlessHwExportDeployScript({
+    ...options,
+    installDir: check.installDir,
+  });
+  const tmpPs1Path = path.join(
+    os.tmpdir(),
+    `haiwell_headless_deploy_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.ps1`
+  );
+
+  const parseMarker = (text: string): HeadlessHwExportDeployResult | null => {
+    const marker = '__HW_HEADLESS_RESULT__:';
+    const idx = text.lastIndexOf(marker);
+    if (idx < 0) return null;
+    const line = text.slice(idx + marker.length).split(/\r?\n/)[0]?.trim();
+    if (!line) return null;
+    try {
+      const parsed = JSON.parse(line) as Partial<HeadlessHwExportDeployResult>;
+      return {
+        ok: Boolean(parsed.ok),
+        projectName: String(parsed.projectName ?? ''),
+        hwdevPath: String(parsed.hwdevPath ?? options.hwdevPath),
+        hwExportPath: String(parsed.hwExportPath ?? options.hwExportPath),
+        installDir: String(parsed.installDir ?? check.installDir),
+        backupPath: parsed.backupPath ? String(parsed.backupPath) : null,
+        deletedWindows: Array.isArray(parsed.deletedWindows) ? parsed.deletedWindows.map(String) : [],
+        importedWindows: Array.isArray(parsed.importedWindows)
+          ? parsed.importedWindows.map((w) => ({
+              id: Number(w.id),
+              windowId: Number(w.windowId),
+              name: String(w.name ?? ''),
+              docBytes: Number(w.docBytes ?? 0),
+            }))
+          : [],
+        allUserWindows: Array.isArray(parsed.allUserWindows)
+          ? parsed.allUserWindows.map((w) => ({
+              id: Number(w.id),
+              windowId: Number(w.windowId),
+              name: String(w.name ?? ''),
+            }))
+          : [],
+        importedVariableGroups: Array.isArray(parsed.importedVariableGroups)
+          ? parsed.importedVariableGroups.map(String)
+          : [],
+        importedTasks: Array.isArray(parsed.importedTasks) ? parsed.importedTasks.map(String) : [],
+        importedEventsCount: Number(parsed.importedEventsCount ?? 0),
+        activeGuiWarning: parsed.activeGuiWarning ? String(parsed.activeGuiWarning) : null,
+        error: parsed.error ? String(parsed.error) : null,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  try {
+    fs.writeFileSync(tmpPs1Path, psScript, 'utf8');
+    const { stdout } = await execFileAsync(
+      check.powershell32Path,
+      ['-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', tmpPs1Path],
+      { timeout: options.timeoutMs ?? 45_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }
+    );
+    const parsed = parseMarker(stdout);
+    if (parsed) return parsed;
+    return {
+      ok: false,
+      projectName: '',
+      hwdevPath: options.hwdevPath,
+      hwExportPath: options.hwExportPath,
+      installDir: check.installDir,
+      backupPath: null,
+      deletedWindows: [],
+      importedWindows: [],
+      allUserWindows: [],
+      importedVariableGroups: [],
+      importedTasks: [],
+      importedEventsCount: 0,
+      activeGuiWarning: null,
+      error: `HEADLESS_OUTPUT_PARSE_ERROR: ${stdout.trim().slice(0, 400)}`,
+    };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+    const parsed = parseMarker(e.stdout ?? '');
+    if (parsed) return parsed;
+    const detail = (e.stderr || e.stdout || e.message || 'Unknown headless deployment failure').trim();
+    return {
+      ok: false,
+      projectName: '',
+      hwdevPath: options.hwdevPath,
+      hwExportPath: options.hwExportPath,
+      installDir: check.installDir,
+      backupPath: null,
+      deletedWindows: [],
+      importedWindows: [],
+      allUserWindows: [],
+      importedVariableGroups: [],
+      importedTasks: [],
+      importedEventsCount: 0,
+      activeGuiWarning: null,
+      error: detail,
+    };
+  } finally {
+    try {
+      fs.rmSync(tmpPs1Path, { force: true });
+    } catch {
+      // ignore temp script cleanup failure
+    }
+  }
+}
+
 export interface DeployHwExportOptions {
   xml: string;
   fileName: string;
   hwdevPath: string;
   outputDir: string;
   inboxDir?: string;
+  installDir?: string;
   deleteWindowPrefixes?: string[];
+  deployMode?: 'auto' | 'headless' | 'watcher_or_bat';
+  createBackup?: boolean;
   dryRun?: boolean;
   waitTimeoutMs?: number;
 }
@@ -1071,31 +1632,101 @@ export interface DeployHwExportOptions {
 export async function deployHwExportToDesktop(options: DeployHwExportOptions) {
   const hwExportPath = path.join(options.outputDir, options.fileName);
   const inboxDir = options.inboxDir ?? path.join(options.outputDir, 'inbox');
+  const deployMode = options.deployMode ?? 'auto';
+  const headlessCheck = canRunHeadlessDotNetDeploy(options.installDir);
+  const headlessScript = buildHeadlessHwExportDeployScript({
+    hwdevPath: options.hwdevPath,
+    hwExportPath,
+    installDir: options.installDir,
+    deleteWindowPrefixes: options.deleteWindowPrefixes,
+    createBackup: options.createBackup,
+  });
   const deployScript = buildHwExportImportScript({
     hwdevPath: options.hwdevPath,
     hwExportPath,
     deleteWindowPrefixes: options.deleteWindowPrefixes,
+    haiwellExePath: path.join(headlessCheck.installDir, 'Scada.Develop.exe'),
   });
   const watcherScript = buildAutoSyncWatcherScript({
     inboxDir,
     defaultHwdevPath: options.hwdevPath,
+    haiwellExePath: path.join(headlessCheck.installDir, 'Scada.Develop.exe'),
   });
 
   if (options.dryRun || process.platform !== 'win32') {
     return {
       deployed: false,
       mode: 'DRY_RUN' as const,
+      preferredLiveMode: headlessCheck.available ? ('HEADLESS_DOTNET_DIRECT' as const) : ('WATCHER_OR_BAT' as const),
+      headlessAvailable: headlessCheck.available,
       hwExportPath,
       hwExportBytes: Buffer.byteLength(options.xml, 'utf8'),
+      headlessScript,
       deployScript,
       watcherScript,
     };
   }
 
   fs.mkdirSync(options.outputDir, { recursive: true });
-  fs.mkdirSync(inboxDir, { recursive: true });
   fs.writeFileSync(hwExportPath, options.xml, 'utf8');
 
+  // Primary zero-touch path: direct headless .hwExport -> .hwdev import via Haiwell's
+  // official 32-bit .NET APIs (zero GUI, zero UIA, zero mouse/keyboard, zero UAC, zero Python).
+  if (deployMode !== 'watcher_or_bat') {
+    if (headlessCheck.available) {
+      const headlessResult = await deployHwExportHeadless({
+        hwdevPath: options.hwdevPath,
+        hwExportPath,
+        installDir: headlessCheck.installDir,
+        deleteWindowPrefixes: options.deleteWindowPrefixes,
+        createBackup: options.createBackup,
+        timeoutMs: Math.max(options.waitTimeoutMs ?? 45_000, 30_000),
+      });
+      if (headlessResult.ok) {
+        return {
+          deployed: true,
+          mode: 'HEADLESS_DOTNET_DIRECT' as const,
+          hwdevPath: options.hwdevPath,
+          hwExportPath,
+          hwExportBytes: Buffer.byteLength(options.xml, 'utf8'),
+          backupPath: headlessResult.backupPath,
+          projectName: headlessResult.projectName,
+          installDir: headlessResult.installDir,
+          deletedWindows: headlessResult.deletedWindows,
+          importedWindows: headlessResult.importedWindows,
+          allUserWindows: headlessResult.allUserWindows,
+          importedVariableGroups: headlessResult.importedVariableGroups,
+          importedTasks: headlessResult.importedTasks,
+          importedEventsCount: headlessResult.importedEventsCount,
+          activeGuiWarning: headlessResult.activeGuiWarning,
+        };
+      }
+      return {
+        deployed: false,
+        mode: 'HEADLESS_FAILED' as const,
+        hwdevPath: options.hwdevPath,
+        hwExportPath,
+        hwExportBytes: Buffer.byteLength(options.xml, 'utf8'),
+        backupPath: headlessResult.backupPath,
+        activeGuiWarning: headlessResult.activeGuiWarning,
+        error: headlessResult.error ?? 'Unknown headless .hwdev import failure',
+      };
+    }
+
+    if (deployMode === 'headless') {
+      return {
+        deployed: false,
+        mode: 'HEADLESS_FAILED' as const,
+        hwdevPath: options.hwdevPath,
+        hwExportPath,
+        hwExportBytes: Buffer.byteLength(options.xml, 'utf8'),
+        error: headlessCheck.reason ?? 'Haiwell Cloud Scada 32-bit assemblies not found locally.',
+      };
+    }
+  }
+
+  // Fallback legacy path (only when deployMode === 'watcher_or_bat' or HaiwellScada3 is not installed locally)
+  fs.mkdirSync(inboxDir, { recursive: true });
   const heartbeatPath = path.join(inboxDir, 'watcher.heartbeat.json');
   const resultPath = path.join(inboxDir, 'last_result.json');
   let watcherFresh = false;

@@ -689,8 +689,11 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       props: { nativeSymbol: 'HWClock4' },
     });
 
+    const hasBottomNav = Boolean(input.navTabs && input.navTabs.length > 0);
+    const panelH = hasBottomNav ? 444 : 500;
+
     // Left Card: Line Control & PLC Status
-    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: 'LINE CONTROL & PLC STATUS', x: 14, y: 84, width: 264, height: 444 });
+    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: 'LINE CONTROL & PLC STATUS', x: 14, y: 84, width: 264, height: panelH });
     (input.commands ?? []).slice(0, 3).forEach((cmd, i) => {
       widgets.push({
         id: `${key}_cmd_${i}`,
@@ -700,7 +703,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         writeEnabled: true,
         visualRole: cmd.role ?? 'DEFAULT',
         x: 24 + i * 84,
-        y: 122,
+        y: hasBottomNav ? 122 : 128,
         width: 78,
         height: 86,
       });
@@ -713,7 +716,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: ci.tagName,
         visualRole: ci.role ?? 'PRIMARY_ACTION',
         x: 26,
-        y: 228 + i * 50,
+        y: (hasBottomNav ? 228 : 242) + i * (hasBottomNav ? 50 : 56),
         width: 240,
         height: 38,
       });
@@ -726,7 +729,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: input.ioIndicators[0].tagName,
         visualRole: input.ioIndicators[0].role ?? 'PRIMARY_ACTION',
         x: 26,
-        y: 386,
+        y: hasBottomNav ? 386 : 412,
         width: 240,
         height: 38,
       });
@@ -739,26 +742,29 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: input.stationCounter.tagName,
         unit: input.stationCounter.unit ?? '',
         x: 26,
-        y: 436,
+        y: hasBottomNav ? 436 : 470,
         width: 240,
-        height: 76,
+        height: hasBottomNav ? 76 : 92,
       });
     }
 
     // Center Card: 5 Large Touch Navigation Cards
-    widgets.push({ id: `${key}_p_center`, type: 'GROUP_PANEL', label: 'SYSTEM NAVIGATION', x: 290, y: 84, width: 444, height: 444 });
+    widgets.push({ id: `${key}_p_center`, type: 'GROUP_PANEL', label: 'SYSTEM NAVIGATION', x: 290, y: 84, width: 444, height: panelH });
     (input.hubNavCards ?? []).slice(0, 5).forEach((card, i) => {
       const isFifth = i === 4;
       const col = i % 2;
       const row = Math.floor(i / 2);
+      const cardH = hasBottomNav ? 110 : 126;
+      const rowStep = hasBottomNav ? 126 : 146;
+      const startY = hasBottomNav ? 124 : 132;
       widgets.push({
         id: `${key}_hub_nav_${i}`,
         type: 'NAV_BAR',
         label: card.label,
         x: isFifth ? 306 : 306 + col * 214,
-        y: isFifth ? 376 : 124 + row * 126,
+        y: isFifth ? startY + 2 * rowStep : startY + row * rowStep,
         width: isFifth ? 412 : 198,
-        height: 110,
+        height: cardH,
         props: {
           targetScreenName: card.targetScreenName,
           ...(card.targetWindowId !== undefined ? { targetWindowId: card.targetWindowId } : {}),
@@ -768,7 +774,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
     });
 
     // Right Card: Live Production Summary
-    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: 'LIVE PRODUCTION COUNTERS', x: 746, y: 84, width: 264, height: 444 });
+    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: 'LIVE PRODUCTION COUNTERS', x: 746, y: 84, width: 264, height: panelH });
     (input.heroKpis ?? []).slice(0, 4).forEach((kpi, i) => {
       widgets.push({
         id: `${key}_kpi_${i}`,
@@ -779,13 +785,13 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         precision: kpi.precision,
         visualRole: kpi.role ?? 'KPI_HERO',
         x: 762,
-        y: 122 + i * 96,
+        y: (hasBottomNav ? 122 : 128) + i * (hasBottomNav ? 96 : 110),
         width: 232,
-        height: 82,
+        height: hasBottomNav ? 82 : 94,
       });
     });
   } else if (input.template === 'STATION_ALARMS_SIMPLE') {
-    widgets.push({ id: `${key}_p_faults`, type: 'GROUP_PANEL', label: 'ACTIVE FAULT MONITORS', x: 14, y: 62, width: 486, height: 466 });
+    widgets.push({ id: `${key}_p_faults`, type: 'GROUP_PANEL', label: 'ACTIVE FAULTS', x: 14, y: 62, width: 486, height: 466 });
     (input.inputs ?? []).slice(0, 6).forEach((flt, i) => {
       widgets.push({
         id: `${key}_flt_${i}`,
@@ -800,7 +806,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
 
-    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: 'ALARM STATUS & SQLITE HISTORY', x: 512, y: 62, width: 498, height: 466 });
+    const readouts = (input.leftReadouts ?? []).slice(0, 4);
+    const compactMode = readouts.length <= 2;
+    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: 'ALARM CONTROL', x: 512, y: 62, width: 498, height: 466 });
     if (input.stationCounter) {
       widgets.push({
         id: `${key}_alm_total`,
@@ -808,10 +816,10 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         label: input.stationCounter.label,
         tagName: input.stationCounter.tagName,
         unit: input.stationCounter.unit ?? '',
-        x: 528,
-        y: 102,
-        width: 214,
-        height: 96,
+        x: 532,
+        y: compactMode ? 114 : 102,
+        width: 226,
+        height: compactMode ? 110 : 96,
       });
     }
     if (input.outputs?.[0]) {
@@ -822,49 +830,68 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: input.outputs[0].tagName,
         writeEnabled: true,
         visualRole: input.outputs[0].role ?? 'WARNING_ACTION',
-        x: 766,
-        y: 102,
-        width: 120,
-        height: 96,
+        x: 790,
+        y: compactMode ? 114 : 102,
+        width: 136,
+        height: compactMode ? 110 : 96,
       });
     }
-    if (input.leftReadouts?.[0]) {
-      widgets.push({
-        id: `${key}_last_msg`,
-        type: 'NUMERIC_DISPLAY',
-        label: input.leftReadouts[0].label,
-        tagName: input.leftReadouts[0].tagName,
-        x: 528,
-        y: 212,
-        width: 466,
-        height: 64,
+    if (compactMode) {
+      readouts.forEach((rd, i) => {
+        widgets.push({
+          id: i === 0 ? `${key}_last_msg` : `${key}_hist_${i - 1}`,
+          type: 'NUMERIC_DISPLAY',
+          label: rd.label,
+          tagName: rd.tagName,
+          x: 532,
+          y: 256 + i * 126,
+          width: 458,
+          height: 98,
+        });
+      });
+    } else {
+      if (readouts[0]) {
+        widgets.push({
+          id: `${key}_last_msg`,
+          type: 'NUMERIC_DISPLAY',
+          label: readouts[0].label,
+          tagName: readouts[0].tagName,
+          x: 528,
+          y: 212,
+          width: 466,
+          height: 64,
+        });
+      }
+      readouts.slice(1, 4).forEach((hr, i) => {
+        widgets.push({
+          id: `${key}_hist_${i}`,
+          type: 'NUMERIC_DISPLAY',
+          label: hr.label,
+          tagName: hr.tagName,
+          x: 528,
+          y: 288 + i * 76,
+          width: 466,
+          height: 64,
+        });
       });
     }
-    (input.leftReadouts ?? []).slice(1, 4).forEach((hr, i) => {
-      widgets.push({
-        id: `${key}_hist_${i}`,
-        type: 'NUMERIC_DISPLAY',
-        label: hr.label,
-        tagName: hr.tagName,
-        x: 528,
-        y: 288 + i * 76,
-        width: 466,
-        height: 64,
-      });
-    });
   } else if (input.template === 'EDGE_LOGGER_CONSOLE') {
-    widgets.push({ id: `${key}_p_log`, type: 'GROUP_PANEL', label: 'CLOUD RUN EDGE LOGGER', x: 14, y: 62, width: 486, height: 466 });
+    const qKpis = (input.heroKpis ?? []).slice(0, 3);
+    const lReads = (input.leftReadouts ?? []).slice(0, 2);
+    const simpleLeft = qKpis.length <= 2 && lReads.length <= 1;
+
+    widgets.push({ id: `${key}_p_log`, type: 'GROUP_PANEL', label: 'CLOUD LOGGER', x: 14, y: 62, width: 486, height: 466 });
     if (input.runIdTagName) {
       widgets.push({
         id: `${key}_run_id`,
         type: 'NUMERIC_INPUT',
-        label: 'ACTIVE RUN ID (EDITABLE)',
+        label: simpleLeft ? 'RUN ID' : 'ACTIVE RUN ID (EDITABLE)',
         tagName: input.runIdTagName,
         writeEnabled: true,
         x: 30,
-        y: 102,
+        y: simpleLeft ? 112 : 102,
         width: 310,
-        height: 68,
+        height: simpleLeft ? 80 : 68,
       });
     }
     if (input.outputs?.[0]) {
@@ -876,7 +903,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         writeEnabled: true,
         visualRole: input.outputs[0].role ?? 'PRIMARY_ACTION',
         x: 358,
-        y: 100,
+        y: simpleLeft ? 108 : 100,
         width: 124,
         height: 92,
       });
@@ -889,55 +916,106 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: input.commIndicators[0].tagName,
         visualRole: input.commIndicators[0].role ?? 'PRIMARY_ACTION',
         x: 30,
-        y: 184,
-        width: 310,
-        height: 38,
+        y: simpleLeft ? 216 : 184,
+        width: simpleLeft ? 452 : 310,
+        height: 40,
       });
     }
-    (input.heroKpis ?? []).slice(0, 3).forEach((q, i) => {
-      widgets.push({
-        id: `${key}_q_${i}`,
-        type: 'NUMERIC_DISPLAY',
-        label: q.label,
-        tagName: q.tagName,
-        unit: q.unit ?? 'rows',
-        visualRole: q.role ?? 'KPI_HERO',
-        x: 30 + i * 154,
-        y: 236,
-        width: 146,
-        height: 76,
+    if (simpleLeft) {
+      const qW = qKpis.length === 2 ? 218 : 452;
+      qKpis.forEach((q, i) => {
+        widgets.push({
+          id: `${key}_q_${i}`,
+          type: 'NUMERIC_DISPLAY',
+          label: q.label,
+          tagName: q.tagName,
+          unit: q.unit ?? 'rows',
+          visualRole: q.role ?? 'KPI_HERO',
+          x: 30 + i * (qW + 16),
+          y: 280,
+          width: qW,
+          height: 94,
+        });
       });
-    });
-    (input.leftReadouts ?? []).slice(0, 2).forEach((lr, i) => {
-      widgets.push({
-        id: `${key}_log_msg_${i}`,
-        type: 'NUMERIC_DISPLAY',
-        label: lr.label,
-        tagName: lr.tagName,
-        x: 30,
-        y: 326 + i * 86,
-        width: 454,
-        height: 72,
+      if (lReads[0]) {
+        widgets.push({
+          id: `${key}_log_msg_0`,
+          type: 'NUMERIC_DISPLAY',
+          label: lReads[0].label,
+          tagName: lReads[0].tagName,
+          x: 30,
+          y: 400,
+          width: 452,
+          height: 96,
+        });
+      }
+    } else {
+      qKpis.forEach((q, i) => {
+        widgets.push({
+          id: `${key}_q_${i}`,
+          type: 'NUMERIC_DISPLAY',
+          label: q.label,
+          tagName: q.tagName,
+          unit: q.unit ?? 'rows',
+          visualRole: q.role ?? 'KPI_HERO',
+          x: 30 + i * 154,
+          y: 236,
+          width: 146,
+          height: 76,
+        });
       });
-    });
+      lReads.forEach((lr, i) => {
+        widgets.push({
+          id: `${key}_log_msg_${i}`,
+          type: 'NUMERIC_DISPLAY',
+          label: lr.label,
+          tagName: lr.tagName,
+          x: 30,
+          y: 326 + i * 86,
+          width: 454,
+          height: 72,
+        });
+      });
+    }
 
-    widgets.push({ id: `${key}_p_tel`, type: 'GROUP_PANEL', label: 'LIVE STATION CYCLE TELEMETRY', x: 512, y: 62, width: 498, height: 466 });
-    (input.sequenceCounters ?? []).slice(0, 9).forEach((sc, i) => {
-      const col = i % 3;
-      const row = Math.floor(i / 3);
-      widgets.push({
-        id: `${key}_tel_${i}`,
-        type: 'NUMERIC_DISPLAY',
-        label: sc.label,
-        tagName: sc.tagName,
-        unit: sc.unit ?? '',
-        precision: sc.precision,
-        x: 528 + col * 158,
-        y: 108 + row * 136,
-        width: 150,
-        height: 110,
+    const seqs = (input.sequenceCounters ?? []).slice(0, 9);
+    const simpleRight = seqs.length <= 4;
+    widgets.push({ id: `${key}_p_tel`, type: 'GROUP_PANEL', label: simpleRight ? 'STATION CYCLE TELEMETRY' : 'LIVE STATION CYCLE TELEMETRY', x: 512, y: 62, width: 498, height: 466 });
+    if (simpleRight) {
+      seqs.forEach((sc, i) => {
+        const col = i % 2;
+        const row = Math.floor(i / 2);
+        widgets.push({
+          id: `${key}_tel_${i}`,
+          type: 'NUMERIC_DISPLAY',
+          label: sc.label,
+          tagName: sc.tagName,
+          unit: sc.unit ?? '',
+          precision: sc.precision,
+          x: 530 + col * 240,
+          y: 118 + row * 198,
+          width: 222,
+          height: 170,
+        });
       });
-    });
+    } else {
+      seqs.forEach((sc, i) => {
+        const col = i % 3;
+        const row = Math.floor(i / 3);
+        widgets.push({
+          id: `${key}_tel_${i}`,
+          type: 'NUMERIC_DISPLAY',
+          label: sc.label,
+          tagName: sc.tagName,
+          unit: sc.unit ?? '',
+          precision: sc.precision,
+          x: 528 + col * 158,
+          y: 108 + row * 136,
+          width: 150,
+          height: 110,
+        });
+      });
+    }
   }
 
   widgets.push(...makeNavBar(key, input.navTabs));
