@@ -107,6 +107,27 @@ test('v2.12.0: Hard-coded HMI templates instantiate with 0 collisions/OOB at 102
   assert.equal(t4.ok, true);
   assert.equal((t4.data as any).validation.valid, true);
 
+  const t5 = await invokeHaiwellTool('haiwell_hmi_template_instantiate', {
+    projectId: 'prj_tpl_v212',
+    template: 'STATION_IO_MONITOR',
+    screenId: 'scr_t5',
+    name: 'StationMonitor',
+    title: 'STATION 1 — DISTRIBUTION',
+    commTagName: 'START',
+    commLabel: 'PLC ONLINE',
+    outputs: [
+      { label: 'START', tagName: 'START', role: 'PRIMARY_ACTION' },
+      { label: 'STOP', tagName: 'STOP', role: 'DANGER_ACTION' },
+      { label: 'RESET', tagName: 'STOP', role: 'WARNING_ACTION' },
+    ],
+    stationCounter: { label: 'TOTAL', tagName: 'CNT', unit: 'pcs' },
+    inputs: Array.from({ length: 8 }, (_, i) => ({ label: `X${i} - SENSOR ${i}`, tagName: 'START' })),
+    outputIndicators: Array.from({ length: 8 }, (_, i) => ({ label: `Y${i} - COIL ${i}`, tagName: 'STOP' })),
+  }, store);
+  assert.equal(t5.ok, true);
+  assert.equal((t5.data as any).validation.valid, true);
+  assert.equal((t5.data as any).validation.collisions.length, 0);
+
   // 3. Export .hwExport and confirm image-backed BitSw/BitLamp + SymbolVariableUsing + 2-state text
   const exp = await invokeHaiwellTool('haiwell_project_export_hwexport', { projectId: 'prj_tpl_v212' }, store);
   assert.equal(exp.ok, true);

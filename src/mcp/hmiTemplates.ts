@@ -4,7 +4,8 @@ export type HmiTemplateKind =
   | 'INDUSTRIAL_LINE_OVERVIEW'
   | 'MULTI_STATION_PROCESS_FLOW'
   | 'ALARMS_TRENDS_DIAGNOSTICS'
-  | 'STATION_IO_DETAIL';
+  | 'STATION_IO_DETAIL'
+  | 'STATION_IO_MONITOR';
 
 export interface TemplateNavTab {
   label: string;
@@ -21,6 +22,7 @@ export interface TemplateCommandItem {
 export interface TemplateIndicatorItem {
   label: string;
   tagName: string;
+  role?: HmiVisualRole;
 }
 
 export interface TemplateReadoutItem {
@@ -74,12 +76,22 @@ export interface InstantiateTemplateInput {
   trendTagName?: string;
   runIdTagName?: string;
   sequenceCounters?: TemplateReadoutItem[];
-  // STATION_IO_DETAIL
+  // STATION_IO_DETAIL & STATION_IO_MONITOR
   inputs?: TemplateIndicatorItem[];
   outputs?: TemplateCommandItem[];
+  outputIndicators?: TemplateIndicatorItem[];
+  commTagName?: string;
+  commLabel?: string;
+  stationCounter?: TemplateReadoutItem;
 }
 
-function makeHeader(key: string, title: string, eStopTag?: string): HmiWidget[] {
+function makeHeader(
+  key: string,
+  title: string,
+  statusTag?: string,
+  statusLabel = 'E-STOP OK',
+  statusRole: 'DANGER_ACTION' | 'PRIMARY_ACTION' | 'STATUS_READONLY' = 'DANGER_ACTION'
+): HmiWidget[] {
   const out: HmiWidget[] = [
     {
       id: `${key}_hdr_bg`,
@@ -92,13 +104,13 @@ function makeHeader(key: string, title: string, eStopTag?: string): HmiWidget[] 
       props: { theme: 'dark' },
     },
   ];
-  if (eStopTag) {
+  if (statusTag) {
     out.push({
       id: `${key}_hdr_estop`,
       type: 'BIT_LAMP',
-      label: 'E-STOP OK',
-      tagName: eStopTag,
-      visualRole: 'DANGER_ACTION',
+      label: statusLabel,
+      tagName: statusTag,
+      visualRole: statusRole,
       x: 706,
       y: 13,
       width: 142,
@@ -175,8 +187,11 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
   const targetH = input.height ?? 600;
   const key = input.screenId.replace(/[^a-zA-Z0-9_]/g, '_');
   const now = new Date().toISOString();
+  const headerTag = input.eStopTag ?? input.commTagName;
+  const headerLabel = input.eStopTag ? 'E-STOP OK' : (input.commLabel ?? 'PLC ONLINE');
+  const headerRole = input.eStopTag ? 'DANGER_ACTION' : 'STATUS_READONLY';
   const widgets: HmiWidget[] = [
-    ...makeHeader(key, input.title, input.eStopTag),
+    ...makeHeader(key, input.title, headerTag, headerLabel, headerRole),
   ];
   const pipes: HmiPipeRoute[] = [];
 
@@ -525,6 +540,65 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         y: 108 + row * 190,
         width: 106,
         height: 110,
+      });
+    });
+  } else if (input.template === 'STATION_IO_MONITOR') {
+    widgets.push({ id: `${key}_p_ctrl`, type: 'GROUP_PANEL', label: 'STATION CONTROL', x: 14, y: 62, width: 176, height: 466 });
+    (input.outputs ?? []).slice(0, 3).forEach((cmd, i) => {
+      widgets.push({
+        id: `${key}_cmd_${i}`,
+        type: 'BIT_BUTTON',
+        label: cmd.label,
+        tagName: cmd.tagName,
+        writeEnabled: true,
+        visualRole: cmd.role ?? 'DEFAULT',
+        x: 50,
+        y: 102 + i * 106,
+        width: 104,
+        height: 96,
+      });
+    });
+    if (input.stationCounter) {
+      widgets.push({
+        id: `${key}_cnt`,
+        type: 'NUMERIC_DISPLAY',
+        label: input.stationCounter.label,
+        tagName: input.stationCounter.tagName,
+        unit: input.stationCounter.unit ?? 'pcs',
+        x: 26,
+        y: 428,
+        width: 152,
+        height: 82,
+      });
+    }
+
+    widgets.push({ id: `${key}_p_in`, type: 'GROUP_PANEL', label: 'DIGITAL INPUTS (SENSORS X0-X7)', x: 202, y: 62, width: 398, height: 466 });
+    (input.inputs ?? []).slice(0, 8).forEach((inp, i) => {
+      widgets.push({
+        id: `${key}_in_${i}`,
+        type: 'BIT_LAMP',
+        label: inp.label,
+        tagName: inp.tagName,
+        visualRole: inp.role ?? 'STATUS_READONLY',
+        x: 216,
+        y: 102 + i * 51,
+        width: 370,
+        height: 40,
+      });
+    });
+
+    widgets.push({ id: `${key}_p_out`, type: 'GROUP_PANEL', label: 'DIGITAL OUTPUTS (COILS Y0-Y7)', x: 612, y: 62, width: 398, height: 466 });
+    (input.outputIndicators ?? []).slice(0, 8).forEach((outp, i) => {
+      widgets.push({
+        id: `${key}_out_ind_${i}`,
+        type: 'BIT_LAMP',
+        label: outp.label,
+        tagName: outp.tagName,
+        visualRole: outp.role ?? 'STATUS_READONLY',
+        x: 626,
+        y: 102 + i * 51,
+        width: 370,
+        height: 40,
       });
     });
   }

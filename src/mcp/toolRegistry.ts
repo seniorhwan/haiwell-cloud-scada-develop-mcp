@@ -3334,7 +3334,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Zero-Pixel-Math Hard-Coded ISA-101 HMI Screen Templates',
     safetyTier: 'design',
     description:
-      'Instantiate a hard-coded, guaranteed zero-overlap ISA-101 HMI screen template (INDUSTRIAL_LINE_OVERVIEW, MULTI_STATION_PROCESS_FLOW, ALARMS_TRENDS_DIAGNOSTICS, STATION_IO_DETAIL) using only semantic tag/title inputs. Eliminates manual x/y/width/height math and validates 0 collisions.',
+      'Instantiate a hard-coded, guaranteed zero-overlap ISA-101 HMI screen template (INDUSTRIAL_LINE_OVERVIEW, MULTI_STATION_PROCESS_FLOW, ALARMS_TRENDS_DIAGNOSTICS, STATION_IO_DETAIL, STATION_IO_MONITOR) using only semantic tag/title inputs. Eliminates manual x/y/width/height math and validates 0 collisions.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       template: z.enum([
@@ -3342,6 +3342,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         'MULTI_STATION_PROCESS_FLOW',
         'ALARMS_TRENDS_DIAGNOSTICS',
         'STATION_IO_DETAIL',
+        'STATION_IO_MONITOR',
       ]),
       screenId: z.string().regex(/^[a-zA-Z0-9_-]{2,64}$/),
       name: z.string().min(2).max(80),
@@ -3491,6 +3492,24 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             role: z.enum(VISUAL_ROLES).optional(),
           })
         )
+        .optional(),
+      outputIndicators: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            role: z.enum(VISUAL_ROLES).optional(),
+          })
+        )
+        .optional(),
+      commTagName: z.string().min(1).optional(),
+      commLabel: z.string().min(1).optional(),
+      stationCounter: z
+        .object({
+          label: z.string().min(1),
+          tagName: z.string().min(1),
+          unit: z.string().optional(),
+        })
         .optional(),
       returnSvg: z.boolean().default(false),
     }),
