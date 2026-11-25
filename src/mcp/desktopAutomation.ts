@@ -1058,11 +1058,20 @@ while True:
 `;
 }
 
+export interface HeadlessTaskUpsert {
+  name: string;
+  script: string;
+  memo?: string;
+}
+
 export interface HeadlessHwExportDeployOptions {
   hwdevPath: string;
   hwExportPath: string;
   installDir?: string;
   deleteWindowPrefixes?: string[];
+  enableAlwaysCollectFullNames?: string[];
+  upsertTasks?: HeadlessTaskUpsert[];
+  replaceExistingVariableGroups?: boolean;
   createBackup?: boolean;
   timeoutMs?: number;
 }
@@ -1086,6 +1095,8 @@ export interface HeadlessHwExportDeployResult {
   allUserWindows: HeadlessDeployedWindowInfo[];
   importedVariableGroups: string[];
   importedTasks: string[];
+  upsertedTasks: string[];
+  alwaysCollectUpdated: string[];
   importedEventsCount: number;
   activeGuiWarning: string | null;
   error?: string | null;
@@ -1147,6 +1158,13 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     hwdevPath: options.hwdevPath,
     hwExportPath: options.hwExportPath,
     deleteWindowPrefixes: (options.deleteWindowPrefixes ?? []).filter((p) => p.trim().length > 0),
+    enableAlwaysCollectFullNames: (options.enableAlwaysCollectFullNames ?? []).filter((p) => p.trim().length > 0),
+    upsertTasks: (options.upsertTasks ?? []).map((t) => ({
+      name: t.name,
+      script: t.script,
+      memo: t.memo ?? '',
+    })),
+    replaceExistingVariableGroups: options.replaceExistingVariableGroups !== false,
     createBackup: options.createBackup !== false,
   };
   const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
@@ -1157,6 +1175,18 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `$cfg = $cfgJson | ConvertFrom-Json`,
     `$deletePrefixes = [string[]]@()`,
     `if ($null -ne $cfg.deleteWindowPrefixes) { $deletePrefixes = [string[]]@($cfg.deleteWindowPrefixes) }`,
+    `$alwaysCollectPatterns = [string[]]@()`,
+    `if ($null -ne $cfg.enableAlwaysCollectFullNames) { $alwaysCollectPatterns = [string[]]@($cfg.enableAlwaysCollectFullNames) }`,
+    `$upsertTaskNames = [string[]]@()`,
+    `$upsertTaskScripts = [string[]]@()`,
+    `$upsertTaskMemos = [string[]]@()`,
+    `if ($null -ne $cfg.upsertTasks) {`,
+    `  foreach ($ut in @($cfg.upsertTasks)) {`,
+    `    $upsertTaskNames += [string]$ut.name`,
+    `    $upsertTaskScripts += [string]$ut.script`,
+    `    $upsertTaskMemos += [string]$ut.memo`,
+    `  }`,
+    `}`,
     ``,
     `Add-Type -TypeDefinition @'`,
     `using System;`,
@@ -1188,6 +1218,8 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `    public List<HwHeadlessWindowItem> allUserWindows { get; set; }`,
     `    public List<string> importedVariableGroups { get; set; }`,
     `    public List<string> importedTasks { get; set; }`,
+    `    public List<string> upsertedTasks { get; set; }`,
+    `    public List<string> alwaysCollectUpdated { get; set; }`,
     `    public int importedEventsCount { get; set; }`,
     `    public string activeGuiWarning { get; set; }`,
     `    public string error { get; set; }`,
@@ -1242,7 +1274,23 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `        return null;`,
     `    }`,
     ``,
-    `    public static HwHeadlessDeployOutcome Run(string installDir, string hwdevPath, string hwExportPath, string[] deletePrefixes, bool createBackup) {`,
+    `    private static bool MatchesAlwaysCollect(string fullName, string[] patterns) {`,
+    `        if (string.IsNullOrEmpty(fullName) || patterns == null) return false;`,
+    `        foreach (var raw in patterns) {`,
+    `            string p = (raw ?? "").Trim();`,
+    `            if (p.Length == 0) continue;`,
+    `            if (p == "*") return true;`,
+    `            if (p.EndsWith("*")) {`,
+    `                string pre = p.Substring(0, p.Length - 1);`,
+    `                if (fullName.StartsWith(pre, StringComparison.OrdinalIgnoreCase)) return true;`,
+    `            } else if (string.Equals(fullName, p, StringComparison.OrdinalIgnoreCase)) {`,
+    `                return true;`,
+    `            }`,
+    `        }`,
+    `        return false;`,
+    `    }`,
+    ``,
+    `    public static HwHeadlessDeployOutcome Run(string installDir, string hwdevPath, string hwExportPath, string[] deletePrefixes, string[] alwaysCollectPatterns, string[] upsertTaskNames, string[] upsertTaskScripts, string[] upsertTaskMemos, bool replaceExistingVariableGroups, bool createBackup) {`,
     `        var outcome = new HwHeadlessDeployOutcome {`,
     `            ok = false,`,
     `            projectName = "",`,
@@ -1255,6 +1303,8 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `            allUserWindows = new List<HwHeadlessWindowItem>(),`,
     `            importedVariableGroups = new List<string>(),`,
     `            importedTasks = new List<string>(),`,
+    `            upsertedTasks = new List<string>(),`,
+    `            alwaysCollectUpdated = new List<string>(),`,
     `            importedEventsCount = 0,`,
     `            activeGuiWarning = null,`,
     `            error = null,`,
@@ -1353,7 +1403,12 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `            var getWinDoc = prjType.GetMethod("GetWindowDocument");`,
     `            var sqlType = asmPrj.GetType("Scada.Project.Data.ProjectSQLite");`,
     `            var queryTable = sqlType.GetMethod("QueryTable", new[] { typeof(string) });`,
+    `            var execSql = sqlType.GetMethod("ExecuteSql", new[] { typeof(string) });`,
+    `            var updateTable = sqlType.GetMethod("UpdateTable");`,
+    `            var insertTable = sqlType.GetMethod("InsertTable");`,
+    `            var getMaxId = sqlType.GetMethod("GetMaxID", new[] { typeof(string), typeof(string) });`,
     `            Func<string, DataTable> Q = (sql) => (DataTable)queryTable.Invoke(null, new object[] { sql });`,
+    `            Func<string, int> E = (sql) => Convert.ToInt32(execSql.Invoke(null, new object[] { sql }));`,
     ``,
     `            var preVgNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);`,
     `            foreach (DataRow r in Q("SELECT Name FROM variableGroup").Rows) preVgNames.Add(Convert.ToString(r["Name"] ?? ""));`,
@@ -1402,6 +1457,27 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     ``,
     `            var vgProp = exportModelType.GetProperty("VariableGroups").GetValue(model, null);`,
     `            if (vgProp != null && Convert.ToBoolean(vgProp.GetType().GetProperty("HasValue").GetValue(vgProp, null))) {`,
+    `                if (replaceExistingVariableGroups) {`,
+    `                    try {`,
+    `                        var expXml = new XmlDocument();`,
+    `                        expXml.Load(hwExportPath);`,
+    `                        var vgNodes = expXml.SelectNodes("//VariableGroups//ListVariableGroup//VariableGroup/Name | //VariableGroups//VariableGroup/Name");`,
+    `                        if (vgNodes != null) {`,
+    `                            foreach (XmlNode vn in vgNodes) {`,
+    `                                string gName = (vn.InnerText ?? "").Trim();`,
+    `                                if (gName.Length == 0) continue;`,
+    `                                string gEsc = gName.Replace("'", "''");`,
+    `                                var gRows = Q("SELECT ID FROM variableGroup WHERE lower(Name) = lower('" + gEsc + "')").Rows;`,
+    `                                foreach (DataRow gr in gRows) {`,
+    `                                    int gid = Convert.ToInt32(gr["ID"]);`,
+    `                                    E("DELETE FROM variable WHERE GroupId = " + gid);`,
+    `                                    E("DELETE FROM variableGroup WHERE ID = " + gid);`,
+    `                                    preVgNames.Remove(gName);`,
+    `                                }`,
+    `                            }`,
+    `                        }`,
+    `                    } catch {}`,
+    `                }`,
     `                asmDev.GetType("Scada.Develop.Export.HwExportVariableGroup").GetMethod("AddModel").Invoke(null, new object[] { vgProp });`,
     `            }`,
     ``,
@@ -1426,6 +1502,67 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `                if (midEventCount == preEventCount) {`,
     `                    object[] eArgs = new object[] { evtProp, "" };`,
     `                    asmDev.GetType("Scada.Develop.Export.HwExportEvent").GetMethod("AddModel").Invoke(null, eArgs);`,
+    `                }`,
+    `            }`,
+    ``,
+    `            if (alwaysCollectPatterns != null && alwaysCollectPatterns.Length > 0) {`,
+    `                foreach (DataRow vr in Q("SELECT ID, FullName, CollectionAlwaysEnabled FROM variable WHERE Name NOT LIKE '$%'").Rows) {`,
+    `                    string fn = Convert.ToString(vr["FullName"] ?? "");`,
+    `                    int alw = vr["CollectionAlwaysEnabled"] == DBNull.Value ? 0 : Convert.ToInt32(vr["CollectionAlwaysEnabled"]);`,
+    `                    if (alw == 1) continue;`,
+    `                    if (MatchesAlwaysCollect(fn, alwaysCollectPatterns)) {`,
+    `                        int vid = Convert.ToInt32(vr["ID"]);`,
+    `                        E("UPDATE variable SET CollectionAlwaysEnabled = 1 WHERE ID = " + vid);`,
+    `                        outcome.alwaysCollectUpdated.Add(fn);`,
+    `                    }`,
+    `                }`,
+    `            }`,
+    ``,
+    `            if (upsertTaskNames != null && upsertTaskNames.Length > 0) {`,
+    `                for (int ti = 0; ti < upsertTaskNames.Length; ti++) {`,
+    `                    string tName = (upsertTaskNames[ti] ?? "").Trim();`,
+    `                    if (tName.Length == 0) continue;`,
+    `                    string tScript = upsertTaskScripts != null && ti < upsertTaskScripts.Length ? (upsertTaskScripts[ti] ?? "") : "";`,
+    `                    string tMemo = upsertTaskMemos != null && ti < upsertTaskMemos.Length ? (upsertTaskMemos[ti] ?? "") : "";`,
+    `                    string tEsc = tName.Replace("'", "''");`,
+    `                    var existingT = Q("SELECT ID, ContentId FROM task WHERE lower(Name) = lower('" + tEsc + "')").Rows;`,
+    `                    if (existingT.Count > 0) {`,
+    `                        int tid = Convert.ToInt32(existingT[0]["ID"]);`,
+    `                        int cid = existingT[0]["ContentId"] == DBNull.Value ? tid : Convert.ToInt32(existingT[0]["ContentId"]);`,
+    `                        var docHt = new Hashtable();`,
+    `                        docHt["Script"] = tScript;`,
+    `                        docHt["CompileScript"] = tScript;`,
+    `                        updateTable.Invoke(null, new object[] { "taskDocument", docHt, "ID=" + cid, null });`,
+    `                        if (tMemo.Length > 0) {`,
+    `                            var tHt = new Hashtable();`,
+    `                            tHt["Memo"] = tMemo;`,
+    `                            updateTable.Invoke(null, new object[] { "task", tHt, "ID=" + tid, null });`,
+    `                        }`,
+    `                        outcome.upsertedTasks.Add(tName + " (updated ID=" + tid + ")");`,
+    `                    } else {`,
+    `                        int newDocId = Convert.ToInt32(getMaxId.Invoke(null, new object[] { "ID", "taskDocument" })) + 1;`,
+    `                        int newTaskId = Convert.ToInt32(getMaxId.Invoke(null, new object[] { "ID", "task" })) + 1;`,
+    `                        var docHt = new Hashtable();`,
+    `                        docHt["ID"] = newDocId;`,
+    `                        docHt["HwSys"] = 0;`,
+    `                        docHt["Config"] = "";`,
+    `                        docHt["Script"] = tScript;`,
+    `                        docHt["CompileScript"] = tScript;`,
+    `                        docHt["VariableId"] = "";`,
+    `                        insertTable.Invoke(null, new object[] { "taskDocument", docHt, null });`,
+    `                        var tHt = new Hashtable();`,
+    `                        tHt["ID"] = newTaskId;`,
+    `                        tHt["HwSys"] = 0;`,
+    `                        tHt["Name"] = tName;`,
+    `                        tHt["Type"] = 0;`,
+    `                        tHt["Memo"] = tMemo;`,
+    `                        tHt["IsAutoCreate"] = 0;`,
+    `                        tHt["OrderId"] = newTaskId;`,
+    `                        tHt["ContentId"] = newDocId;`,
+    `                        tHt["ClassifyId"] = 0;`,
+    `                        insertTable.Invoke(null, new object[] { "task", tHt, null });`,
+    `                        outcome.upsertedTasks.Add(tName + " (inserted ID=" + newTaskId + ")");`,
+    `                    }`,
     `                }`,
     `            }`,
     ``,
@@ -1478,7 +1615,7 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `}`,
     `'@ -ReferencedAssemblies System.Windows.Forms, System.Data, System.Xml`,
     ``,
-    `$res = [HwHeadlessDeployer]::Run($cfg.installDir, $cfg.hwdevPath, $cfg.hwExportPath, $deletePrefixes, [bool]$cfg.createBackup)`,
+    `$res = [HwHeadlessDeployer]::Run($cfg.installDir, $cfg.hwdevPath, $cfg.hwExportPath, $deletePrefixes, $alwaysCollectPatterns, $upsertTaskNames, $upsertTaskScripts, $upsertTaskMemos, [bool]$cfg.replaceExistingVariableGroups, [bool]$cfg.createBackup)`,
     `Write-Output ("__HW_HEADLESS_RESULT__:" + ($res | ConvertTo-Json -Depth 6 -Compress))`,
     `if (-not $res.ok) { exit 1 }`,
   ].join('\n');
@@ -1501,6 +1638,8 @@ export async function deployHwExportHeadless(
       allUserWindows: [],
       importedVariableGroups: [],
       importedTasks: [],
+      upsertedTasks: [],
+      alwaysCollectUpdated: [],
       importedEventsCount: 0,
       activeGuiWarning: null,
       error: check.reason ?? 'HEADLESS_DOTNET_UNAVAILABLE',
@@ -1551,6 +1690,8 @@ export async function deployHwExportHeadless(
           ? parsed.importedVariableGroups.map(String)
           : [],
         importedTasks: Array.isArray(parsed.importedTasks) ? parsed.importedTasks.map(String) : [],
+        upsertedTasks: Array.isArray(parsed.upsertedTasks) ? parsed.upsertedTasks.map(String) : [],
+        alwaysCollectUpdated: Array.isArray(parsed.alwaysCollectUpdated) ? parsed.alwaysCollectUpdated.map(String) : [],
         importedEventsCount: Number(parsed.importedEventsCount ?? 0),
         activeGuiWarning: parsed.activeGuiWarning ? String(parsed.activeGuiWarning) : null,
         error: parsed.error ? String(parsed.error) : null,
@@ -1581,6 +1722,8 @@ export async function deployHwExportHeadless(
       allUserWindows: [],
       importedVariableGroups: [],
       importedTasks: [],
+      upsertedTasks: [],
+      alwaysCollectUpdated: [],
       importedEventsCount: 0,
       activeGuiWarning: null,
       error: `HEADLESS_OUTPUT_PARSE_ERROR: ${stdout.trim().slice(0, 400)}`,
@@ -1602,6 +1745,8 @@ export async function deployHwExportHeadless(
       allUserWindows: [],
       importedVariableGroups: [],
       importedTasks: [],
+      upsertedTasks: [],
+      alwaysCollectUpdated: [],
       importedEventsCount: 0,
       activeGuiWarning: null,
       error: detail,
@@ -1623,6 +1768,9 @@ export interface DeployHwExportOptions {
   inboxDir?: string;
   installDir?: string;
   deleteWindowPrefixes?: string[];
+  enableAlwaysCollectFullNames?: string[];
+  upsertTasks?: HeadlessTaskUpsert[];
+  replaceExistingVariableGroups?: boolean;
   deployMode?: 'auto' | 'headless' | 'watcher_or_bat';
   createBackup?: boolean;
   dryRun?: boolean;
@@ -1639,6 +1787,9 @@ export async function deployHwExportToDesktop(options: DeployHwExportOptions) {
     hwExportPath,
     installDir: options.installDir,
     deleteWindowPrefixes: options.deleteWindowPrefixes,
+    enableAlwaysCollectFullNames: options.enableAlwaysCollectFullNames,
+    upsertTasks: options.upsertTasks,
+    replaceExistingVariableGroups: options.replaceExistingVariableGroups,
     createBackup: options.createBackup,
   });
   const deployScript = buildHwExportImportScript({
@@ -1679,6 +1830,9 @@ export async function deployHwExportToDesktop(options: DeployHwExportOptions) {
         hwExportPath,
         installDir: headlessCheck.installDir,
         deleteWindowPrefixes: options.deleteWindowPrefixes,
+        enableAlwaysCollectFullNames: options.enableAlwaysCollectFullNames,
+        upsertTasks: options.upsertTasks,
+        replaceExistingVariableGroups: options.replaceExistingVariableGroups,
         createBackup: options.createBackup,
         timeoutMs: Math.max(options.waitTimeoutMs ?? 45_000, 30_000),
       });
@@ -1697,6 +1851,8 @@ export async function deployHwExportToDesktop(options: DeployHwExportOptions) {
           allUserWindows: headlessResult.allUserWindows,
           importedVariableGroups: headlessResult.importedVariableGroups,
           importedTasks: headlessResult.importedTasks,
+          upsertedTasks: headlessResult.upsertedTasks,
+          alwaysCollectUpdated: headlessResult.alwaysCollectUpdated,
           importedEventsCount: headlessResult.importedEventsCount,
           activeGuiWarning: headlessResult.activeGuiWarning,
         };
