@@ -964,3 +964,217 @@ time.sleep(2.0)
 keyboard.send_keys("^s")
 `;
 }
+
+export interface AutoSyncWatcherOptions {
+  inboxDir: string;
+  defaultHwdevPath: string;
+  haiwellExePath?: string;
+}
+
+/**
+ * Generates a self-contained elevated Python pywinauto UIA watch-folder daemon
+ * that monitors inboxDir for *.deploy.json jobs, imports .hwExport into Haiwell
+ * Cloud Scada automatically (strictly targeting File name auto_id="1148"),
+ * saves the .hwdev, and writes last_result.json.
+ */
+export function buildAutoSyncWatcherScript(options: AutoSyncWatcherOptions): string {
+  const exePath =
+    options.haiwellExePath ?? 'C:\\Program Files (x86)\\Haiwell\\HaiwellScada3\\Scada.Develop.exe';
+  return `import ctypes, json, shutil, subprocess, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+from pywinauto import Desktop, keyboard
+
+HAIWELL_EXE = ${JSON.stringify(exePath)}
+DEFAULT_HWDEV = Path(${JSON.stringify(options.defaultHwdevPath)})
+INBOX_DIR = Path(${JSON.stringify(options.inboxDir)})
+DONE_DIR = INBOX_DIR / "done"
+HEARTBEAT_FILE = INBOX_DIR / "watcher.heartbeat.json"
+RESULT_FILE = INBOX_DIR / "last_result.json"
+
+if not ctypes.windll.shell32.IsUserAnAdmin():
+    print("Run from an Administrator PowerShell (Scada.Develop.exe requires elevation).", file=sys.stderr)
+    sys.exit(2)
+
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
+DONE_DIR.mkdir(parents=True, exist_ok=True)
+
+def find_win():
+    for w in Desktop(backend="uia").windows(title_re=r"(?i)^Haiwell Cloud Scada\\\\[.*"):
+        if w.is_visible() and w.rectangle().width() > 600:
+            return w
+    return None
+
+while True:
+    HEARTBEAT_FILE.write_text(json.dumps({"pid": ctypes.windll.kernel32.GetCurrentProcessId(), "updatedAt": time.time(), "inboxDir": str(INBOX_DIR)}), encoding="utf-8")
+    for jf in sorted(INBOX_DIR.glob("*.deploy.json")):
+        try:
+            job = json.loads(jf.read_text(encoding="utf-8"))
+            hwdev = Path(job.get("hwdevPath") or DEFAULT_HWDEV)
+            hwexp = Path(job["hwExportPath"])
+            if hwdev.exists():
+                shutil.copy2(hwdev, hwdev.with_suffix(".hwdev.bak"))
+            main_win = find_win()
+            if main_win is None:
+                subprocess.Popen([HAIWELL_EXE, str(hwdev)])
+                for _ in range(50):
+                    main_win = find_win()
+                    if main_win is not None:
+                        break
+                    time.sleep(0.8)
+            if main_win is None:
+                raise RuntimeError("Timed out waiting for Haiwell Cloud Scada")
+            main_win.set_focus()
+            pdisp = next((it for it in main_win.descendants(control_type="TreeItem") if it.window_text() == "Project display"), None)
+            if pdisp is None:
+                raise RuntimeError("Project display not found")
+            pdisp.click_input(button="right")
+            time.sleep(0.35)
+            keyboard.send_keys("{DOWN}{ENTER}")
+            time.sleep(0.8)
+            file_dlg = next((w for w in Desktop(backend="uia").windows() if w.process_id() == main_win.process_id() and w.handle != main_win.handle and w.is_visible()), None)
+            if file_dlg is None:
+                raise RuntimeError("File Open dialog not found")
+            edits = file_dlg.descendants(control_type="Edit")
+            target_edit = next((e for e in edits if (e.element_info.automation_id or "").strip() == "1148"), None)
+            if target_edit is None:
+                raise RuntimeError("File name Edit box (auto_id='1148') not found")
+            target_edit.click_input()
+            keyboard.send_keys("^a{BACKSPACE}")
+            target_edit.set_edit_text(str(hwexp))
+            ok_btn = next((b for b in file_dlg.descendants(control_type="Button") if (b.element_info.automation_id or "").strip() == "1"), None)
+            if ok_btn is not None:
+                ok_btn.click_input()
+            else:
+                keyboard.send_keys("{ENTER}")
+            time.sleep(1.5)
+            keyboard.send_keys("^s")
+            RESULT_FILE.write_text(json.dumps({"jobId": job.get("jobId", jf.stem), "ok": True, "importedWindows": [], "timestamp": datetime.now(timezone.utc).isoformat(), "error": None}), encoding="utf-8")
+        except Exception as exc:
+            RESULT_FILE.write_text(json.dumps({"jobId": jf.stem, "ok": False, "importedWindows": [], "timestamp": datetime.now(timezone.utc).isoformat(), "error": str(exc)}), encoding="utf-8")
+        shutil.move(str(jf), str(DONE_DIR / jf.name))
+    time.sleep(1.0)
+`;
+}
+
+export interface DeployHwExportOptions {
+  xml: string;
+  fileName: string;
+  hwdevPath: string;
+  outputDir: string;
+  inboxDir?: string;
+  deleteWindowPrefixes?: string[];
+  dryRun?: boolean;
+  waitTimeoutMs?: number;
+}
+
+export async function deployHwExportToDesktop(options: DeployHwExportOptions) {
+  const hwExportPath = path.join(options.outputDir, options.fileName);
+  const inboxDir = options.inboxDir ?? path.join(options.outputDir, 'inbox');
+  const deployScript = buildHwExportImportScript({
+    hwdevPath: options.hwdevPath,
+    hwExportPath,
+    deleteWindowPrefixes: options.deleteWindowPrefixes,
+  });
+  const watcherScript = buildAutoSyncWatcherScript({
+    inboxDir,
+    defaultHwdevPath: options.hwdevPath,
+  });
+
+  if (options.dryRun || process.platform !== 'win32') {
+    return {
+      deployed: false,
+      mode: 'DRY_RUN' as const,
+      hwExportPath,
+      hwExportBytes: Buffer.byteLength(options.xml, 'utf8'),
+      deployScript,
+      watcherScript,
+    };
+  }
+
+  fs.mkdirSync(options.outputDir, { recursive: true });
+  fs.mkdirSync(inboxDir, { recursive: true });
+  fs.writeFileSync(hwExportPath, options.xml, 'utf8');
+
+  const heartbeatPath = path.join(inboxDir, 'watcher.heartbeat.json');
+  const resultPath = path.join(inboxDir, 'last_result.json');
+  let watcherFresh = false;
+  if (fs.existsSync(heartbeatPath)) {
+    try {
+      const hb = JSON.parse(fs.readFileSync(heartbeatPath, 'utf8')) as { updatedAt?: number };
+      const nowSec = Date.now() / 1000;
+      if (typeof hb.updatedAt === 'number' && Math.abs(nowSec - hb.updatedAt) < 15) {
+        watcherFresh = true;
+      }
+    } catch {
+      watcherFresh = false;
+    }
+  }
+
+  if (watcherFresh) {
+    const jobId = `job_${Date.now()}`;
+    const jobPath = path.join(inboxDir, `${jobId}.deploy.json`);
+    fs.writeFileSync(
+      jobPath,
+      JSON.stringify(
+        {
+          jobId,
+          hwdevPath: options.hwdevPath,
+          hwExportPath,
+          deleteWindowPrefixes: options.deleteWindowPrefixes ?? [],
+          saveAfterImport: true,
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+    const deadline = Date.now() + (options.waitTimeoutMs ?? 20_000);
+    while (Date.now() < deadline) {
+      if (fs.existsSync(resultPath)) {
+        try {
+          const res = JSON.parse(fs.readFileSync(resultPath, 'utf8')) as {
+            jobId?: string;
+            ok?: boolean;
+            importedWindows?: string[];
+            error?: string | null;
+          };
+          if (res.jobId === jobId) {
+            return {
+              deployed: Boolean(res.ok),
+              mode: 'AUTO_SYNC_WATCHER' as const,
+              hwExportPath,
+              result: res,
+            };
+          }
+        } catch {
+          // wait for complete JSON write
+        }
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    return {
+      deployed: false,
+      mode: 'AUTO_SYNC_TIMEOUT' as const,
+      hwExportPath,
+      jobPath,
+    };
+  }
+
+  const pyPath = path.join(options.outputDir, 'deploy_to_haiwell.py');
+  const batPath = path.join(options.outputDir, 'Deploy_To_Haiwell.bat');
+  fs.writeFileSync(pyPath, deployScript, 'utf8');
+  fs.writeFileSync(
+    batPath,
+    `@echo off\nnet session >nul 2>&1\nif %errorlevel% neq 0 (\n  powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"\n  exit /b\n)\npython "${pyPath}"\npause\n`,
+    'utf8'
+  );
+  return {
+    deployed: false,
+    mode: 'QUEUED_WAITING_FOR_AUTOSYNC' as const,
+    hwExportPath,
+    oneClickLauncherBat: batPath,
+    deployScript,
+    watcherScript,
+  };
+}

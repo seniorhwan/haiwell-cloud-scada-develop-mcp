@@ -513,7 +513,7 @@ test('Production MCP #13: Tool annotations, SHA-256 catalog hash, scoped profile
 
   // Scoped profiles keep context-window tool count lean (14 tools for core)
   assert.equal(getToolsForProfile('core').length, 14);
-  assert.ok(getToolsForProfile('hmi').length <= 32);
+  assert.ok(getToolsForProfile('hmi').length <= 35);
   assert.equal(getToolsForProfile('all').length, HAIWELL_TOOLS.length);
 
   // Deterministic SHA-256 rug-pull hash

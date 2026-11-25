@@ -60,6 +60,7 @@ import { validateHaiwellScript } from './scriptAnalyzer';
 import { evaluateProjectAlarms, runSimulationSteps } from './simulationEngine';
 import {
   createNewHaiwellProjectOnDesktop,
+  deployHwExportToDesktop,
   inspectHaiwellDesktopInstallation,
   launchHaiwellDesktop,
 } from './desktopAutomation';
@@ -5513,6 +5514,59 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: async (input) => createNewHaiwellProjectOnDesktop(input),
   }),
+
+  defineTool({
+    name: 'haiwell_desktop_deploy_hwexport',
+    domain: 'hmi',
+    haiwellFeature: 'Zero-Touch .hwExport Auto-Sync Deployer into Live Haiwell .hwdev',
+    safetyTier: 'design',
+    description:
+      'Compiles the project to official Haiwell .hwExport XML (with WordSw->$ShowWindowId navigation) and deploys it automatically via the elevated Haiwell Auto-Sync watch-folder daemon (or writes a 1-click UAC Deploy_To_Haiwell.bat launcher). Supports dryRun=true.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      hwdevPath: z.string().min(1).max(300),
+      outputDir: z.string().min(1).max(300),
+      inboxDir: z.string().max(300).optional(),
+      fileName: z.string().max(120).optional(),
+      screenIds: z.array(z.string()).optional(),
+      startWindowId: z.number().int().min(1).max(9999).default(2),
+      language: z.enum(['en_0', 'zh_0']).default('en_0'),
+      deleteWindowPrefixes: z.array(z.string()).optional(),
+      dryRun: z.boolean().default(false),
+      waitTimeoutMs: z.number().int().min(1000).max(120000).default(20000),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      hwdevPath: 'C:\\Users\\user\\Documents\\Haiwell Scada\\Temporary\\Project1.hwdev',
+      outputDir: 'C:\\Users\\user\\Documents\\haiwell_exports',
+      startWindowId: 2,
+      dryRun: true,
+    },
+    handler: async (input, store) => {
+      const project = store.getProject(input.projectId);
+      const compiled = compileProjectToHwExport(project, {
+        screenIds: input.screenIds,
+        startWindowId: input.startWindowId,
+        language: input.language,
+      });
+      const deployment = await deployHwExportToDesktop({
+        xml: compiled.xml,
+        fileName: input.fileName ?? compiled.fileName,
+        hwdevPath: input.hwdevPath,
+        outputDir: input.outputDir,
+        inboxDir: input.inboxDir,
+        deleteWindowPrefixes: input.deleteWindowPrefixes,
+        dryRun: input.dryRun,
+        waitTimeoutMs: input.waitTimeoutMs,
+      });
+      return {
+        screensExported: compiled.screensExported,
+        widgetsExported: compiled.widgetsExported,
+        variablesBound: compiled.variablesBound,
+        ...deployment,
+      };
+    },
+  }),
 ];
 
 const SAFE_SVG_TAGS = new Set([
@@ -5611,6 +5665,7 @@ const NON_IDEMPOTENT_TOOLS = new Set([
   'haiwell_opcua_browse_read_write',
   'haiwell_desktop_launch',
   'haiwell_desktop_new_project',
+  'haiwell_desktop_deploy_hwexport',
 ]);
 
 export function getToolAnnotations(tool: HaiwellToolDefinition): McpToolAnnotations {
@@ -5631,7 +5686,8 @@ export function getToolAnnotations(tool: HaiwellToolDefinition): McpToolAnnotati
     tool.name === 'haiwell_data_reporting_server_configure' ||
     tool.name === 'haiwell_cloud_transparent_tunnel' ||
     tool.name === 'haiwell_desktop_launch' ||
-    tool.name === 'haiwell_desktop_new_project';
+    tool.name === 'haiwell_desktop_new_project' ||
+    tool.name === 'haiwell_desktop_deploy_hwexport';
 
   return {
     title: tool.haiwellFeature,

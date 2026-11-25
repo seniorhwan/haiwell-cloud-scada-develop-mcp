@@ -4,8 +4,8 @@ import { HaiwellProjectStore } from './projectStore';
 import { HAIWELL_TOOLS, invokeHaiwellTool } from './toolRegistry';
 import { REAL_HAIWELL_350_TREE_NODES } from './hmiSpatialEngine';
 
-test('Haiwell Cloud Scada 3.50.x parity: 64 total tools cover all 22 real Project Browser nodes + desktop automation', () => {
-  assert.equal(HAIWELL_TOOLS.length, 64);
+test('Haiwell Cloud Scada 3.50.x parity: 65 total tools cover all 22 real Project Browser nodes + desktop automation', () => {
+  assert.equal(HAIWELL_TOOLS.length, 65);
   assert.equal(REAL_HAIWELL_350_TREE_NODES.length, 22);
 });
 

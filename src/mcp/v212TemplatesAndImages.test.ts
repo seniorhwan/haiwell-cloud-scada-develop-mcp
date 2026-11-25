@@ -143,4 +143,27 @@ test('v2.12.0: Hard-coded HMI templates instantiate with 0 collisions/OOB at 102
   assert.ok(xml.includes('WrtVar=&quot;$ShowWindowId&quot;'));
   assert.ok(xml.includes('<string>$ShowWindowId</string>'));
   assert.ok(xml.includes('<PropName>WrtVar-id</PropName>'));
+
+  // 4. Verify haiwell_desktop_deploy_hwexport dryRun returns WordSw->$ShowWindowId + watcher/deploy scripts
+  const dep = await invokeHaiwellTool(
+    'haiwell_desktop_deploy_hwexport',
+    {
+      projectId: 'prj_tpl_v212',
+      hwdevPath: 'C:\\Temp\\Project1.hwdev',
+      outputDir: 'C:\\Temp\\exports',
+      dryRun: true,
+    },
+    store
+  );
+  assert.equal(dep.ok, true);
+  const depData = dep.data as {
+    deployed: boolean;
+    mode: string;
+    deployScript: string;
+    watcherScript: string;
+  };
+  assert.equal(depData.deployed, false);
+  assert.equal(depData.mode, 'DRY_RUN');
+  assert.ok(depData.deployScript.includes('"1148"'));
+  assert.ok(depData.watcherScript.includes('watcher.heartbeat.json'));
 });
