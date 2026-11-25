@@ -943,7 +943,23 @@ pdisp.click_input(button="right")
 if not click_menu(("Import",)):
     raise RuntimeError("Import menu item not found")
 time.sleep(0.8)
-keyboard.send_keys(str(HWEXPORT_PATH) + "{ENTER}")
+file_dlg = next((w for w in Desktop(backend="uia").windows() if w.process_id() == main_win.process_id() and w.handle != main_win.handle and w.is_visible()), None)
+if file_dlg is None:
+    raise RuntimeError("File Open dialog not found")
+edits = file_dlg.descendants(control_type="Edit")
+target_edit = next((e for e in edits if (e.element_info.automation_id or "").strip() == "1148"), None)
+if target_edit is None:
+    target_edit = next((e for e in edits if (e.element_info.name or "").strip().lower() in ("file name:", "file name")), None)
+if target_edit is None:
+    raise RuntimeError("File name Edit box (auto_id='1148') not found")
+target_edit.click_input()
+keyboard.send_keys("^a{BACKSPACE}")
+target_edit.set_edit_text(str(HWEXPORT_PATH))
+ok_btn = next((b for b in file_dlg.descendants(control_type="Button") if (b.element_info.automation_id or "").strip() == "1"), None)
+if ok_btn is not None:
+    ok_btn.click_input()
+else:
+    keyboard.send_keys("{ENTER}")
 time.sleep(2.0)
 keyboard.send_keys("^s")
 `;
