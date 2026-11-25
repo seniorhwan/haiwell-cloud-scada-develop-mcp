@@ -123,16 +123,24 @@ test('v2.12.0: Hard-coded HMI templates instantiate with 0 collisions/OOB at 102
     stationCounter: { label: 'TOTAL', tagName: 'CNT', unit: 'pcs' },
     inputs: Array.from({ length: 8 }, (_, i) => ({ label: `X${i} - SENSOR ${i}`, tagName: 'START' })),
     outputIndicators: Array.from({ length: 8 }, (_, i) => ({ label: `Y${i} - COIL ${i}`, tagName: 'STOP' })),
+    navTabs: [
+      { label: 'HOME', targetScreenName: 'Main_display' },
+      { label: 'ST1', targetScreenName: 'StationMonitor', active: true },
+    ],
   }, store);
   assert.equal(t5.ok, true);
   assert.equal((t5.data as any).validation.valid, true);
   assert.equal((t5.data as any).validation.collisions.length, 0);
 
-  // 3. Export .hwExport and confirm image-backed BitSw/BitLamp + SymbolVariableUsing + 2-state text
+  // 3. Export .hwExport and confirm image-backed BitSw/BitLamp + SymbolVariableUsing + WordSw->$ShowWindowId nav
   const exp = await invokeHaiwellTool('haiwell_project_export_hwexport', { projectId: 'prj_tpl_v212' }, store);
   assert.equal(exp.ok, true);
   const xml = (exp.data as { xml: string }).xml;
   assert.ok(xml.includes('<SymbolType>image</SymbolType>'));
   assert.ok(xml.includes('<SymbolVariableUsing>'));
   assert.ok(xml.includes('md5file=&quot;'));
+  assert.ok(xml.includes('sym-type=&quot;WordSw&quot;'));
+  assert.ok(xml.includes('WrtVar=&quot;$ShowWindowId&quot;'));
+  assert.ok(xml.includes('<string>$ShowWindowId</string>'));
+  assert.ok(xml.includes('<PropName>WrtVar-id</PropName>'));
 });

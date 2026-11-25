@@ -857,3 +857,94 @@ export async function createNewHaiwellProjectOnDesktop(options: NewDesktopProjec
     throw new Error(`DESKTOP_NEW_PROJECT_FAILED: ${detail}`);
   }
 }
+
+export interface HwExportImportScriptOptions {
+  hwdevPath: string;
+  hwExportPath: string;
+  deleteWindowPrefixes?: string[];
+  haiwellExePath?: string;
+}
+
+/**
+ * Generates a self-contained Python pywinauto UIA script that deletes old target windows
+ * (without touching 1:Main_display), imports a .hwExport file into Project display,
+ * and saves the .hwdev project. Requires Administrator elevation because Scada.Develop.exe
+ * runs elevated (Windows UIPI).
+ */
+export function buildHwExportImportScript(options: HwExportImportScriptOptions): string {
+  const exePath =
+    options.haiwellExePath ?? 'C:\\Program Files (x86)\\Haiwell\\HaiwellScada3\\Scada.Develop.exe';
+  const prefixes = JSON.stringify(options.deleteWindowPrefixes ?? []);
+  return `import ctypes, json, shutil, subprocess, sys, time
+from pathlib import Path
+from pywinauto import Desktop, keyboard
+
+HAIWELL_EXE = ${JSON.stringify(exePath)}
+HWDEV_PATH = Path(${JSON.stringify(options.hwdevPath)})
+HWEXPORT_PATH = Path(${JSON.stringify(options.hwExportPath)})
+DELETE_PREFIXES = ${prefixes}
+
+if not ctypes.windll.shell32.IsUserAnAdmin():
+    print("Run from an Administrator PowerShell (Scada.Develop.exe requires elevation).", file=sys.stderr)
+    sys.exit(2)
+
+shutil.copy2(HWDEV_PATH, HWDEV_PATH.with_suffix(".hwdev.bak"))
+
+def find_win():
+    for w in Desktop(backend="uia").windows(title_re=r"(?i)^Haiwell Cloud Scada\\\\[.*"):
+        if w.is_visible() and w.rectangle().width() > 600:
+            return w
+    return None
+
+main_win = find_win()
+if main_win is None:
+    subprocess.Popen([HAIWELL_EXE, str(HWDEV_PATH)])
+    for _ in range(50):
+        main_win = find_win()
+        if main_win is not None:
+            break
+        time.sleep(0.8)
+if main_win is None:
+    raise RuntimeError("Timed out waiting for Haiwell Cloud Scada")
+
+main_win.set_focus()
+time.sleep(1.5)
+
+def find_item(prefix, exact=False):
+    for it in main_win.descendants(control_type="TreeItem"):
+        t = it.window_text()
+        if (t == prefix) if exact else (t == prefix or t.startswith(prefix)):
+            return it
+    return None
+
+def click_menu(names):
+    time.sleep(0.35)
+    for w in Desktop(backend="uia").windows():
+        if w.process_id() == main_win.process_id():
+            for mi in w.descendants(control_type="MenuItem"):
+                if any(mi.window_text().strip().lower().startswith(n.lower()) for n in names):
+                    mi.click_input()
+                    return True
+    return False
+
+for p in DELETE_PREFIXES:
+    it = find_item(p)
+    if it:
+        it.click_input(button="right")
+        if not click_menu(("Delete",)):
+            it.click_input()
+            keyboard.send_keys("{DELETE}")
+        time.sleep(0.4)
+        keyboard.send_keys("{ENTER}")
+        time.sleep(0.4)
+
+pdisp = find_item("Project display", exact=True)
+pdisp.click_input(button="right")
+if not click_menu(("Import",)):
+    raise RuntimeError("Import menu item not found")
+time.sleep(0.8)
+keyboard.send_keys(str(HWEXPORT_PATH) + "{ENTER}")
+time.sleep(2.0)
+keyboard.send_keys("^s")
+`;
+}

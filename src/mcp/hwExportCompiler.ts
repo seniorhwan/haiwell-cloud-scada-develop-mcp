@@ -252,6 +252,16 @@ export function compileProjectToHwExport(
     return { varId, fullName, tag };
   };
 
+  const bindSystemVar = (fullName: string, dataType = 'SHORT'): number => {
+    let varId = varIdByFullName.get(fullName);
+    if (varId === undefined) {
+      varId = nextVarId++;
+      varIdByFullName.set(fullName, varId);
+      varTypeById.set(varId, dataType);
+    }
+    return varId;
+  };
+
   const symbolLibs = new Map<string, SymbolLibEntry>();
   const symbolGroups = new Map<string, SymbolGroupEntry>();
   const pictures = new Map<string, { id: number; md5: string; base64: string }>();
@@ -336,8 +346,10 @@ export function compileProjectToHwExport(
   let totalWidgets = 0;
 
   const screenNameToWinDbId = new Map<string, number>();
+  const screenNameToWindowId = new Map<string, number>();
   targetScreens.forEach((s, idx) => {
     screenNameToWinDbId.set(s.name, nextWinDbId + idx);
+    screenNameToWindowId.set(s.name, startWindowId + idx);
   });
 
   targetScreens.forEach((screen, scrIdx) => {
@@ -857,7 +869,7 @@ export function compileProjectToHwExport(
         continue;
       }
 
-      // 12. NAV_BAR -> Real Haiwell WinOpBtn (btn214)
+      // 12. NAV_BAR -> Native WordSw writing $ShowWindowId (survives .hwExport import with exact WindowID target)
       if (w.type === 'NAV_BAR') {
         const firstScreenName = targetScreens[0]?.name ?? 'Main_display';
         const navTarget =
@@ -867,8 +879,6 @@ export function compileProjectToHwExport(
         const activeNav = Boolean(w.props?.active);
         const bgHex = activeNav ? '#0284C7' : '#334155';
         const seq = nextSymDbId++;
-        const symId = `WinOpBtn_${seq}`;
-        const hwkey = `${symId}_${seq}`;
         const btnAsset = HAIWELL_NATIVE_SYMBOLS.librarySymbols['btn214_0'];
         const grp = ensureSvgGroup(`btn214_${bgHex.replace('#', '')}`, [
           {
@@ -881,13 +891,61 @@ export function compileProjectToHwExport(
         const sx = (w.width / 100).toFixed(6);
         const sy = (w.height / 100).toFixed(6);
         const isHomeNav = navTarget.toLowerCase() === 'main_display' || w.props?.navAction === 'home';
-        const targetWinDbId = screenNameToWinDbId.get(navTarget);
-        const navFun = isHomeNav ? 'show_fst_pic' : 'show_spef_pic';
-        const navPicAttr = isHomeNav ? 'Pic=""' : `Pic="${xmlEsc(navTarget)}"${targetWinDbId !== undefined ? ` Pic-id="${targetWinDbId}"` : ''}`;
-        registerTextOnlyRecord('WinOpBtn', symId, hwkey, grp.groupId, { '0': symbolLibs.get(grp.stateIds['0'])!.md5 }, '', '#FFFFFF', 12, true, 'st', [], 'btn214');
-        svgElements.push(
-          `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WinOpBtn" v="0.1" id="${symId}" hwkey="${hwkey}" Fun="${navFun}" ${navPicAttr} SubPic="" IsPrintHidden="false" ActnEff="false" WhthCnfrmBox="false" ActnLock="false" StCt="1"><hwsymbol id="${hwkey}" newsym="true" defGId="btn214" title="Picture operation button" name="WinOpBtn" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
-        );
+        const targetWindowId =
+          typeof w.props?.targetWindowId === 'number'
+            ? w.props.targetWindowId
+            : isHomeNav
+              ? 1
+              : screenNameToWindowId.get(navTarget);
+
+        if (targetWindowId !== undefined) {
+          const symId = `WordSw_${seq}`;
+          const hwkey = `${symId}_${seq}`;
+          const showWinVarId = bindSystemVar('$ShowWindowId', 'SHORT');
+          usedVarIds.add(showWinVarId);
+          registerTextOnlyRecord(
+            'WordSw',
+            symId,
+            hwkey,
+            grp.groupId,
+            { '0': symbolLibs.get(grp.stateIds['0'])!.md5 },
+            '',
+            '#FFFFFF',
+            12,
+            true,
+            'st',
+            [{ propName: 'WrtVar-id', varId: showWinVarId }],
+            'btn201'
+          );
+          svgElements.push(
+            `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WordSw" v="0.1" id="${symId}" hwkey="${hwkey}" WhthCnfrmBox="false" ActnEff="false" CnfrmTxt="Make sure to perform the current operation" ActnFun="asgn" Opds="${targetWindowId}" LmtIsVar="false" LmtRet="false" LmtNum="80" RetNum="0" ActnLock="false" LockMode="var" LockLogic="off" LockStyle="show" StCt="1" WrtVar="$ShowWindowId" WrtVar-UseAddr="false" WrtVar-id="${showWinVarId}" LmtVar="" LockVar="" NoticeBitVar="" NoticeNumVar="" RemoteOperation="true"><hwsymbol id="${hwkey}" newsym="true" defGId="btn201" title="Word switch" name="WordSw" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
+          );
+        } else {
+          const symId = `WinOpBtn_${seq}`;
+          const hwkey = `${symId}_${seq}`;
+          const targetWinDbId = screenNameToWinDbId.get(navTarget);
+          const navFun = isHomeNav ? 'show_fst_pic' : 'show_spef_pic';
+          const navPicAttr = isHomeNav
+            ? 'Pic=""'
+            : `Pic="${xmlEsc(navTarget)}"${targetWinDbId !== undefined ? ` Pic-id="${targetWinDbId}"` : ''}`;
+          registerTextOnlyRecord(
+            'WinOpBtn',
+            symId,
+            hwkey,
+            grp.groupId,
+            { '0': symbolLibs.get(grp.stateIds['0'])!.md5 },
+            '',
+            '#FFFFFF',
+            12,
+            true,
+            'st',
+            [],
+            'btn214'
+          );
+          svgElements.push(
+            `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WinOpBtn" v="0.1" id="${symId}" hwkey="${hwkey}" Fun="${navFun}" ${navPicAttr} SubPic="" IsPrintHidden="false" ActnEff="false" WhthCnfrmBox="false" ActnLock="false" StCt="1"><hwsymbol id="${hwkey}" newsym="true" defGId="btn214" title="Picture operation button" name="WinOpBtn" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
+          );
+        }
         addTxtBlock(w.x + 6, w.y + Math.max(4, Math.round(w.height / 2) - 10), Math.max(30, w.width - 12), 20, w.label, {
           color: '#FFFFFF',
           fontSize: 11,

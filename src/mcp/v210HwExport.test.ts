@@ -96,12 +96,13 @@ test('v2.10.0: haiwell_project_export_hwexport generates valid <HwExportModel> X
   };
   assert.equal(data.format, 'HAIWELL_NATIVE_HWEXPORT_XML');
   assert.equal(data.screensExported, 1);
-  assert.equal(data.variablesBound, 3);
+  assert.equal(data.variablesBound, 4);
   assert.ok(data.xml.includes('<HwExportModel '));
   assert.ok(data.xml.includes('<Versions>3</Versions>'));
   assert.ok(data.xml.includes('<string>Modbus_1.START</string>'));
   assert.ok(data.xml.includes('<string>Modbus_1.COUNTER</string>'));
   assert.ok(data.xml.includes('<string>Modbus_1._commStatus</string>'));
+  assert.ok(data.xml.includes('<string>$ShowWindowId</string>'));
   assert.ok(data.xml.includes('sym-type=&quot;BitSw&quot;') && data.xml.includes('defGId=&quot;sw006&quot;'));
   assert.ok(data.xml.includes('sym-type=&quot;BitLamp&quot;') && data.xml.includes('defGId=&quot;lamp013&quot;'));
   assert.ok(data.xml.includes('<SymbolType>image</SymbolType>'));
