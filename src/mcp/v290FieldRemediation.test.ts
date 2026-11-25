@@ -18,7 +18,7 @@ function makeStore() {
 }
 
 test('v2.9.0 P0-1: haiwell_project_import_hwrun imports unencrypted .hwrun SQLite & rejects encrypted .hwdev', async () => {
-  assert.equal(SERVER_VERSION, '2.9.0');
+  assert.equal(SERVER_VERSION, '2.10.0');
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hwrun-test-'));
   const hwrunPath = path.join(tmpDir, 'sample.hwrun');
   const fakeHwdevPath = path.join(tmpDir, 'encrypted.hwdev');

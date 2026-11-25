@@ -46,6 +46,7 @@ import {
   solveAndRepairScreenLayout,
 } from './hmiSpatialEngine';
 import { importHwrunProject } from './hwrunImporter';
+import { compileProjectToHwExport } from './hwExportCompiler';
 import {
   buildMqttPayload,
   generateOpcUaNodeSet2Xml,
@@ -454,6 +455,7 @@ export function buildProjectExportBundle(project: HaiwellProject) {
       ),
       'plc/pous': Object.fromEntries(project.pous.map((p) => [`${p.name}.${p.language.toLowerCase()}`, p.source])),
       'scripts/js': Object.fromEntries(project.scripts.map((s) => [`${s.name}.js`, s.code])),
+      ...(project.screens.length > 0 ? { 'project.hwExport': compileProjectToHwExport(project).xml } : {}),
     },
   };
 }
@@ -1857,6 +1859,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             'hmi_svg',
             'pous',
             'scripts',
+            'hwexport_xml',
           ])
         )
         .optional(),
@@ -1882,7 +1885,49 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       if (input.includeArtifacts.includes('hmi_svg')) selected['screens/svg'] = bundle.artifacts['screens/svg'];
       if (input.includeArtifacts.includes('pous')) selected['plc/pous'] = bundle.artifacts['plc/pous'];
       if (input.includeArtifacts.includes('scripts')) selected['scripts/js'] = bundle.artifacts['scripts/js'];
+      if (input.includeArtifacts.includes('hwexport_xml')) selected['project.hwExport'] = bundle.artifacts['project.hwExport'];
       return { ...bundle, artifacts: selected };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_project_export_hwexport',
+    domain: 'project',
+    haiwellFeature: 'Native Haiwell Cloud Scada .hwExport XML Export (Zero-UIA Import)',
+    safetyTier: 'read',
+    description:
+      'Compile validated HMI screens and their bound PLC/Internal variables directly into an official Haiwell Cloud Scada 3.50.x <HwExportModel> .hwExport XML file for native Project(P) -> Import(I) without Windows UI automation.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      screenIds: z.array(z.string().min(1)).optional(),
+      startWindowId: z.number().int().min(1).max(9999).default(5),
+      language: z.enum(['en_0', 'zh_0']).default('en_0'),
+      variableFullNameOverrides: z.record(z.string(), z.string()).optional(),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      startWindowId: 5,
+      language: 'en_0',
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const compiled = compileProjectToHwExport(project, {
+        screenIds: input.screenIds,
+        startWindowId: input.startWindowId,
+        language: input.language,
+        variableFullNameOverrides: input.variableFullNameOverrides,
+      });
+      return {
+        fileName: compiled.fileName,
+        format: 'HAIWELL_NATIVE_HWEXPORT_XML',
+        importInstructions:
+          'In Haiwell Cloud Scada 3.50.x, open your .hwdev project and click Project(P) -> Import(I), then select the saved .hwExport file.',
+        screensExported: compiled.screensExported,
+        widgetsExported: compiled.widgetsExported,
+        variablesBound: compiled.variablesBound,
+        warnings: compiled.warnings,
+        xml: compiled.xml,
+      };
     },
   }),
 
