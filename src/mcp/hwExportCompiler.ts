@@ -335,6 +335,11 @@ export function compileProjectToHwExport(
   let nextSymDbId = 1000;
   let totalWidgets = 0;
 
+  const screenNameToWinDbId = new Map<string, number>();
+  targetScreens.forEach((s, idx) => {
+    screenNameToWinDbId.set(s.name, nextWinDbId + idx);
+  });
+
   targetScreens.forEach((screen, scrIdx) => {
     const winDbId = nextWinDbId++;
     const windowId = startWindowId + scrIdx;
@@ -875,9 +880,13 @@ export function compileProjectToHwExport(
         ]);
         const sx = (w.width / 100).toFixed(6);
         const sy = (w.height / 100).toFixed(6);
+        const isHomeNav = navTarget.toLowerCase() === 'main_display' || w.props?.navAction === 'home';
+        const targetWinDbId = screenNameToWinDbId.get(navTarget);
+        const navFun = isHomeNav ? 'show_fst_pic' : 'show_spef_pic';
+        const navPicAttr = isHomeNav ? 'Pic=""' : `Pic="${xmlEsc(navTarget)}"${targetWinDbId !== undefined ? ` Pic-id="${targetWinDbId}"` : ''}`;
         registerTextOnlyRecord('WinOpBtn', symId, hwkey, grp.groupId, { '0': symbolLibs.get(grp.stateIds['0'])!.md5 }, '', '#FFFFFF', 12, true, 'st', [], 'btn214');
         svgElements.push(
-          `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WinOpBtn" v="0.1" id="${symId}" hwkey="${hwkey}" Fun="show_spef_pic" Pic="${xmlEsc(navTarget)}" SubPic="" IsPrintHidden="false" ActnEff="false" WhthCnfrmBox="false" ActnLock="false" StCt="1"><hwsymbol id="${hwkey}" newsym="true" defGId="btn214" title="Picture operation button" name="WinOpBtn" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
+          `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WinOpBtn" v="0.1" id="${symId}" hwkey="${hwkey}" Fun="${navFun}" ${navPicAttr} SubPic="" IsPrintHidden="false" ActnEff="false" WhthCnfrmBox="false" ActnLock="false" StCt="1"><hwsymbol id="${hwkey}" newsym="true" defGId="btn214" title="Picture operation button" name="WinOpBtn" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
         );
         addTxtBlock(w.x + 6, w.y + Math.max(4, Math.round(w.height / 2) - 10), Math.max(30, w.width - 12), 20, w.label, {
           color: '#FFFFFF',
