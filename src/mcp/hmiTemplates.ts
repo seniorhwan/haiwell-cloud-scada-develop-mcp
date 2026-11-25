@@ -791,24 +791,54 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
   } else if (input.template === 'STATION_ALARMS_SIMPLE') {
-    widgets.push({ id: `${key}_p_faults`, type: 'GROUP_PANEL', label: 'ACTIVE FAULTS', x: 14, y: 62, width: 486, height: 466 });
-    (input.inputs ?? []).slice(0, 6).forEach((flt, i) => {
-      widgets.push({
-        id: `${key}_flt_${i}`,
-        type: 'BIT_LAMP',
-        label: flt.label,
-        tagName: flt.tagName,
-        visualRole: flt.role ?? 'DANGER_ACTION',
-        x: 30,
-        y: 108 + i * 66,
-        width: 454,
-        height: 46,
-      });
+    const faults = (input.inputs ?? []).slice(0, 12);
+    const twoCol = faults.length > 6;
+    const leftW = twoCol ? 560 : 486;
+    const rightX = 14 + leftW + 12;
+    const rightW = 1010 - rightX;
+
+    widgets.push({
+      id: `${key}_p_faults`,
+      type: 'GROUP_PANEL',
+      label: twoCol ? 'SYSTEM & STATION ALARMS (ST1 / ST2 / ST3)' : 'ACTIVE FAULTS',
+      x: 14,
+      y: 62,
+      width: leftW,
+      height: 466,
+    });
+    faults.forEach((flt, i) => {
+      if (twoCol) {
+        const col = Math.floor(i / 6);
+        const row = i % 6;
+        widgets.push({
+          id: `${key}_flt_${i}`,
+          type: 'BIT_LAMP',
+          label: flt.label,
+          tagName: flt.tagName,
+          visualRole: flt.role ?? 'DANGER_ACTION',
+          x: 26 + col * 274,
+          y: 108 + row * 66,
+          width: 262,
+          height: 44,
+        });
+      } else {
+        widgets.push({
+          id: `${key}_flt_${i}`,
+          type: 'BIT_LAMP',
+          label: flt.label,
+          tagName: flt.tagName,
+          visualRole: flt.role ?? 'DANGER_ACTION',
+          x: 30,
+          y: 108 + i * 66,
+          width: 454,
+          height: 46,
+        });
+      }
     });
 
     const readouts = (input.leftReadouts ?? []).slice(0, 4);
     const compactMode = readouts.length <= 2;
-    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: 'ALARM CONTROL', x: 512, y: 62, width: 498, height: 466 });
+    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: 'ALARM CONTROL', x: rightX, y: 62, width: rightW, height: 466 });
     if (input.stationCounter) {
       widgets.push({
         id: `${key}_alm_total`,
@@ -816,9 +846,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         label: input.stationCounter.label,
         tagName: input.stationCounter.tagName,
         unit: input.stationCounter.unit ?? '',
-        x: 532,
+        x: rightX + 18,
         y: compactMode ? 114 : 102,
-        width: 226,
+        width: twoCol ? 210 : 226,
         height: compactMode ? 110 : 96,
       });
     }
@@ -830,9 +860,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: input.outputs[0].tagName,
         writeEnabled: true,
         visualRole: input.outputs[0].role ?? 'WARNING_ACTION',
-        x: 790,
+        x: rightX + (twoCol ? 248 : 278),
         y: compactMode ? 114 : 102,
-        width: 136,
+        width: twoCol ? 148 : 136,
         height: compactMode ? 110 : 96,
       });
     }
@@ -843,9 +873,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
           type: 'NUMERIC_DISPLAY',
           label: rd.label,
           tagName: rd.tagName,
-          x: 532,
+          x: rightX + 18,
           y: 256 + i * 126,
-          width: 458,
+          width: rightW - 36,
           height: 98,
         });
       });
@@ -856,9 +886,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
           type: 'NUMERIC_DISPLAY',
           label: readouts[0].label,
           tagName: readouts[0].tagName,
-          x: 528,
+          x: rightX + 16,
           y: 212,
-          width: 466,
+          width: rightW - 32,
           height: 64,
         });
       }
@@ -868,9 +898,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
           type: 'NUMERIC_DISPLAY',
           label: hr.label,
           tagName: hr.tagName,
-          x: 528,
+          x: rightX + 16,
           y: 288 + i * 76,
-          width: 466,
+          width: rightW - 32,
           height: 64,
         });
       });
