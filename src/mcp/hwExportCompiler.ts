@@ -1228,6 +1228,19 @@ ${s.varBindings
     )
     .join('\n');
 
+  const dicSymWinIdXml = targetScreens
+    .map(
+      (_s, idx) => `      <SerializableDictionary>
+        <key>
+          <int>${100 + idx}</int>
+        </key>
+        <value>
+          <int>${startWindowId + idx}</int>
+        </value>
+      </SerializableDictionary>`
+    )
+    .join('\n');
+
   const xml = `<?xml version="1.0" encoding="utf-8"?>
 <HwExportModel xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <Windows>
@@ -1263,7 +1276,9 @@ ${dicVarIdTypeXml}
     <DicSymVarInfo>
 ${dicSymVarInfoXml}
     </DicSymVarInfo>
-    <DicSymbolWinIdAndWindowId />
+    <DicSymbolWinIdAndWindowId>
+${dicSymWinIdXml}
+    </DicSymbolWinIdAndWindowId>
   </Windows>
   <Tasks>
     <ListTask />
