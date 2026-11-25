@@ -1,6 +1,9 @@
-import crypto from 'node:crypto';
-import zlib from 'node:zlib';
 import { HAIWELL_NATIVE_SYMBOLS, type NativeSymbolBBox } from './haiwellNativeSymbols';
+import {
+  generateLedLampPng,
+  generatePushbuttonPng,
+  generateSolidPngBase64,
+} from './hwPngIcons';
 import type { HaiwellProject, HmiScreen, HmiVisualRole, HmiWidget, TagDefinition } from './types';
 
 export interface HwExportCompileOptions {
@@ -17,112 +20,6 @@ export interface HwExportCompileResult {
   widgetsExported: number;
   variablesBound: number;
   warnings: string[];
-}
-
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[n] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  }
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function pngChunk(type: string, data: Buffer): Buffer {
-  const typeBuf = Buffer.from(type, 'ascii');
-  const lenBuf = Buffer.alloc(4);
-  lenBuf.writeUInt32BE(data.length, 0);
-  const crcBuf = Buffer.alloc(4);
-  const crcVal = crc32(Buffer.concat([typeBuf, data]));
-  crcBuf.writeUInt32BE(crcVal, 0);
-  return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
-}
-
-function parseHexColor(hex: string): [number, number, number, number] {
-  const clean = (hex || '#CBD5E1').trim().replace(/^#/, '');
-  if (/^[0-9a-fA-F]{6}$/.test(clean)) {
-    return [
-      parseInt(clean.slice(0, 2), 16),
-      parseInt(clean.slice(2, 4), 16),
-      parseInt(clean.slice(4, 6), 16),
-      255,
-    ];
-  }
-  if (/^[0-9a-fA-F]{3}$/.test(clean)) {
-    return [
-      parseInt(clean[0] + clean[0], 16),
-      parseInt(clean[1] + clean[1], 16),
-      parseInt(clean[2] + clean[2], 16),
-      255,
-    ];
-  }
-  return [203, 213, 225, 255];
-}
-
-const PNG_CACHE = new Map<string, { base64: string; md5: string }>();
-
-/**
- * Generates a minimal valid RGBA PNG thumbnail for DicSymPic (<SourcePicture>)
- * and computes its exact MD5 hex digest for PicMd5 / SymbolStateMd5Config.
- */
-export function generateSolidPngBase64(
-  hexColor: string,
-  width = 24,
-  height = 24
-): { base64: string; md5: string } {
-  const key = `${hexColor.toUpperCase()}_${width}x${height}`;
-  const cached = PNG_CACHE.get(key);
-  if (cached) return cached;
-
-  const [r, g, b, a] = parseHexColor(hexColor);
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 6;
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-
-  const rowSize = 1 + width * 4;
-  const raw = Buffer.alloc(rowSize * height);
-  for (let y = 0; y < height; y++) {
-    const rowOff = y * rowSize;
-    raw[rowOff] = 0;
-    for (let x = 0; x < width; x++) {
-      const px = rowOff + 1 + x * 4;
-      raw[px] = r;
-      raw[px + 1] = g;
-      raw[px + 2] = b;
-      raw[px + 3] = a;
-    }
-  }
-
-  const idat = zlib.deflateSync(raw);
-  const png = Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', idat),
-    pngChunk('IEND', Buffer.alloc(0)),
-  ]);
-
-  const entry = {
-    base64: png.toString('base64'),
-    md5: crypto.createHash('md5').update(png).digest('hex'),
-  };
-  PNG_CACHE.set(key, entry);
-  return entry;
 }
 
 function xmlEsc(s: string): string {
@@ -190,10 +87,6 @@ function resolveTagFullName(
   return tag.name;
 }
 
-/**
- * Computes exact SVG matrix(sx,0,0,sy,tx,ty) placing a native symbol's measured bbox
- * cleanly inside (targetX, targetY, targetW, targetH).
- */
 function computeNativeMatrix(
   bbox: NativeSymbolBBox,
   targetX: number,
@@ -220,10 +113,6 @@ function computeNativeMatrix(
   return `matrix(${sx.toFixed(6)},0,0,${sy.toFixed(6)},${tx.toFixed(3)},${ty.toFixed(3)})`;
 }
 
-/**
- * Rewrites shared native gradient IDs (HWIDone, HWIDtwo, etc.) per widget hwkey
- * so multiple gauges, switches, lamps, or motors never collide in <svg>.
- */
 function scopeGradientIds(svgFragment: string, hwkey: string): string {
   return svgFragment
     .replace(/id="(HWID[^"]+)"/g, `id="${hwkey}_$1"`)
@@ -247,15 +136,51 @@ function getPushbuttonPalette(role?: HmiVisualRole): {
   }
 }
 
+function buildTwoStateTextConfig(lang: string, color: string, fontSize: number, bold: boolean) {
+  const single = {
+    t: '',
+    f: 'Arial',
+    s: fontSize,
+    sh: Number((fontSize * 1.33).toFixed(2)),
+    fs: bold ? 'Bold' : 'Regular',
+    u: 0,
+    st: 0,
+    fe: 'Arial',
+  };
+  const langObj = {
+    c: color,
+    t: '',
+    f: 'Arial',
+    s: String(fontSize),
+    sh: String(Number((fontSize * 1.33).toFixed(2))),
+    fs: bold ? 'Bold' : 'Regular',
+    u: '0',
+    st: '0',
+    fe: 'Arial',
+  };
+  return {
+    stateConfig: JSON.stringify({
+      '0': { c: color, ism: 1, single, [lang]: single },
+      '1': { c: color, ism: 1, single, [lang]: single },
+    }),
+    contentConfig: JSON.stringify({
+      '0': langObj,
+      '1': langObj,
+    }),
+  };
+}
+
 interface SymbolLibEntry {
   symbolId: string;
+  symbolType: 'svg' | 'image';
   md5: string;
   color: string;
-  symbolXml: string;
+  symbolXml?: string;
 }
 
 interface SymbolGroupEntry {
   groupId: string;
+  symbolType: 'svg' | 'image';
   stateIds: Record<string, string>;
   colors: Record<string, string>;
 }
@@ -266,6 +191,7 @@ interface SymRecord {
   symbolName: string;
   hwkey: string;
   groupId: string;
+  defaultGroupId: string;
   winId: number;
   md5Config: string;
   textConfig: string;
@@ -280,10 +206,12 @@ interface SymRecord {
 
 /**
  * Compiles validated HMI screens + bound PLC/Internal variables from a HaiwellProject
- * into an official Haiwell Cloud Scada 3.50.x `<HwExportModel>` `.hwExport` XML file
- * using authentic Graphics Library symbols (HWIstrument3, HWCursor3, ConveyorBelt1,
- * HWAlarmTableControlNew, RealTimeCurves, HWHistoricalDataTableNew, HWBoard2/3,
- * lamp013, sw006, Motor1, HWReactor25, HWGear1, HWClock4, HWArrow1, HWChannel1).
+ * into an official Haiwell Cloud Scada 3.50.x `<HwExportModel>` `.hwExport` XML file.
+ * - Uses native `<SymbolType>image</SymbolType>` + 96x96 3D shaded PNGs for `BitSw` & `BitLamp`
+ *   so Haiwell 3.50.x renders crisp 3D pushbuttons & glowing pilot LEDs with zero dashed boxes.
+ * - Uses crisp ISA-101 flat card frames (`Shape` + 28px title header strip) with zero bevel overlap.
+ * - Uses native `Scada.Develop.Symbol.dll` templates for `HWIstrument3`, `HWCursor3`, `ConveyorBelt1`,
+ *   `HWAlarmTableControlNew`, `RealTimeCurves`, `HWHistoricalDataTableNew`, `HWClock4`, `Motor1`, `HWReactor25`, `HWGear1`.
  */
 export function compileProjectToHwExport(
   project: HaiwellProject,
@@ -329,64 +257,70 @@ export function compileProjectToHwExport(
   const pictures = new Map<string, { id: number; md5: string; base64: string }>();
   let nextPicId = 1;
 
-  const ensurePic = (color: string, realAssetKey?: string): string => {
-    if (realAssetKey && HAIWELL_NATIVE_SYMBOLS.librarySymbols[realAssetKey]?.pngBase64) {
-      const asset = HAIWELL_NATIVE_SYMBOLS.librarySymbols[realAssetKey];
-      if (!pictures.has(asset.md5)) {
-        pictures.set(asset.md5, { id: nextPicId++, md5: asset.md5, base64: asset.pngBase64 });
-      }
-      return asset.md5;
+  const registerPng = (png: { base64: string; md5: string }): string => {
+    if (!pictures.has(png.md5)) {
+      pictures.set(png.md5, { id: nextPicId++, md5: png.md5, base64: png.base64 });
     }
-    const { base64, md5 } = generateSolidPngBase64(color);
-    if (!pictures.has(md5)) {
-      pictures.set(md5, { id: nextPicId++, md5, base64 });
-    }
-    return md5;
+    return png.md5;
   };
 
-  const ensureLibrarySymbol = (
-    symbolId: string,
-    color: string,
-    symbolXml: string,
-    realAssetKey?: string
-  ): SymbolLibEntry => {
-    const existing = symbolLibs.get(symbolId);
-    if (existing) return existing;
-    const md5 = ensurePic(color, realAssetKey);
-    const entry: SymbolLibEntry = { symbolId, md5, color, symbolXml };
-    symbolLibs.set(symbolId, entry);
-    return entry;
-  };
+  const ensurePic = (color: string): string => registerPng(generateSolidPngBase64(color));
 
-  const ensureFlatSymbol = (
-    symbolId: string,
-    color: string,
-    borderColor: string,
-    rx = 6
-  ): SymbolLibEntry => {
-    const symbolXml = `<symbol symbolId="${symbolId}" hwsymbolId="HWButton26" set="{'HWBackColor':'${color}'}"><g><rect localid="SymColor" x="0" y="0" rx="${rx}" ry="${rx}" width="100" height="100" stroke="${borderColor}" stroke-width="2" fill="${color}" /></g></symbol>`;
-    return ensureLibrarySymbol(symbolId, color, symbolXml);
-  };
-
-  const ensureGroup = (
+  const ensureImageGroup = (
     groupId: string,
-    entries: { stateKey: string; symbolId: string; color: string; symbolXml: string; realAssetKey?: string }[]
+    states: { stateKey: string; color: string; png: { base64: string; md5: string } }[]
+  ): SymbolGroupEntry => {
+    const existing = symbolGroups.get(groupId);
+    if (existing) return existing;
+    const stateIds: Record<string, string> = {};
+    const colors: Record<string, string> = {};
+    for (const st of states) {
+      const md5 = registerPng(st.png);
+      const symId = `${groupId}_st${st.stateKey}_${md5.slice(0, 8)}`;
+      if (!symbolLibs.has(symId)) {
+        symbolLibs.set(symId, {
+          symbolId: symId,
+          symbolType: 'image',
+          md5,
+          color: st.color,
+        });
+      }
+      stateIds[st.stateKey] = symId;
+      colors[st.stateKey] = st.color;
+    }
+    const grp: SymbolGroupEntry = { groupId, symbolType: 'image', stateIds, colors };
+    symbolGroups.set(groupId, grp);
+    return grp;
+  };
+
+  const ensureSvgGroup = (
+    groupId: string,
+    entries: { stateKey: string; symbolId: string; color: string; symbolXml: string }[]
   ): SymbolGroupEntry => {
     const existing = symbolGroups.get(groupId);
     if (existing) return existing;
     const stateIds: Record<string, string> = {};
     const colors: Record<string, string> = {};
     for (const e of entries) {
-      const s = ensureLibrarySymbol(e.symbolId, e.color, e.symbolXml, e.realAssetKey);
-      stateIds[e.stateKey] = s.symbolId;
+      const md5 = ensurePic(e.color);
+      if (!symbolLibs.has(e.symbolId)) {
+        symbolLibs.set(e.symbolId, {
+          symbolId: e.symbolId,
+          symbolType: 'svg',
+          md5,
+          color: e.color,
+          symbolXml: e.symbolXml,
+        });
+      }
+      stateIds[e.stateKey] = e.symbolId;
       colors[e.stateKey] = e.color;
     }
-    const grp: SymbolGroupEntry = { groupId, stateIds, colors };
+    const grp: SymbolGroupEntry = { groupId, symbolType: 'svg', stateIds, colors };
     symbolGroups.set(groupId, grp);
     return grp;
   };
 
-  const textGroup = ensureGroup('shap001', [
+  const textGroup = ensureSvgGroup('shap001', [
     {
       stateKey: '0',
       symbolId: 'shap001_0',
@@ -419,7 +353,8 @@ export function compileProjectToHwExport(
       fontSize: number,
       bold: boolean,
       localId = 'at',
-      varBindings: { propName: string; varId: number }[] = []
+      varBindings: { propName: string; varId: number }[] = [],
+      defaultGroupId = groupId
     ) => {
       const seq = nextSymDbId++;
       const single = {
@@ -438,6 +373,7 @@ export function compileProjectToHwExport(
         symbolName: symId,
         hwkey,
         groupId,
+        defaultGroupId,
         winId: winDbId,
         md5Config: JSON.stringify(md5Config),
         textConfig: JSON.stringify({ '0': { c: color, ism: 1, single, [lang]: single } }),
@@ -507,6 +443,24 @@ export function compileProjectToHwExport(
       );
     };
 
+    const addFlatRectShape = (
+      x: number,
+      y: number,
+      w: number,
+      h: number,
+      fillHex: string,
+      strokeHex: string,
+      rx = 3
+    ) => {
+      const seq = nextSymDbId++;
+      const symId = `Shape_${seq}`;
+      const hwkey = `${symId}_${seq}`;
+      registerTextOnlyRecord('Shape', symId, hwkey, textGroup.groupId, { '0': ensurePic(fillHex) }, '', '#0F172A', 12, false, 'st');
+      svgElements.push(
+        `<g transform="matrix(${(w / 100).toFixed(6)},0,0,${(h / 100).toFixed(6)},${x},${y})" hw-PowerTime="10" sym-type="Shape" v="0.2" id="${symId}" hwkey="${hwkey}" StCt="1" RemoteOperation="true"><hwsymbol id="${hwkey}" newsym="true" defGId="shap001" title="Graphics" name="Shape" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="${rx}" ry="${rx}" width="100" height="100" stroke="${strokeHex}" stroke-width="1.5" fill="${fillHex}" /></g></g></g></g></g>`
+      );
+    };
+
     const placeDllSymbol = (
       dllKey: string,
       symType: string,
@@ -562,7 +516,7 @@ export function compileProjectToHwExport(
       );
     };
 
-    // Render native pipes (HWChannel1 + HWArrow1) underneath widgets
+    // Render pipes underneath widgets
     for (const pipe of screen.pipes ?? []) {
       const boundFlow = bindTag(pipe.flowTagName);
       if (boundFlow) usedVarIds.add(boundFlow.varId);
@@ -573,18 +527,16 @@ export function compileProjectToHwExport(
         const minX = Math.min(p0.x, p1.x);
         const minY = Math.min(p0.y, p1.y);
         const spanW = Math.max(24, Math.abs(p1.x - p0.x));
-        const spanH = Math.max(16, Math.abs(p1.y - p0.y));
         if (pipe.fluid === 'SIGNAL') {
           const ptsStr = pts.map((p) => `${p.x},${p.y}`).join(' ');
           svgElements.push(
             `<polyline fill="none" stroke="#2563EB" stroke-width="3" stroke-dasharray="6,4" marker-end="url(#arrow2)" points="${ptsStr}" />`
           );
         } else {
-          // Clean horizontal metallic industrial pipe + native HWArrow1
           svgElements.push(
             `<g><rect x="${minX}" y="${minY - 5}" width="${spanW}" height="10" rx="2" fill="#94A3B8" stroke="#334155" stroke-width="1.5" /><line x1="${minX}" y1="${minY - 2}" x2="${minX + spanW}" y2="${minY - 2}" stroke="#E2E8F0" stroke-width="2" /></g>`
           );
-          placeDllSymbol('HWArrow1', 'HWArrow1', minX + Math.round(spanW / 2) - 16, minY - 12, 32, 24, {
+          placeDllSymbol('HWArrow1', 'HWArrow1', minX + Math.round(spanW / 2) - 14, minY - 11, 28, 22, {
             preserveAspect: true,
             extraAttrs: 'StCt="1" HWBackColor="#16A34A"',
           });
@@ -594,7 +546,7 @@ export function compileProjectToHwExport(
           const midY = Math.round((p0.y + p1.y) / 2) - 24;
           addTxtBlock(Math.max(0, midX), Math.max(0, midY), 120, 18, pipe.label, {
             color: pipe.fluid === 'SIGNAL' ? '#1D4ED8' : '#334155',
-            fontSize: 11,
+            fontSize: 10,
             bold: true,
             align: 'center',
           });
@@ -607,35 +559,31 @@ export function compileProjectToHwExport(
       const bound = bindTag(w.tagName);
       if (bound) usedVarIds.add(bound.varId);
 
-      // 1. GROUP_PANEL -> Real Haiwell HWBoard3 (sharp 3D beveled industrial panel) or dark header bar
+      // 1. GROUP_PANEL -> Razor-sharp ISA-101 flat card with dedicated 28px header strip
       if (w.type === 'GROUP_PANEL') {
         const isDark = w.props?.theme === 'dark';
         if (isDark) {
-          const seq = nextSymDbId++;
-          const symId = `Shape_${seq}`;
-          const hwkey = `${symId}_${seq}`;
-          registerTextOnlyRecord('Shape', symId, hwkey, textGroup.groupId, { '0': ensurePic('#1E293B') }, '', '#F8FAFC', 14, true, 'st');
-          svgElements.push(
-            `<g transform="matrix(${(w.width / 100).toFixed(6)},0,0,${(w.height / 100).toFixed(6)},${w.x},${w.y})" hw-PowerTime="10" sym-type="Shape" v="0.2" id="${symId}" hwkey="${hwkey}" StCt="1" RemoteOperation="true"><hwsymbol id="${hwkey}" newsym="true" defGId="shap001" title="Graphics" name="Shape" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="2" ry="2" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="#1E293B" /></g></g></g></g></g>`
-          );
+          addFlatRectShape(w.x, w.y, w.width, w.height, '#1E293B', '#0F172A', 2);
+          if (w.label) {
+            addTxtBlock(w.x + 14, w.y + Math.max(6, Math.round((w.height - 22) / 2)), Math.max(80, w.width - 28), 22, w.label, {
+              color: '#F8FAFC',
+              fontSize: 14,
+              bold: true,
+              align: 'left',
+            });
+          }
         } else {
-          placeDllSymbol('HWBoard3', 'HWBoard3', w.x, w.y, w.width, w.height, {
-            preserveAspect: false,
-            extraAttrs: `HWSurface1="out" HWSurface2="in" HWBackColor1="#CBD5E1" HWBackColor2="#F8FAFC"`,
-            transformVisual: (vis) =>
-              vis
-                .replace(/fill="#DDDDDD"/g, 'fill="#F8FAFC"')
-                .replace(/stroke="#FFFFFF"/g, 'stroke="#FFFFFF"')
-                .replace(/stroke="#666666"/g, 'stroke="#94A3B8"'),
-          });
-        }
-        if (w.label) {
-          addTxtBlock(w.x + 14, w.y + (isDark ? 10 : 8), Math.max(80, w.width - 28), 22, w.label, {
-            color: isDark ? '#F8FAFC' : '#0F172A',
-            fontSize: isDark ? 14 : 12,
-            bold: true,
-            align: 'left',
-          });
+          addFlatRectShape(w.x, w.y, w.width, w.height, '#FFFFFF', '#CBD5E1', 2);
+          const hdrH = Math.min(28, Math.max(22, Math.round(w.height * 0.12)));
+          addFlatRectShape(w.x, w.y, w.width, hdrH, '#E2E8F0', '#CBD5E1', 2);
+          if (w.label) {
+            addTxtBlock(w.x + 10, w.y + Math.round((hdrH - 18) / 2), Math.max(80, w.width - 20), 18, w.label, {
+              color: '#0F172A',
+              fontSize: 11,
+              bold: true,
+              align: 'left',
+            });
+          }
         }
         continue;
       }
@@ -646,9 +594,9 @@ export function compileProjectToHwExport(
           const seq = nextSymDbId++;
           const symId = `Clock4_${seq}`;
           const hwkey = `HWClock4_${seq}_${seq}`;
-          registerTextOnlyRecord('HWClock4', symId, hwkey, textGroup.groupId, { '0': ensurePic('#1E293B') }, '00:00:00', '#38BDF8', 14, true, 'at');
+          registerTextOnlyRecord('HWClock4', symId, hwkey, textGroup.groupId, { '0': ensurePic('#1E293B') }, '00:00:00', '#38BDF8', 13, true, 'at');
           svgElements.push(
-            `<g transform="matrix(1,0,0,1,${w.x},${w.y})" hw-PowerTime="10" sym-type="HWClock4" v="0.3" id="${symId}" hwkey="${hwkey}" Font="" TxtColor="#38BDF8" HWBackColor="#1E293B" HWBackOpacity="100" IsTextBlock="true" DateEnable="true" DataType="7" DataSign="/" WeekEnable="false" TimeEnable="true"><hwsymbol ChangeToPicture="true" id="${hwkey}" newSym="true" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Clock" name="HWClock4" /><g><g sign="state"><g sign="svg" /><g sign="text"><textBlock localid="at" x="0" y="0" width="${w.width}" height="${w.height}" fill="#1E293B" fill-opacity="0" stroke="none" text-color="#38BDF8" text-anchor="right" font-family="Arial" fonten="Arial" font-size="14" sh="18.66" font-weight="bold" wrap="nowrap">2026/11/25 21:20</textBlock></g></g></g></g>`
+            `<g transform="matrix(1,0,0,1,${w.x},${w.y})" hw-PowerTime="10" sym-type="HWClock4" v="0.3" id="${symId}" hwkey="${hwkey}" Font="" TxtColor="#38BDF8" HWBackColor="#1E293B" HWBackOpacity="100" IsTextBlock="true" DateEnable="true" DataType="7" DataSign="/" WeekEnable="false" TimeEnable="true"><hwsymbol ChangeToPicture="true" id="${hwkey}" newSym="true" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Clock" name="HWClock4" /><g><g sign="state"><g sign="svg" /><g sign="text"><textBlock localid="at" x="0" y="0" width="${w.width}" height="${w.height}" fill="#1E293B" fill-opacity="0" stroke="none" text-color="#38BDF8" text-anchor="right" font-family="Arial" fonten="Arial" font-size="13" sh="17.3" font-weight="bold" wrap="nowrap">2026/11/25 21:45</textBlock></g></g></g></g>`
           );
         } else {
           addTxtBlock(w.x, w.y, w.width, w.height, w.label, {
@@ -661,27 +609,28 @@ export function compileProjectToHwExport(
         continue;
       }
 
-      // 3. BIT_BUTTON -> Real Haiwell sw006 (HWNewSwitch2) metallic-bezel industrial pushbutton
+      // 3. BIT_BUTTON -> Native Haiwell <SymbolType>image</SymbolType> BitSw with 96x96 3D pushbutton PNG
       if (w.type === 'BIT_BUTTON') {
         const pal = getPushbuttonPalette(w.visualRole);
+        const png0 = generatePushbuttonPng(pal.state0, false, 96);
+        const png1 = generatePushbuttonPng(pal.state1, true, 96);
+        const grp = ensureImageGroup(`img_sw006_${pal.state0.replace('#', '')}`, [
+          { stateKey: '0', color: pal.state0, png: png0 },
+          { stateKey: '1', color: pal.state1, png: png1 },
+        ]);
+
         const seq = nextSymDbId++;
         const symId = `BitSw_${seq}`;
         const hwkey = `${symId}_${seq}`;
-        const sw0 = HAIWELL_NATIVE_SYMBOLS.librarySymbols['sw006_0'];
-        const sw1 = HAIWELL_NATIVE_SYMBOLS.librarySymbols['sw006_1'];
-        const tint0 = scopeGradientIds(sw0.innerSvg.replace(/#750000/gi, pal.state0), hwkey);
-        const xml0 = sw0.symbolXml.replace(/#750000/gi, pal.state0);
-        const xml1 = sw1.symbolXml.replace(/#FF2D2D/gi, pal.state1);
-        const grp = ensureGroup(`sw006_${pal.state0.replace('#', '')}`, [
-          { stateKey: '0', symbolId: `sw006_${pal.state0.replace('#', '')}_0`, color: pal.state0, symbolXml: xml0, realAssetKey: 'sw006_0' },
-          { stateKey: '1', symbolId: `sw006_${pal.state0.replace('#', '')}_1`, color: pal.state1, symbolXml: xml1, realAssetKey: 'sw006_1' },
-        ]);
-
-        const btnSize = Math.min(w.width, Math.max(36, w.height - 20));
-        const tf = computeNativeMatrix(sw0.bbox, w.x, w.y, w.width, btnSize, true);
+        const size = Math.min(w.width, Math.max(40, w.height - 20));
+        const bx = w.x + (w.width - size) / 2;
+        const by = w.y;
+        const sx = (size / 100).toFixed(6);
+        const sy = (size / 100).toFixed(6);
         const wrtAttrs = bound
           ? `WrtVar="${xmlEsc(bound.fullName)}" WrtVar-UseAddr="false" WrtVar-id="${bound.varId}"`
           : `WrtVar=""`;
+        const txtCfg = buildTwoStateTextConfig(lang, pal.text, 10, true);
 
         symRecords.push({
           id: seq,
@@ -689,58 +638,55 @@ export function compileProjectToHwExport(
           symbolName: symId,
           hwkey,
           groupId: grp.groupId,
+          defaultGroupId: 'sw006',
           winId: winDbId,
-          md5Config: JSON.stringify({
-            '0': symbolLibs.get(grp.stateIds['0'])!.md5,
-            '1': symbolLibs.get(grp.stateIds['1'])!.md5,
-          }),
-          textConfig: JSON.stringify({}),
+          md5Config: JSON.stringify({ '0': png0.md5, '1': png1.md5 }),
+          textConfig: txtCfg.stateConfig,
           stateCount: 2,
-          textContent: JSON.stringify({}),
+          textContent: txtCfg.contentConfig,
           textLocalId: 'st',
           textColor: pal.text,
-          fontSize: 11,
+          fontSize: 10,
           fontWeight: 'bold',
           varBindings: bound ? [{ propName: 'WrtVar-id', varId: bound.varId }] : [],
         });
 
         svgElements.push(
-          `<g transform="${tf}" hw-PowerTime="10" sym-type="BitSw" v="0.1" id="${symId}" hwkey="${hwkey}" RvrsSt="false" DifVar="false" ActnLock="false" LockLogic="off" StCt="2" ActnType="sw" ActnEff="false" WhthCnfrmBox="false" ${wrtAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="sw006" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit switch" title-en="Bit switch" name="BitSw" /><g><g sign="state"><g sign="svg">${tint0}</g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" cst="0" /></g></g></g></g>`
+          `<g transform="matrix(${sx},0,0,${sy},${bx.toFixed(2)},${by.toFixed(2)})" hw-PowerTime="10" sym-type="BitSw" v="0.1" id="${symId}" hwkey="${hwkey}" RvrsSt="false" DifVar="false" ActnLock="false" LockMode="var" LockExpress-Express="" LockExpress-Enable="false" LockLogic="off" LockStyle="show" StCt="2" ActnType="sw" ActnEff="false" WhthCnfrmBox="false" CnfrmType="all" UseMiniTime="false" MiniTime="3.0" UseDisplayTime="true" DisplayLocal="up_down" IsNoticeEnable="false" NoticeOrderType="before" NoticeType="bit" ActionType="sw" NumVarValue="1" ${wrtAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="sw006" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit switch" title-en="Bit switch" name="BitSw" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
         );
-        addTxtBlock(w.x, w.y + btnSize + 2, w.width, 18, w.label, {
+        addTxtBlock(w.x, w.y + size + 2, w.width, 18, w.label, {
           color: '#0F172A',
-          fontSize: 11,
+          fontSize: 10,
           bold: true,
           align: 'center',
         });
         continue;
       }
 
-      // 4. BIT_LAMP -> Real Haiwell lamp013 (HWLight8) glowing 3D pilot LED
+      // 4. BIT_LAMP -> Native Haiwell <SymbolType>image</SymbolType> BitLamp with 96x96 3D pilot LED PNG
       if (w.type === 'BIT_LAMP') {
         const offHex = w.visualRole === 'DANGER_ACTION' ? '#DC2626' : '#64748B';
         const onHex = '#22C55E';
+        const png0 = generateLedLampPng(offHex, false, 96);
+        const png1 = generateLedLampPng(onHex, true, 96);
+        const grp = ensureImageGroup(`img_lamp013_${offHex.replace('#', '')}`, [
+          { stateKey: '0', color: offHex, png: png0 },
+          { stateKey: '1', color: onHex, png: png1 },
+        ]);
+
         const seq = nextSymDbId++;
         const symId = `BitLamp_${seq}`;
         const hwkey = `${symId}_${seq}`;
-        const l0 = HAIWELL_NATIVE_SYMBOLS.librarySymbols['lamp013_0'];
-        const l1 = HAIWELL_NATIVE_SYMBOLS.librarySymbols['lamp013_1'];
-        const ledSvg = scopeGradientIds(l0.innerSvg.replace(/#006000/gi, offHex), hwkey);
-        const xml0 = l0.symbolXml.replace(/#006000/gi, offHex);
-        const xml1 = l1.symbolXml.replace(/#28FF28/gi, onHex);
-        const grp = ensureGroup(`lamp013_${offHex.replace('#', '')}`, [
-          { stateKey: '0', symbolId: `lamp013_${offHex.replace('#', '')}_0`, color: offHex, symbolXml: xml0, realAssetKey: 'lamp013_0' },
-          { stateKey: '1', symbolId: `lamp013_${offHex.replace('#', '')}_1`, color: onHex, symbolXml: xml1, realAssetKey: 'lamp013_1' },
-        ]);
-
-        const horizontal = w.width >= w.height * 2.2;
-        const ledSize = horizontal ? Math.min(34, w.height - 4) : Math.min(w.width, Math.max(24, w.height - 20));
-        const ledX = horizontal ? w.x + 4 : w.x;
-        const ledY = horizontal ? w.y + Math.round((w.height - ledSize) / 2) : w.y;
-        const tf = computeNativeMatrix(l0.bbox, ledX, ledY, horizontal ? ledSize : w.width, ledSize, true);
+        const horizontal = w.width >= w.height * 2.0;
+        const ledSize = horizontal ? Math.min(28, w.height - 4) : Math.min(34, w.width, Math.max(24, w.height - 20));
+        const lx = horizontal ? w.x + 2 : w.x + (w.width - ledSize) / 2;
+        const ly = horizontal ? w.y + (w.height - ledSize) / 2 : w.y;
+        const sx = (ledSize / 100).toFixed(6);
+        const sy = (ledSize / 100).toFixed(6);
         const rdAttrs = bound
           ? `RdVar="${xmlEsc(bound.fullName)}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
           : `RdVar=""`;
+        const txtCfg = buildTwoStateTextConfig(lang, '#0F172A', 10, true);
 
         symRecords.push({
           id: seq,
@@ -748,27 +694,25 @@ export function compileProjectToHwExport(
           symbolName: symId,
           hwkey,
           groupId: grp.groupId,
+          defaultGroupId: 'lamp013',
           winId: winDbId,
-          md5Config: JSON.stringify({
-            '0': symbolLibs.get(grp.stateIds['0'])!.md5,
-            '1': symbolLibs.get(grp.stateIds['1'])!.md5,
-          }),
-          textConfig: JSON.stringify({}),
+          md5Config: JSON.stringify({ '0': png0.md5, '1': png1.md5 }),
+          textConfig: txtCfg.stateConfig,
           stateCount: 2,
-          textContent: JSON.stringify({}),
+          textContent: txtCfg.contentConfig,
           textLocalId: 'st',
           textColor: '#0F172A',
-          fontSize: 11,
+          fontSize: 10,
           fontWeight: 'bold',
           varBindings: bound ? [{ propName: 'RdVar-id', varId: bound.varId }] : [],
         });
 
         svgElements.push(
-          `<g transform="${tf}" hw-PowerTime="10" sym-type="BitLamp" v="0.4" id="${symId}" hwkey="${hwkey}" RvrsSt="false" StCt="2" Model="none" Type="on" IsOFFCtrl="false" FrqTime="1000" EnblExps="" ${rdAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="lamp013" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit lamp" title-en="Bit lamp" name="BitLamp" /><g><g sign="state"><g sign="svg">${ledSvg}</g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" cst="0" /></g></g></g></g>`
+          `<g transform="matrix(${sx},0,0,${sy},${lx.toFixed(2)},${ly.toFixed(2)})" hw-PowerTime="10" sym-type="BitLamp" v="0.4" id="${symId}" hwkey="${hwkey}" RvrsSt="false" StCt="2" Model="none" Type="on" IsOFFCtrl="false" FrqTime="1000" EnblExps="" ${rdAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="lamp013" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit lamp" title-en="Bit lamp" name="BitLamp" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
         );
 
         if (horizontal) {
-          addTxtBlock(w.x + ledSize + 10, w.y + Math.round((w.height - 18) / 2), Math.max(40, w.width - ledSize - 12), 18, w.label, {
+          addTxtBlock(w.x + ledSize + 8, w.y + Math.round((w.height - 18) / 2), Math.max(40, w.width - ledSize - 10), 18, w.label, {
             color: w.props?.labelColor ? String(w.props.labelColor) : '#0F172A',
             fontSize: 11,
             bold: true,
@@ -801,7 +745,6 @@ export function compileProjectToHwExport(
           preserveAspect: true,
           extraAttrs: extra,
           varBindings: bound ? [{ propName: 'HWNumVar-id', varId: bound.varId }] : [],
-          transformVisual: (vis) => vis.replace(/>仪表</g, `>${xmlEsc(w.unit || '%')}<`),
         });
         continue;
       }
@@ -822,7 +765,6 @@ export function compileProjectToHwExport(
           preserveAspect: true,
           extraAttrs: extra,
           varBindings: bound ? [{ propName: 'HWNumVar-id', varId: bound.varId }] : [],
-          transformVisual: (vis) => vis.replace(/>游标</g, `>${xmlEsc(w.unit || 'Qty')}<`).replace(/>000</g, '>0<'),
         });
         continue;
       }
@@ -872,31 +814,30 @@ export function compileProjectToHwExport(
         continue;
       }
 
-      // 11. STATION / ACTUATOR / PUMP / VALVE / TANK -> Real Haiwell HWBoard3 + Machine/Motor/Gear/Reactor25
+      // 11. STATION / ACTUATOR / PUMP / VALVE / TANK -> Crisp ISA-101 Station Card + Native Machinery Symbol
       if (w.type === 'STATION' || w.type === 'ACTUATOR' || w.type === 'PUMP' || w.type === 'VALVE' || w.type === 'TANK') {
         const iconKey =
           typeof w.props?.nativeSymbol === 'string' && HAIWELL_NATIVE_SYMBOLS.dllSymbols[w.props.nativeSymbol]
             ? w.props.nativeSymbol
             : w.type === 'STATION'
               ? 'HWReactor25'
-              : w.type === 'ACTUATOR'
+              : w.type === 'ACTUATOR' || w.type === 'PUMP'
                 ? 'Motor1'
-                : w.type === 'PUMP'
-                  ? 'Motor1'
-                  : 'HWReactor25';
+                : 'HWReactor25';
 
         if (w.type === 'STATION') {
-          placeDllSymbol('HWBoard3', 'HWBoard3', w.x, w.y, w.width, w.height, {
-            preserveAspect: false,
-            extraAttrs: `HWSurface1="out" HWSurface2="in" HWBackColor1="#E2E8F0" HWBackColor2="#F8FAFC"`,
-          });
-          addTxtBlock(w.x + 12, w.y + 8, Math.max(60, w.width - 24), 22, w.label, {
-            color: '#0F172A',
-            fontSize: 12,
+          addFlatRectShape(w.x, w.y, w.width, w.height, '#FFFFFF', '#94A3B8', 2);
+          addFlatRectShape(w.x, w.y, w.width, 28, '#334155', '#1E293B', 2);
+          addTxtBlock(w.x + 8, w.y + 5, Math.max(60, w.width - 16), 18, w.label, {
+            color: '#F8FAFC',
+            fontSize: 11,
             bold: true,
             align: 'center',
           });
-          placeDllSymbol(iconKey, iconKey, w.x + Math.round(w.width * 0.14), w.y + 38, Math.round(w.width * 0.56), Math.max(48, w.height - 64), {
+          const iconZoneH = typeof w.props?.iconZoneHeight === 'number'
+            ? w.props.iconZoneHeight
+            : Math.max(56, w.height - 44);
+          placeDllSymbol(iconKey, iconKey, w.x + 14, w.y + 34, Math.max(48, w.width - 28), iconZoneH, {
             preserveAspect: true,
             extraAttrs: bound ? `RdVar="${xmlEsc(bound.fullName)}" RdVar-id="${bound.varId}"` : '',
             varBindings: bound ? [{ propName: 'RdVar-id', varId: bound.varId }] : [],
@@ -924,18 +865,17 @@ export function compileProjectToHwExport(
         const symId = `WinOpBtn_${seq}`;
         const hwkey = `${symId}_${seq}`;
         const btnAsset = HAIWELL_NATIVE_SYMBOLS.librarySymbols['btn214_0'];
-        const grp = ensureGroup(`btn214_${bgHex.replace('#', '')}`, [
+        const grp = ensureSvgGroup(`btn214_${bgHex.replace('#', '')}`, [
           {
             stateKey: '0',
             symbolId: `btn214_${bgHex.replace('#', '')}_0`,
             color: bgHex,
             symbolXml: btnAsset.symbolXml.replace(/#77C34F/gi, bgHex),
-            realAssetKey: 'btn214_0',
           },
         ]);
         const sx = (w.width / 100).toFixed(6);
         const sy = (w.height / 100).toFixed(6);
-        registerTextOnlyRecord('WinOpBtn', symId, hwkey, grp.groupId, { '0': symbolLibs.get(grp.stateIds['0'])!.md5 }, '', '#FFFFFF', 12, true, 'st');
+        registerTextOnlyRecord('WinOpBtn', symId, hwkey, grp.groupId, { '0': symbolLibs.get(grp.stateIds['0'])!.md5 }, '', '#FFFFFF', 12, true, 'st', [], 'btn214');
         svgElements.push(
           `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WinOpBtn" v="0.1" id="${symId}" hwkey="${hwkey}" Fun="show_spef_pic" Pic="${xmlEsc(navTarget)}" SubPic="" IsPrintHidden="false" ActnEff="false" WhthCnfrmBox="false" ActnLock="false" StCt="1"><hwsymbol id="${hwkey}" newsym="true" defGId="btn214" title="Picture operation button" name="WinOpBtn" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
         );
@@ -958,7 +898,7 @@ export function compileProjectToHwExport(
       const boxH = Math.max(24, w.height - labelH);
       addTxtBlock(w.x + 2, w.y, Math.max(40, w.width - 4), labelH, w.label, {
         color: '#334155',
-        fontSize: 11,
+        fontSize: 10,
         bold: true,
         align: 'left',
       });
@@ -967,16 +907,15 @@ export function compileProjectToHwExport(
       const symType = isString ? 'TxtShowIput' : 'NumShowIput';
       const symId = `${symType}_${seq}`;
       const hwkey = `${symId}_${seq}`;
-      const cardFill = w.visualRole === 'KPI_HERO' ? '#EFF6FF' : '#FFFFFF';
-      const cardBorder = w.visualRole === 'KPI_HERO' ? '#2563EB' : '#94A3B8';
+      const cardFill = w.visualRole === 'KPI_HERO' ? '#EFF6FF' : w.visualRole === 'DANGER_ACTION' ? '#FEF2F2' : '#FFFFFF';
+      const cardBorder = w.visualRole === 'KPI_HERO' ? '#2563EB' : w.visualRole === 'DANGER_ACTION' ? '#DC2626' : '#94A3B8';
       const btn226 = HAIWELL_NATIVE_SYMBOLS.librarySymbols['btn226_0'];
-      const grp = ensureGroup(`btn226_${cardFill.replace('#', '')}`, [
+      const grp = ensureSvgGroup(`btn226_${cardFill.replace('#', '')}`, [
         {
           stateKey: '0',
           symbolId: `btn226_${cardFill.replace('#', '')}_0`,
           color: cardFill,
           symbolXml: btn226.symbolXml.replace(/#C7E1F0/gi, cardFill),
-          realAssetKey: 'btn226_0',
         },
       ]);
       const sx = (w.width / 100).toFixed(6);
@@ -997,10 +936,11 @@ export function compileProjectToHwExport(
         { '0': symbolLibs.get(grp.stateIds['0'])!.md5 },
         isString ? '---' : `0${unitStr ? ` ${unitStr}` : ''}`,
         '#0F172A',
-        w.visualRole === 'KPI_HERO' ? 16 : 13,
+        w.visualRole === 'KPI_HERO' ? 14 : 12,
         true,
         'at',
-        bindings
+        bindings,
+        'btn226'
       );
       const attrs = bound
         ? isString
@@ -1008,7 +948,7 @@ export function compileProjectToHwExport(
           : `SignDisp="true" IsPwdDisp="false" KilobitDisp="false" IsIput="${isInput}" ShowLeftTag="false" ShowRightTag="${Boolean(unitStr)}" DifVar="false" LeftTag="" RightTag="${xmlEsc(unitStr)}" NumHex="10" IntNum="6" DcmPls="${decimals}" HwLimit="num" IputMaxVal="${w.max ?? 32767}" IputMinVal="${w.min ?? -32768}" Font="" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar="${xmlEsc(bound.fullName)}" WrtVar="${isInput ? xmlEsc(bound.fullName) : ''}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
         : `SignDisp="true" IsIput="false" DcmPls="${decimals}" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar=""`;
       svgElements.push(
-        `<g transform="matrix(${sx},0,0,${sy},${w.x},${boxY})" hw-PowerTime="10" sym-type="${symType}" v="0.4" id="${symId}" hwkey="${hwkey}" ${attrs}><hwsymbol id="${hwkey}" newsym="true" defGId="btn226" title="Numeric input/display" name="${symType}" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="4" ry="4" width="100" height="100" stroke="${cardBorder}" stroke-width="2" fill="${cardFill}" /></g></g><g sign="text"><textBlock localid="at" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#0F172A" text-anchor="center" font-family="Arial" fonten="Arial" font-size="${w.visualRole === 'KPI_HERO' ? 16 : 13}" sh="20" font-weight="bold" cst="0">${isString ? '---' : `0${unitStr ? ` ${xmlEsc(unitStr)}` : ''}`}</textBlock></g></g></g></g>`
+        `<g transform="matrix(${sx},0,0,${sy},${w.x},${boxY})" hw-PowerTime="10" sym-type="${symType}" v="0.4" id="${symId}" hwkey="${hwkey}" ${attrs}><hwsymbol id="${hwkey}" newsym="true" defGId="btn226" title="Numeric input/display" name="${symType}" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="4" ry="4" width="100" height="100" stroke="${cardBorder}" stroke-width="2" fill="${cardFill}" /></g></g><g sign="text"><textBlock localid="at" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#0F172A" text-anchor="center" font-family="Arial" fonten="Arial" font-size="${w.visualRole === 'KPI_HERO' ? 14 : 12}" sh="18" font-weight="bold" cst="0">${isString ? '---' : `0${unitStr ? ` ${xmlEsc(unitStr)}` : ''}`}</textBlock></g></g></g></g>`
       );
     }
 
@@ -1096,8 +1036,21 @@ export function compileProjectToHwExport(
     .join('\n');
 
   const dicSymXml = symRecords
-    .map(
-      (s) => `      <SerializableDictionary>
+    .map((s) => {
+      const varUsingXml =
+        s.varBindings.length > 0
+          ? `\n            <SymbolVariableUsing>${xmlEsc(
+              JSON.stringify(
+                s.varBindings.map((vb) => ({
+                  PropName: vb.propName,
+                  VariableID: vb.varId,
+                  IsCollection: false,
+                  VariableList: null,
+                }))
+              )
+            )}</SymbolVariableUsing>`
+          : '';
+      return `      <SerializableDictionary>
         <key>
           <string>${xmlEsc(s.hwkey)}</string>
         </key>
@@ -1114,13 +1067,13 @@ export function compileProjectToHwExport(
             <SymbolStateMd5Config>${xmlEsc(s.md5Config)}</SymbolStateMd5Config>
             <SymbolStateTextConfig>${xmlEsc(s.textConfig)}</SymbolStateTextConfig>
             <IsSingle>0</IsSingle>
-            <DefaultGroupId>${xmlEsc(s.groupId)}</DefaultGroupId>
-            <StateCount>${s.stateCount}</StateCount>
+            <DefaultGroupId>${xmlEsc(s.defaultGroupId)}</DefaultGroupId>
+            <StateCount>${s.stateCount}</StateCount>${varUsingXml}
             <IsPublicWindow>0</IsPublicWindow>
           </ProjectSymbol>
         </value>
-      </SerializableDictionary>`
-    )
+      </SerializableDictionary>`;
+    })
     .join('\n');
 
   const dicSymGrpLibXml = Array.from(symbolGroups.values())
@@ -1135,13 +1088,17 @@ export function compileProjectToHwExport(
             <ClassifyId>0</ClassifyId>
             <SymbolGroupId>${xmlEsc(g.groupId)}</SymbolGroupId>
             <GroupConfig>${xmlEsc(JSON.stringify(g.stateIds))}</GroupConfig>
-            <DefaultDisplaySetting>${xmlEsc(
-              JSON.stringify(
-                Object.fromEntries(Object.entries(g.colors).map(([k, v]) => [k, { HWBackColor: v }]))
-              )
-            )}</DefaultDisplaySetting>
+            <DefaultDisplaySetting>${
+              g.symbolType === 'image'
+                ? '{}'
+                : xmlEsc(
+                    JSON.stringify(
+                      Object.fromEntries(Object.entries(g.colors).map(([k, v]) => [k, { HWBackColor: v }]))
+                    )
+                  )
+            }</DefaultDisplaySetting>
             <StateCount>${Object.keys(g.stateIds).length}</StateCount>
-            <SymbolType>svg</SymbolType>
+            <SymbolType>${g.symbolType}</SymbolType>
           </ProjectSymbolGroupLibrary>
         </value>
       </SerializableDictionary>`
@@ -1159,9 +1116,8 @@ export function compileProjectToHwExport(
             <ID>${idx + 1}</ID>
             <ClassifyId>0</ClassifyId>
             <SymbolId>${xmlEsc(lib.symbolId)}</SymbolId>
-            <SymbolType>svg</SymbolType>
-            <PicMd5>${lib.md5}</PicMd5>
-            <SymbolXml>${xmlEsc(lib.symbolXml)}</SymbolXml>
+            <SymbolType>${lib.symbolType}</SymbolType>
+            <PicMd5>${lib.md5}</PicMd5>${lib.symbolType === 'svg' && lib.symbolXml ? `\n            <SymbolXml>${xmlEsc(lib.symbolXml)}</SymbolXml>` : ''}
           </ProjectSymbolLibrary>
         </value>
       </SerializableDictionary>`

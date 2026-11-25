@@ -77,7 +77,7 @@ test('CRIT-01: Live HTTP server blocks trailing-slash/uppercase auth bypasses, e
   const baseUrl = `http://127.0.0.1:${port}`;
 
   try {
-    assert.equal(SERVER_VERSION, '2.11.0');
+    assert.equal(SERVER_VERSION, '2.12.0');
 
     // A. Auth bypass PoC vectors: trailing slash, uppercase, double slash, mixed case
     const bypassVectors: { method: string; urlPath: string; body?: unknown }[] = [

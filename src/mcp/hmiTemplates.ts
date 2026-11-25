@@ -1,0 +1,549 @@
+import type { HmiPipeRoute, HmiScreen, HmiVisualRole, HmiWidget } from './types';
+
+export type HmiTemplateKind =
+  | 'INDUSTRIAL_LINE_OVERVIEW'
+  | 'MULTI_STATION_PROCESS_FLOW'
+  | 'ALARMS_TRENDS_DIAGNOSTICS'
+  | 'STATION_IO_DETAIL';
+
+export interface TemplateNavTab {
+  label: string;
+  targetScreenName: string;
+  active?: boolean;
+}
+
+export interface TemplateCommandItem {
+  label: string;
+  tagName: string;
+  role?: HmiVisualRole;
+}
+
+export interface TemplateIndicatorItem {
+  label: string;
+  tagName: string;
+}
+
+export interface TemplateReadoutItem {
+  label: string;
+  tagName: string;
+  unit?: string;
+  precision?: number;
+  role?: HmiVisualRole;
+}
+
+export interface TemplateStationItem {
+  title: string;
+  icon: 'HWReactor25' | 'HWCursor3' | 'Motor1';
+  secondaryIcon?: 'HWGear1';
+  tagName?: string;
+  ioIndicators?: TemplateIndicatorItem[];
+  kpi?: TemplateReadoutItem;
+}
+
+export interface TemplateTransferItem {
+  label: string;
+  fluid: 'TRANSFER' | 'SIGNAL';
+  conveyorTagName?: string;
+}
+
+export interface InstantiateTemplateInput {
+  template: HmiTemplateKind;
+  screenId: string;
+  name: string;
+  title: string;
+  width?: number;
+  height?: number;
+  eStopTag?: string;
+  navTabs?: TemplateNavTab[];
+  // INDUSTRIAL_LINE_OVERVIEW
+  commands?: TemplateCommandItem[];
+  commIndicators?: TemplateIndicatorItem[];
+  leftReadouts?: TemplateReadoutItem[];
+  gauge?: { label: string; tagName: string; min?: number; max?: number; unit?: string; precision?: number };
+  bar?: { label: string; tagName: string; min?: number; max?: number; unit?: string };
+  heroKpis?: TemplateReadoutItem[];
+  stationCycles?: TemplateReadoutItem[];
+  ioIndicators?: TemplateIndicatorItem[];
+  includeAlarmTable?: boolean;
+  // MULTI_STATION_PROCESS_FLOW
+  stations?: TemplateStationItem[];
+  transfers?: TemplateTransferItem[];
+  quickCommands?: TemplateCommandItem[];
+  bottomReadouts?: TemplateReadoutItem[];
+  // ALARMS_TRENDS_DIAGNOSTICS
+  trendTagName?: string;
+  runIdTagName?: string;
+  sequenceCounters?: TemplateReadoutItem[];
+  // STATION_IO_DETAIL
+  inputs?: TemplateIndicatorItem[];
+  outputs?: TemplateCommandItem[];
+}
+
+function makeHeader(key: string, title: string, eStopTag?: string): HmiWidget[] {
+  const out: HmiWidget[] = [
+    {
+      id: `${key}_hdr_bg`,
+      type: 'GROUP_PANEL',
+      label: title,
+      x: 10,
+      y: 8,
+      width: 1004,
+      height: 44,
+      props: { theme: 'dark' },
+    },
+  ];
+  if (eStopTag) {
+    out.push({
+      id: `${key}_hdr_estop`,
+      type: 'BIT_LAMP',
+      label: 'E-STOP OK',
+      tagName: eStopTag,
+      visualRole: 'DANGER_ACTION',
+      x: 706,
+      y: 13,
+      width: 142,
+      height: 34,
+      props: { labelColor: '#F8FAFC' },
+    });
+  }
+  out.push({
+    id: `${key}_hdr_clk`,
+    type: 'LABEL',
+    label: 'CLOCK',
+    x: 860,
+    y: 18,
+    width: 144,
+    height: 24,
+    props: { nativeSymbol: 'HWClock4' },
+  });
+  return out;
+}
+
+function makeNavBar(key: string, tabs: TemplateNavTab[] = []): HmiWidget[] {
+  const list = tabs.slice(0, 6);
+  if (list.length === 0) return [];
+  const totalW = 996;
+  const gap = 8;
+  const btnW = Math.floor((totalW - gap * (list.length - 1)) / list.length);
+  return list.map((t, idx) => ({
+    id: `${key}_nav_${idx}`,
+    type: 'NAV_BAR',
+    label: t.label,
+    x: 14 + idx * (btnW + gap),
+    y: 540,
+    width: btnW,
+    height: 46,
+    props: {
+      targetScreenName: t.targetScreenName,
+      active: Boolean(t.active),
+    },
+  }));
+}
+
+function scaleScreen(screen: HmiScreen, targetW: number, targetH: number): HmiScreen {
+  if (targetW === 1024 && targetH === 600) return screen;
+  const sx = targetW / 1024;
+  const sy = targetH / 600;
+  return {
+    ...screen,
+    width: targetW,
+    height: targetH,
+    widgets: screen.widgets.map((w) => ({
+      ...w,
+      x: Math.round(w.x * sx),
+      y: Math.round(w.y * sy),
+      width: Math.max(24, Math.round(w.width * sx)),
+      height: Math.max(20, Math.round(w.height * sy)),
+    })),
+    pipes: screen.pipes?.map((p) => ({
+      ...p,
+      waypoints: p.waypoints.map((pt) => ({
+        x: Math.round(pt.x * sx),
+        y: Math.round(pt.y * sy),
+      })),
+    })),
+  };
+}
+
+/**
+ * Instantiates a hard-coded, zero-overlap ISA-101 HMI screen template.
+ * AI agents supply only semantic bindings (titles, tags, stations, nav tabs);
+ * all coordinates, margins, and card paddings are guaranteed pixel-aligned.
+ */
+export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScreen {
+  const targetW = input.width ?? 1024;
+  const targetH = input.height ?? 600;
+  const key = input.screenId.replace(/[^a-zA-Z0-9_]/g, '_');
+  const now = new Date().toISOString();
+  const widgets: HmiWidget[] = [
+    ...makeHeader(key, input.title, input.eStopTag),
+  ];
+  const pipes: HmiPipeRoute[] = [];
+
+  if (input.template === 'INDUSTRIAL_LINE_OVERVIEW') {
+    // 3 equal-height cards: Left (x=14..324), Center (x=338..682), Right (x=696..1010)
+    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: 'LINE COMMANDS & PLC COMM', x: 14, y: 62, width: 310, height: 466 });
+    const cmds = (input.commands ?? []).slice(0, 3);
+    cmds.forEach((c, i) => {
+      widgets.push({
+        id: `${key}_cmd_${i}`,
+        type: 'BIT_BUTTON',
+        label: c.label,
+        tagName: c.tagName,
+        writeEnabled: true,
+        visualRole: c.role ?? 'DEFAULT',
+        x: 28 + i * 96,
+        y: 100,
+        width: 88,
+        height: 90,
+      });
+    });
+
+    const comms = (input.commIndicators ?? []).slice(0, 4);
+    comms.forEach((cm, i) => {
+      widgets.push({
+        id: `${key}_comm_${i}`,
+        type: 'BIT_LAMP',
+        label: cm.label,
+        tagName: cm.tagName,
+        x: 28,
+        y: 204 + i * 40,
+        width: 282,
+        height: 34,
+      });
+    });
+
+    const leftReads = (input.leftReadouts ?? []).slice(0, 2);
+    leftReads.forEach((lr, i) => {
+      widgets.push({
+        id: `${key}_lr_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: lr.label,
+        tagName: lr.tagName,
+        unit: lr.unit,
+        precision: lr.precision,
+        x: 28,
+        y: 374 + i * 72,
+        width: 282,
+        height: 62,
+      });
+    });
+
+    widgets.push({ id: `${key}_p_mid`, type: 'GROUP_PANEL', label: 'PRODUCTION KPIS & YIELD', x: 338, y: 62, width: 344, height: 466 });
+    if (input.gauge) {
+      widgets.push({
+        id: `${key}_gauge`,
+        type: 'GAUGE',
+        label: input.gauge.label,
+        tagName: input.gauge.tagName,
+        min: input.gauge.min ?? 0,
+        max: input.gauge.max ?? 100,
+        unit: input.gauge.unit ?? '%',
+        precision: input.gauge.precision ?? 1,
+        x: 352,
+        y: 100,
+        width: 192,
+        height: 214,
+      });
+    }
+    if (input.bar) {
+      widgets.push({
+        id: `${key}_bar`,
+        type: 'BAR_GRAPH',
+        label: input.bar.label,
+        tagName: input.bar.tagName,
+        min: input.bar.min ?? 0,
+        max: input.bar.max ?? 100,
+        unit: input.bar.unit ?? 'pcs',
+        x: 554,
+        y: 100,
+        width: 114,
+        height: 214,
+      });
+    }
+
+    const heros = (input.heroKpis ?? []).slice(0, 2);
+    heros.forEach((hk, i) => {
+      widgets.push({
+        id: `${key}_hero_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: hk.label,
+        tagName: hk.tagName,
+        unit: hk.unit,
+        precision: hk.precision,
+        visualRole: hk.role ?? 'KPI_HERO',
+        x: 352 + i * 162,
+        y: 332,
+        width: 154,
+        height: 76,
+      });
+    });
+
+    const cycs = (input.stationCycles ?? []).slice(0, 3);
+    cycs.forEach((sc, i) => {
+      widgets.push({
+        id: `${key}_cyc_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: sc.label,
+        tagName: sc.tagName,
+        unit: sc.unit ?? 's',
+        precision: sc.precision ?? 1,
+        x: 352 + i * 108,
+        y: 424,
+        width: 100,
+        height: 72,
+      });
+    });
+
+    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: 'ACTIVE ALARMS & STATION I/O', x: 696, y: 62, width: 314, height: 466 });
+    const ios = (input.ioIndicators ?? []).slice(0, 3);
+    ios.forEach((io, i) => {
+      widgets.push({
+        id: `${key}_io_${i}`,
+        type: 'BIT_LAMP',
+        label: io.label,
+        tagName: io.tagName,
+        x: 710,
+        y: 100 + i * 40,
+        width: 286,
+        height: 34,
+      });
+    });
+    if (input.includeAlarmTable !== false) {
+      widgets.push({
+        id: `${key}_alm_tbl`,
+        type: 'ALARM_BANNER',
+        label: 'Active Process Alarms',
+        x: 710,
+        y: 230,
+        width: 286,
+        height: 282,
+      });
+    }
+  } else if (input.template === 'MULTI_STATION_PROCESS_FLOW') {
+    const stations = (input.stations ?? []).slice(0, 4);
+    const n = Math.max(2, stations.length);
+    const gap = n <= 3 ? 136 : 76;
+    const marginX = 16;
+    const totalW = 1024 - marginX * 2;
+    const stW = Math.floor((totalW - gap * (n - 1)) / n);
+    const stH = 314;
+
+    stations.forEach((st, idx) => {
+      const sx = marginX + idx * (stW + gap);
+      widgets.push({
+        id: `${key}_st_card_${idx}`,
+        type: 'GROUP_PANEL',
+        label: st.title,
+        x: sx,
+        y: 64,
+        width: stW,
+        height: stH,
+      });
+      const iconW = st.secondaryIcon ? Math.max(60, stW - 92) : Math.max(80, stW - 28);
+      widgets.push({
+        id: `${key}_st_${idx}`,
+        type: 'ACTUATOR',
+        label: st.title,
+        tagName: st.tagName,
+        x: sx + 14,
+        y: 98,
+        width: iconW,
+        height: 192,
+        props: { nativeSymbol: st.icon },
+      });
+      if (st.secondaryIcon) {
+        widgets.push({
+          id: `${key}_st_${idx}_sec`,
+          type: 'ACTUATOR',
+          label: 'Aux',
+          x: sx + stW - 72,
+          y: 112,
+          width: 56,
+          height: 56,
+          props: { nativeSymbol: st.secondaryIcon },
+        });
+      }
+      const stIos = (st.ioIndicators ?? []).slice(0, 2);
+      stIos.forEach((io, j) => {
+        const halfW = st.kpi ? Math.floor((stW - 28) / 2) : Math.floor((stW - 28) / Math.max(1, stIos.length));
+        widgets.push({
+          id: `${key}_st_${idx}_io_${j}`,
+          type: 'BIT_LAMP',
+          label: io.label,
+          tagName: io.tagName,
+          x: sx + 10 + j * (halfW + 8),
+          y: 306,
+          width: halfW,
+          height: 58,
+        });
+      });
+      if (st.kpi) {
+        const halfW = Math.floor((stW - 28) / 2);
+        widgets.push({
+          id: `${key}_st_${idx}_kpi`,
+          type: 'NUMERIC_DISPLAY',
+          label: st.kpi.label,
+          tagName: st.kpi.tagName,
+          unit: st.kpi.unit,
+          precision: st.kpi.precision,
+          x: sx + 10 + halfW + 8,
+          y: 304,
+          width: halfW,
+          height: 60,
+        });
+      }
+
+      if (idx < n - 1) {
+        const tr = input.transfers?.[idx];
+        const leftEdge = sx + stW;
+        const rightEdge = leftEdge + gap;
+        if (tr) {
+          pipes.push({
+            id: `${key}_pipe_${idx}`,
+            fromWidgetId: `${key}_st_card_${idx}`,
+            toWidgetId: `${key}_st_card_${idx + 1}`,
+            fromPort: 'right',
+            toPort: 'left',
+            fluid: tr.fluid,
+            label: tr.label,
+            waypoints: [{ x: leftEdge, y: 158 }, { x: rightEdge, y: 158 }],
+          });
+        }
+        widgets.push({
+          id: `${key}_conv_${idx}`,
+          type: 'CONVEYOR',
+          label: tr?.label ?? `Transfer ${idx + 1}`,
+          tagName: tr?.conveyorTagName,
+          x: leftEdge + 8,
+          y: 194,
+          width: gap - 16,
+          height: 44,
+        });
+      }
+    });
+
+    // Bottom Interlock & Cycle Bar
+    widgets.push({ id: `${key}_bot_panel`, type: 'GROUP_PANEL', label: 'LINE INTERLOCK & QUICK CONTROL', x: 16, y: 390, width: 992, height: 138 });
+    (input.quickCommands ?? []).slice(0, 3).forEach((qc, i) => {
+      widgets.push({
+        id: `${key}_qc_${i}`,
+        type: 'BIT_BUTTON',
+        label: qc.label,
+        tagName: qc.tagName,
+        writeEnabled: true,
+        visualRole: qc.role ?? 'DEFAULT',
+        x: 32 + i * 96,
+        y: 426,
+        width: 86,
+        height: 88,
+      });
+    });
+    const reads = (input.bottomReadouts ?? []).slice(0, 4);
+    const readAreaX = 336;
+    const readW = reads.length > 0 ? Math.floor((656 - 12 * (reads.length - 1)) / reads.length) : 150;
+    reads.forEach((rd, i) => {
+      widgets.push({
+        id: `${key}_br_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: rd.label,
+        tagName: rd.tagName,
+        unit: rd.unit,
+        precision: rd.precision,
+        visualRole: rd.role,
+        x: readAreaX + i * (readW + 12),
+        y: 436,
+        width: readW,
+        height: 70,
+      });
+    });
+  } else if (input.template === 'ALARMS_TRENDS_DIAGNOSTICS') {
+    widgets.push({ id: `${key}_p_alm`, type: 'GROUP_PANEL', label: 'PROCESS & SAFETY ALARMS', x: 14, y: 62, width: 490, height: 256 });
+    widgets.push({ id: `${key}_alm`, type: 'ALARM_BANNER', label: 'Alarm Table', x: 24, y: 98, width: 470, height: 208 });
+
+    widgets.push({ id: `${key}_p_trd`, type: 'GROUP_PANEL', label: 'REAL-TIME CYCLE TIME TREND', x: 518, y: 62, width: 492, height: 256 });
+    widgets.push({ id: `${key}_trd`, type: 'TREND_CHART', label: 'Cycle Time Trend', tagName: input.trendTagName, x: 528, y: 98, width: 472, height: 208 });
+
+    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: 'HISTORICAL DATA & BATCH LOG', x: 14, y: 328, width: 644, height: 200 });
+    widgets.push({ id: `${key}_hist`, type: 'DATA_TABLE', label: 'History Table', x: 24, y: 364, width: 624, height: 152 });
+
+    widgets.push({ id: `${key}_p_seq`, type: 'GROUP_PANEL', label: 'CLOUD LOGGER COUNTERS', x: 672, y: 328, width: 338, height: 200 });
+    if (input.runIdTagName) {
+      widgets.push({
+        id: `${key}_run_id`,
+        type: 'NUMERIC_DISPLAY',
+        label: 'Active Run ID',
+        tagName: input.runIdTagName,
+        x: 686,
+        y: 366,
+        width: 310,
+        height: 64,
+      });
+    }
+    const seqs = (input.sequenceCounters ?? []).slice(0, 3);
+    seqs.forEach((sq, i) => {
+      widgets.push({
+        id: `${key}_seq_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: sq.label,
+        tagName: sq.tagName,
+        x: 686 + i * 106,
+        y: 444,
+        width: 98,
+        height: 68,
+      });
+    });
+  } else if (input.template === 'STATION_IO_DETAIL') {
+    widgets.push({ id: `${key}_p_in`, type: 'GROUP_PANEL', label: 'FIELD SENSOR INPUTS (READ ONLY)', x: 14, y: 62, width: 490, height: 466 });
+    (input.inputs ?? []).slice(0, 8).forEach((inp, i) => {
+      const col = i % 2;
+      const row = Math.floor(i / 2);
+      widgets.push({
+        id: `${key}_in_${i}`,
+        type: 'BIT_LAMP',
+        label: inp.label,
+        tagName: inp.tagName,
+        x: 28 + col * 236,
+        y: 108 + row * 102,
+        width: 224,
+        height: 44,
+      });
+    });
+
+    widgets.push({ id: `${key}_p_out`, type: 'GROUP_PANEL', label: 'ACTUATOR OUTPUTS / MANUAL TEST', x: 518, y: 62, width: 492, height: 466 });
+    (input.outputs ?? []).slice(0, 8).forEach((outp, i) => {
+      const col = i % 4;
+      const row = Math.floor(i / 4);
+      widgets.push({
+        id: `${key}_out_${i}`,
+        type: 'BIT_BUTTON',
+        label: outp.label,
+        tagName: outp.tagName,
+        writeEnabled: true,
+        visualRole: outp.role ?? 'DEFAULT',
+        x: 536 + col * 116,
+        y: 108 + row * 190,
+        width: 106,
+        height: 110,
+      });
+    });
+  }
+
+  widgets.push(...makeNavBar(key, input.navTabs));
+
+  const baseScreen: HmiScreen = {
+    id: input.screenId,
+    name: input.name,
+    width: 1024,
+    height: 600,
+    layoutStandard: 'ISA_101_HIGH_PERFORMANCE',
+    backgroundColor: '#F1F5F9',
+    autoScaleMobile: true,
+    autoScaleWeb: true,
+    widgets,
+    ...(pipes.length > 0 ? { pipes } : {}),
+    createdAt: now,
+  };
+
+  return scaleScreen(baseScreen, targetW, targetH);
+}

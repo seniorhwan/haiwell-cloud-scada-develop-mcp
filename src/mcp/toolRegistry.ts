@@ -47,6 +47,7 @@ import {
 } from './hmiSpatialEngine';
 import { importHwrunProject } from './hwrunImporter';
 import { compileProjectToHwExport } from './hwExportCompiler';
+import { instantiateHmiTemplate } from './hmiTemplates';
 import {
   buildMqttPayload,
   generateOpcUaNodeSet2Xml,
@@ -3323,6 +3324,201 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           windowTitleRegex: input.windowTitleRegex,
           capturedMap: input.capturedMap,
         }),
+      };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_hmi_template_instantiate',
+    domain: 'hmi',
+    haiwellFeature: 'Zero-Pixel-Math Hard-Coded ISA-101 HMI Screen Templates',
+    safetyTier: 'design',
+    description:
+      'Instantiate a hard-coded, guaranteed zero-overlap ISA-101 HMI screen template (INDUSTRIAL_LINE_OVERVIEW, MULTI_STATION_PROCESS_FLOW, ALARMS_TRENDS_DIAGNOSTICS, STATION_IO_DETAIL) using only semantic tag/title inputs. Eliminates manual x/y/width/height math and validates 0 collisions.',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      template: z.enum([
+        'INDUSTRIAL_LINE_OVERVIEW',
+        'MULTI_STATION_PROCESS_FLOW',
+        'ALARMS_TRENDS_DIAGNOSTICS',
+        'STATION_IO_DETAIL',
+      ]),
+      screenId: z.string().regex(/^[a-zA-Z0-9_-]{2,64}$/),
+      name: z.string().min(2).max(80),
+      title: z.string().min(2).max(120),
+      width: z.number().int().min(320).max(3840).default(1024),
+      height: z.number().int().min(240).max(2160).default(600),
+      eStopTag: z.string().optional(),
+      navTabs: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            targetScreenName: z.string().min(1),
+            active: z.boolean().optional(),
+          })
+        )
+        .optional(),
+      commands: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            role: z.enum(VISUAL_ROLES).optional(),
+          })
+        )
+        .optional(),
+      commIndicators: z
+        .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+        .optional(),
+      leftReadouts: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            unit: z.string().optional(),
+            precision: z.number().int().min(0).max(4).optional(),
+            role: z.enum(VISUAL_ROLES).optional(),
+          })
+        )
+        .optional(),
+      gauge: z
+        .object({
+          label: z.string().min(1),
+          tagName: z.string().min(1),
+          min: z.number().optional(),
+          max: z.number().optional(),
+          unit: z.string().optional(),
+          precision: z.number().int().min(0).max(4).optional(),
+        })
+        .optional(),
+      bar: z
+        .object({
+          label: z.string().min(1),
+          tagName: z.string().min(1),
+          min: z.number().optional(),
+          max: z.number().optional(),
+          unit: z.string().optional(),
+        })
+        .optional(),
+      heroKpis: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            unit: z.string().optional(),
+            precision: z.number().int().min(0).max(4).optional(),
+            role: z.enum(VISUAL_ROLES).optional(),
+          })
+        )
+        .optional(),
+      stationCycles: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            unit: z.string().optional(),
+            precision: z.number().int().min(0).max(4).optional(),
+          })
+        )
+        .optional(),
+      ioIndicators: z
+        .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+        .optional(),
+      includeAlarmTable: z.boolean().default(true),
+      stations: z
+        .array(
+          z.object({
+            title: z.string().min(1),
+            icon: z.enum(['HWReactor25', 'HWCursor3', 'Motor1']),
+            secondaryIcon: z.enum(['HWGear1']).optional(),
+            tagName: z.string().optional(),
+            ioIndicators: z
+              .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+              .optional(),
+            kpi: z
+              .object({
+                label: z.string().min(1),
+                tagName: z.string().min(1),
+                unit: z.string().optional(),
+                precision: z.number().int().min(0).max(4).optional(),
+              })
+              .optional(),
+          })
+        )
+        .optional(),
+      transfers: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            fluid: z.enum(['TRANSFER', 'SIGNAL']),
+            conveyorTagName: z.string().optional(),
+          })
+        )
+        .optional(),
+      quickCommands: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            role: z.enum(VISUAL_ROLES).optional(),
+          })
+        )
+        .optional(),
+      bottomReadouts: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            unit: z.string().optional(),
+            precision: z.number().int().min(0).max(4).optional(),
+            role: z.enum(VISUAL_ROLES).optional(),
+          })
+        )
+        .optional(),
+      trendTagName: z.string().optional(),
+      runIdTagName: z.string().optional(),
+      sequenceCounters: z
+        .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+        .optional(),
+      inputs: z
+        .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+        .optional(),
+      outputs: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            role: z.enum(VISUAL_ROLES).optional(),
+          })
+        )
+        .optional(),
+      returnSvg: z.boolean().default(false),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      template: 'INDUSTRIAL_LINE_OVERVIEW',
+      screenId: 'scr_tpl_overview',
+      name: 'Line_Overview',
+      title: 'PLANT OVERVIEW',
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const screen = instantiateHmiTemplate(input);
+      const knownScreenIds = new Set(project.screens.map((s) => s.id));
+      knownScreenIds.add(screen.id);
+      const validation = validateHmiScreen(screen, project.tags, {
+        knownScreenIds,
+        targetHardware: project.targetHardware,
+      });
+      const existingIdx = project.screens.findIndex((s) => s.id === screen.id);
+      if (existingIdx >= 0) project.screens[existingIdx] = screen;
+      else project.screens.push(screen);
+      if (!project.startupScreenId) project.startupScreenId = screen.id;
+      store.saveProject(project);
+      return {
+        screen,
+        validation,
+        ...(input.returnSvg ? { svg: renderScreenToSvg(screen, project.tags) } : {}),
       };
     },
   }),

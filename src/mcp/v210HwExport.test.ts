@@ -11,7 +11,7 @@ import { compileFullOpenProjectBridge } from './hmiSpatialEngine';
 import { SERVER_VERSION } from './version';
 
 test('v2.10.0: haiwell_project_export_hwexport generates valid <HwExportModel> XML with PNG MD5 integrity and SVG documents', async () => {
-  assert.equal(SERVER_VERSION, '2.11.0');
+  assert.equal(SERVER_VERSION, '2.12.0');
   const store = new HaiwellProjectStore();
   await invokeHaiwellTool(
     'haiwell_project_create',
@@ -104,7 +104,9 @@ test('v2.10.0: haiwell_project_export_hwexport generates valid <HwExportModel> X
   assert.ok(data.xml.includes('<string>Modbus_1._commStatus</string>'));
   assert.ok(data.xml.includes('sym-type=&quot;BitSw&quot;') && data.xml.includes('defGId=&quot;sw006&quot;'));
   assert.ok(data.xml.includes('sym-type=&quot;BitLamp&quot;') && data.xml.includes('defGId=&quot;lamp013&quot;'));
-  assert.ok(data.xml.includes('sym-type=&quot;HWBoard3&quot;'));
+  assert.ok(data.xml.includes('<SymbolType>image</SymbolType>'));
+  assert.ok(data.xml.includes('localid=&quot;si&quot;'));
+  assert.ok(data.xml.includes('<SymbolVariableUsing>'));
   const winDocSection = data.xml.slice(data.xml.indexOf('<DicWinAndDoc>'), data.xml.indexOf('</DicWinAndDoc>'));
   assert.ok(!winDocSection.includes('id=&quot;HWIDone&quot;'), 'Shared HWIDone gradient IDs in WindowDocument must be uniquely prefixed per widget');
 
