@@ -339,6 +339,11 @@ test('v2.9.0 AI-Design & P2: sections/GROUP_PANEL, discrete P&ID, styled SVG wit
   assert.equal(bdata.existingProjectMode, 'REPLACE_DISPLAYS');
   assert.equal(bdata.deleteScreenNames.length, 3);
   assert.ok(bdata.pywinautoScript.includes('def delete_existing_displays'));
+  assert.ok(bdata.pywinautoScript.includes('top_level_only=True, found_index=0'));
+  const bareWindowCalls = bdata.pywinautoScript
+    .split('\n')
+    .filter((line) => line.includes('app.window(') && !line.includes('found_index=0'));
+  assert.deepEqual(bareWindowCalls, []);
 
   const pyTmp = path.join(os.tmpdir(), `bridge_v290_${Date.now()}.py`);
   fs.writeFileSync(pyTmp, bdata.pywinautoScript, 'utf8');
