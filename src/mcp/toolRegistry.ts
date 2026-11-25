@@ -3335,7 +3335,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Zero-Pixel-Math Hard-Coded ISA-101 HMI Screen Templates',
     safetyTier: 'design',
     description:
-      'Instantiate a hard-coded, guaranteed zero-overlap ISA-101 HMI screen template (INDUSTRIAL_LINE_OVERVIEW, MULTI_STATION_PROCESS_FLOW, ALARMS_TRENDS_DIAGNOSTICS, STATION_IO_DETAIL, STATION_IO_MONITOR) using only semantic tag/title inputs. Eliminates manual x/y/width/height math and validates 0 collisions.',
+      'Instantiate a hard-coded, guaranteed zero-overlap ISA-101 HMI screen template (INDUSTRIAL_LINE_OVERVIEW, MULTI_STATION_PROCESS_FLOW, ALARMS_TRENDS_DIAGNOSTICS, STATION_IO_DETAIL, STATION_IO_MONITOR, MAIN_NAVIGATION_HUB, STATION_ALARMS_SIMPLE, EDGE_LOGGER_CONSOLE) using only semantic tag/title inputs. Eliminates manual x/y/width/height math and validates 0 collisions.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       template: z.enum([
@@ -3344,6 +3344,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         'ALARMS_TRENDS_DIAGNOSTICS',
         'STATION_IO_DETAIL',
         'STATION_IO_MONITOR',
+        'MAIN_NAVIGATION_HUB',
+        'STATION_ALARMS_SIMPLE',
+        'EDGE_LOGGER_CONSOLE',
       ]),
       screenId: z.string().regex(/^[a-zA-Z0-9_-]{2,64}$/),
       name: z.string().min(2).max(80),
@@ -3356,6 +3359,29 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           z.object({
             label: z.string().min(1),
             targetScreenName: z.string().min(1),
+            targetWindowId: z.number().int().min(1).max(9999).optional(),
+            active: z.boolean().optional(),
+          })
+        )
+        .optional(),
+      subtitle: z.string().optional(),
+      brandingLogos: z
+        .array(
+          z.object({
+            base64: z.string().min(1),
+            x: z.number(),
+            y: z.number(),
+            width: z.number(),
+            height: z.number(),
+          })
+        )
+        .optional(),
+      hubNavCards: z
+        .array(
+          z.object({
+            label: z.string().min(1),
+            targetScreenName: z.string().min(1),
+            targetWindowId: z.number().int().min(1).max(9999).optional(),
             active: z.boolean().optional(),
           })
         )

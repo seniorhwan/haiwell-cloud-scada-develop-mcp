@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { HAIWELL_NATIVE_SYMBOLS, type NativeSymbolBBox } from './haiwellNativeSymbols';
 import {
   generateLedLampPng,
@@ -11,6 +12,8 @@ export interface HwExportCompileOptions {
   startWindowId?: number;
   language?: 'en_0' | 'zh_0';
   variableFullNameOverrides?: Record<string, string>;
+  exportVariableGroups?: { groupName: string; tags: TagDefinition[] }[];
+  exportTasks?: { name: string; script: string; memo?: string }[];
 }
 
 export interface HwExportCompileResult {
@@ -578,8 +581,8 @@ export function compileProjectToHwExport(
 
       // 1. GROUP_PANEL -> Razor-sharp ISA-101 flat card with dedicated 28px header strip
       if (w.type === 'GROUP_PANEL') {
-        const isDark = w.props?.theme === 'dark';
-        if (isDark) {
+        const theme = w.props?.theme;
+        if (theme === 'dark') {
           addFlatRectShape(w.x, w.y, w.width, w.height, '#1E293B', '#0F172A', 2);
           if (w.label) {
             addTxtBlock(w.x + 14, w.y + Math.max(6, Math.round((w.height - 22) / 2)), Math.max(80, w.width - 28), 22, w.label, {
@@ -589,6 +592,8 @@ export function compileProjectToHwExport(
               align: 'left',
             });
           }
+        } else if (theme === 'light_banner') {
+          addFlatRectShape(w.x, w.y, w.width, w.height, '#FFFFFF', '#CBD5E1', 2);
         } else {
           addFlatRectShape(w.x, w.y, w.width, w.height, '#FFFFFF', '#CBD5E1', 2);
           const hdrH = Math.min(28, Math.max(22, Math.round(w.height * 0.12)));
@@ -605,9 +610,25 @@ export function compileProjectToHwExport(
         continue;
       }
 
-      // 2. LABEL (or HWClock4 live digital clock)
+      // 2. LABEL (or HWClock4 live digital clock or custom PNG logo)
       if (w.type === 'LABEL') {
-        if (w.props?.nativeSymbol === 'HWClock4') {
+        if (typeof w.props?.customImageBase64 === 'string' && w.props.customImageBase64.length > 0) {
+          const b64 = w.props.customImageBase64;
+          const md5 = crypto.createHash('md5').update(Buffer.from(b64, 'base64')).digest('hex').toLowerCase();
+          const grp = ensureImageGroup(`logo_${md5.slice(0, 12)}`, [
+            { stateKey: '0', color: '#FFFFFF', png: { base64: b64, md5 } },
+          ]);
+          const seq = nextSymDbId++;
+          const symId = `Shape_${seq}`;
+          const hwkey = `${symId}_${seq}`;
+          const scale = w.height / 100;
+          const imgBoxW = (w.width / Math.max(0.01, scale)).toFixed(2);
+          const scStr = scale.toFixed(6);
+          registerTextOnlyRecord('Shape', symId, hwkey, grp.groupId, { '0': symbolLibs.get(grp.stateIds['0'])!.md5 }, '', '#0F172A', 11, false, 'at');
+          svgElements.push(
+            `<g transform="matrix(${scStr},0,0,${scStr},${w.x},${w.y})" hw-PowerTime="10" sym-type="Shape" v="0.2" id="${symId}" hwkey="${hwkey}" StCt="1" RemoteOperation="true"><hwsymbol id="${hwkey}" newsym="true" defGId="${grp.groupId}" title="Graphics" name="Shape" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="${imgBoxW}" height="100" preserveAspectRatio="xMidYMid meet" md5file="${md5}" /></g><g sign="text" /></g></g></g>`
+          );
+        } else if (w.props?.nativeSymbol === 'HWClock4') {
           const seq = nextSymDbId++;
           const symId = `Clock4_${seq}`;
           const hwkey = `HWClock4_${seq}_${seq}`;
@@ -1299,6 +1320,93 @@ ${s.varBindings
     )
     .join('\n');
 
+  const tasksXml =
+    options.exportTasks && options.exportTasks.length > 0
+      ? `  <Tasks>
+    <ListTask>
+${options.exportTasks
+  .map(
+    (t, idx) => `      <HwExportTaskModel>
+        <Task>
+          <ID>${idx + 1}</ID>
+          <HwSys>0</HwSys>
+          <Name>${xmlEsc(t.name)}</Name>
+          <Type>SCRIPT</Type>
+          <Memo>${xmlEsc(t.memo ?? '')}</Memo>
+          <IsAutoCreate>0</IsAutoCreate>
+          <OrderId>${idx + 1}</OrderId>
+          <ContentId>${idx + 1}</ContentId>
+          <ClassifyId>0</ClassifyId>
+        </Task>
+        <TaskDocument>
+          <ID>${idx + 1}</ID>
+          <HwSys>0</HwSys>
+          <Config />
+          <Script>${xmlEsc(t.script)}</Script>
+          <CompileScript>${xmlEsc(t.script)}</CompileScript>
+          <VariableId />
+          <ClassifyId>0</ClassifyId>
+        </TaskDocument>
+      </HwExportTaskModel>`
+  )
+  .join('\n')}
+    </ListTask>
+  </Tasks>`
+      : `  <Tasks>
+    <ListTask />
+  </Tasks>`;
+
+  const varGroupsXml =
+    options.exportVariableGroups && options.exportVariableGroups.length > 0
+      ? `  <VariableGroups>
+    <ListVariableGroup>
+${options.exportVariableGroups
+  .map(
+    (vg, gIdx) => `      <HwExportVariableGroupModel>
+        <VariableGroup>
+          <ID>${gIdx + 10}</ID>
+          <HwSys>0</HwSys>
+          <Name>${xmlEsc(vg.groupName)}</Name>
+          <Memo />
+          <ClassifyId>0</ClassifyId>
+        </VariableGroup>
+        <ListVariable>
+${vg.tags
+  .map((t, tIdx) => {
+    const dt = mapHaiwellVarType(t.dataType);
+    const fullName = `${vg.groupName}.${t.name}`;
+    const rawInit = (t as unknown as { initialValue?: unknown }).initialValue;
+    const initVal = rawInit !== undefined ? String(rawInit) : dt === 'STRING' ? '' : '0';
+    return `          <variable>
+            <ID>${700 + gIdx * 100 + tIdx}</ID>
+            <ClassifyId>0</ClassifyId>
+            <HwSys>0</HwSys>
+            <DevId>0</DevId>
+            <Name>${xmlEsc(t.name)}</Name>
+            <FullName>${xmlEsc(fullName)}</FullName>
+            <DataType>${xmlEsc(dt)}</DataType>
+            <StringCode>UTF8</StringCode>
+            <StringLength>${dt === 'STRING' ? 128 : 0}</StringLength>
+            <AddressReadWrite>${t.access === 'RO' ? 'r' : 'rw'}</AddressReadWrite>
+            <GroupId>${gIdx + 10}</GroupId>
+            <Memo>${xmlEsc(t.description ?? '')}</Memo>
+            <InitValue>${xmlEsc(initVal)}</InitValue>
+            <SaveValue>0</SaveValue>
+            <Disable>0</Disable>
+            <IsInvalid>0</IsInvalid>
+          </variable>`;
+  })
+  .join('\n')}
+        </ListVariable>
+      </HwExportVariableGroupModel>`
+  )
+  .join('\n')}
+    </ListVariableGroup>
+  </VariableGroups>`
+      : `  <VariableGroups>
+    <ListVariableGroup />
+  </VariableGroups>`;
+
   const xml = `<?xml version="1.0" encoding="utf-8"?>
 <HwExportModel xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <Windows>
@@ -1338,9 +1446,7 @@ ${dicSymVarInfoXml}
 ${dicSymWinIdXml}
     </DicSymbolWinIdAndWindowId>
   </Windows>
-  <Tasks>
-    <ListTask />
-  </Tasks>
+${tasksXml}
   <Events>
     <ListEventModel />
   </Events>
@@ -1350,9 +1456,7 @@ ${dicSymWinIdXml}
   <Reports>
     <ListReport />
   </Reports>
-  <VariableGroups>
-    <ListVariableGroup />
-  </VariableGroups>
+${varGroupsXml}
   <UserGroups>
     <ListUserGroup />
     <ListUser />

@@ -5,11 +5,15 @@ export type HmiTemplateKind =
   | 'MULTI_STATION_PROCESS_FLOW'
   | 'ALARMS_TRENDS_DIAGNOSTICS'
   | 'STATION_IO_DETAIL'
-  | 'STATION_IO_MONITOR';
+  | 'STATION_IO_MONITOR'
+  | 'MAIN_NAVIGATION_HUB'
+  | 'STATION_ALARMS_SIMPLE'
+  | 'EDGE_LOGGER_CONSOLE';
 
 export interface TemplateNavTab {
   label: string;
   targetScreenName: string;
+  targetWindowId?: number;
   active?: boolean;
 }
 
@@ -83,6 +87,10 @@ export interface InstantiateTemplateInput {
   commTagName?: string;
   commLabel?: string;
   stationCounter?: TemplateReadoutItem;
+  // MAIN_NAVIGATION_HUB
+  subtitle?: string;
+  brandingLogos?: { base64: string; x: number; y: number; width: number; height: number }[];
+  hubNavCards?: TemplateNavTab[];
 }
 
 function makeHeader(
@@ -147,6 +155,7 @@ function makeNavBar(key: string, tabs: TemplateNavTab[] = []): HmiWidget[] {
     height: 46,
     props: {
       targetScreenName: t.targetScreenName,
+      ...(t.targetWindowId !== undefined ? { targetWindowId: t.targetWindowId } : {}),
       active: Boolean(t.active),
     },
   }));
@@ -190,9 +199,10 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
   const headerTag = input.eStopTag ?? input.commTagName;
   const headerLabel = input.eStopTag ? 'E-STOP OK' : (input.commLabel ?? 'PLC ONLINE');
   const headerRole = input.eStopTag ? 'DANGER_ACTION' : 'STATUS_READONLY';
-  const widgets: HmiWidget[] = [
-    ...makeHeader(key, input.title, headerTag, headerLabel, headerRole),
-  ];
+  const widgets: HmiWidget[] =
+    input.template === 'MAIN_NAVIGATION_HUB'
+      ? []
+      : [...makeHeader(key, input.title, headerTag, headerLabel, headerRole)];
   const pipes: HmiPipeRoute[] = [];
 
   if (input.template === 'INDUSTRIAL_LINE_OVERVIEW') {
@@ -599,6 +609,333 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         y: 102 + i * 51,
         width: 370,
         height: 40,
+      });
+    });
+  } else if (input.template === 'MAIN_NAVIGATION_HUB') {
+    // White branding header with university logos + alarm pill + dark clock pill
+    widgets.push({
+      id: `${key}_brand_bg`,
+      type: 'GROUP_PANEL',
+      label: '',
+      x: 10,
+      y: 8,
+      width: 854,
+      height: 68,
+      props: { theme: 'light_banner' },
+    });
+    (input.brandingLogos ?? []).slice(0, 3).forEach((logo, idx) => {
+      widgets.push({
+        id: `${key}_logo_${idx}`,
+        type: 'LABEL',
+        label: `LOGO_${idx}`,
+        x: logo.x,
+        y: logo.y,
+        width: logo.width,
+        height: logo.height,
+        props: { customImageBase64: logo.base64 },
+      });
+    });
+    widgets.push({
+      id: `${key}_hub_title`,
+      type: 'LABEL',
+      label: input.title,
+      x: 442,
+      y: 17,
+      width: 292,
+      height: 24,
+      props: { color: '#0F172A', fontSize: 13, bold: true, align: 'left' },
+    });
+    widgets.push({
+      id: `${key}_hub_sub`,
+      type: 'LABEL',
+      label: input.subtitle ?? 'PETRA CHRISTIAN UNIVERSITY • FESTO MPS LAB',
+      x: 442,
+      y: 43,
+      width: 292,
+      height: 18,
+      props: { color: '#475569', fontSize: 10, bold: false, align: 'left' },
+    });
+    if (input.commTagName) {
+      widgets.push({
+        id: `${key}_hub_alm`,
+        type: 'BIT_LAMP',
+        label: input.commLabel ?? 'ALARM',
+        tagName: input.commTagName,
+        visualRole: 'DANGER_ACTION',
+        x: 742,
+        y: 25,
+        width: 116,
+        height: 34,
+      });
+    }
+    widgets.push({
+      id: `${key}_hub_clk_bg`,
+      type: 'GROUP_PANEL',
+      label: '',
+      x: 870,
+      y: 8,
+      width: 144,
+      height: 68,
+      props: { theme: 'dark' },
+    });
+    widgets.push({
+      id: `${key}_hub_clk`,
+      type: 'LABEL',
+      label: 'CLOCK',
+      x: 878,
+      y: 30,
+      width: 128,
+      height: 24,
+      props: { nativeSymbol: 'HWClock4' },
+    });
+
+    // Left Card: Line Control & PLC Status
+    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: 'LINE CONTROL & PLC STATUS', x: 14, y: 84, width: 264, height: 444 });
+    (input.commands ?? []).slice(0, 3).forEach((cmd, i) => {
+      widgets.push({
+        id: `${key}_cmd_${i}`,
+        type: 'BIT_BUTTON',
+        label: cmd.label,
+        tagName: cmd.tagName,
+        writeEnabled: true,
+        visualRole: cmd.role ?? 'DEFAULT',
+        x: 24 + i * 84,
+        y: 122,
+        width: 78,
+        height: 86,
+      });
+    });
+    (input.commIndicators ?? []).slice(0, 3).forEach((ci, i) => {
+      widgets.push({
+        id: `${key}_comm_${i}`,
+        type: 'BIT_LAMP',
+        label: ci.label,
+        tagName: ci.tagName,
+        visualRole: ci.role ?? 'PRIMARY_ACTION',
+        x: 26,
+        y: 228 + i * 50,
+        width: 240,
+        height: 38,
+      });
+    });
+    if (input.ioIndicators?.[0]) {
+      widgets.push({
+        id: `${key}_cloud_ok`,
+        type: 'BIT_LAMP',
+        label: input.ioIndicators[0].label,
+        tagName: input.ioIndicators[0].tagName,
+        visualRole: input.ioIndicators[0].role ?? 'PRIMARY_ACTION',
+        x: 26,
+        y: 386,
+        width: 240,
+        height: 38,
+      });
+    }
+    if (input.stationCounter) {
+      widgets.push({
+        id: `${key}_alm_cnt`,
+        type: 'NUMERIC_DISPLAY',
+        label: input.stationCounter.label,
+        tagName: input.stationCounter.tagName,
+        unit: input.stationCounter.unit ?? '',
+        x: 26,
+        y: 436,
+        width: 240,
+        height: 76,
+      });
+    }
+
+    // Center Card: 5 Large Touch Navigation Cards
+    widgets.push({ id: `${key}_p_center`, type: 'GROUP_PANEL', label: 'SYSTEM NAVIGATION', x: 290, y: 84, width: 444, height: 444 });
+    (input.hubNavCards ?? []).slice(0, 5).forEach((card, i) => {
+      const isFifth = i === 4;
+      const col = i % 2;
+      const row = Math.floor(i / 2);
+      widgets.push({
+        id: `${key}_hub_nav_${i}`,
+        type: 'NAV_BAR',
+        label: card.label,
+        x: isFifth ? 306 : 306 + col * 214,
+        y: isFifth ? 376 : 124 + row * 126,
+        width: isFifth ? 412 : 198,
+        height: 110,
+        props: {
+          targetScreenName: card.targetScreenName,
+          ...(card.targetWindowId !== undefined ? { targetWindowId: card.targetWindowId } : {}),
+          active: Boolean(card.active),
+        },
+      });
+    });
+
+    // Right Card: Live Production Summary
+    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: 'LIVE PRODUCTION COUNTERS', x: 746, y: 84, width: 264, height: 444 });
+    (input.heroKpis ?? []).slice(0, 4).forEach((kpi, i) => {
+      widgets.push({
+        id: `${key}_kpi_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: kpi.label,
+        tagName: kpi.tagName,
+        unit: kpi.unit ?? 'pcs',
+        precision: kpi.precision,
+        visualRole: kpi.role ?? 'KPI_HERO',
+        x: 762,
+        y: 122 + i * 96,
+        width: 232,
+        height: 82,
+      });
+    });
+  } else if (input.template === 'STATION_ALARMS_SIMPLE') {
+    widgets.push({ id: `${key}_p_faults`, type: 'GROUP_PANEL', label: 'ACTIVE FAULT MONITORS', x: 14, y: 62, width: 486, height: 466 });
+    (input.inputs ?? []).slice(0, 6).forEach((flt, i) => {
+      widgets.push({
+        id: `${key}_flt_${i}`,
+        type: 'BIT_LAMP',
+        label: flt.label,
+        tagName: flt.tagName,
+        visualRole: flt.role ?? 'DANGER_ACTION',
+        x: 30,
+        y: 108 + i * 66,
+        width: 454,
+        height: 46,
+      });
+    });
+
+    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: 'ALARM STATUS & SQLITE HISTORY', x: 512, y: 62, width: 498, height: 466 });
+    if (input.stationCounter) {
+      widgets.push({
+        id: `${key}_alm_total`,
+        type: 'NUMERIC_DISPLAY',
+        label: input.stationCounter.label,
+        tagName: input.stationCounter.tagName,
+        unit: input.stationCounter.unit ?? '',
+        x: 528,
+        y: 102,
+        width: 214,
+        height: 96,
+      });
+    }
+    if (input.outputs?.[0]) {
+      widgets.push({
+        id: `${key}_ack_btn`,
+        type: 'BIT_BUTTON',
+        label: input.outputs[0].label,
+        tagName: input.outputs[0].tagName,
+        writeEnabled: true,
+        visualRole: input.outputs[0].role ?? 'WARNING_ACTION',
+        x: 766,
+        y: 102,
+        width: 120,
+        height: 96,
+      });
+    }
+    if (input.leftReadouts?.[0]) {
+      widgets.push({
+        id: `${key}_last_msg`,
+        type: 'NUMERIC_DISPLAY',
+        label: input.leftReadouts[0].label,
+        tagName: input.leftReadouts[0].tagName,
+        x: 528,
+        y: 212,
+        width: 466,
+        height: 64,
+      });
+    }
+    (input.leftReadouts ?? []).slice(1, 4).forEach((hr, i) => {
+      widgets.push({
+        id: `${key}_hist_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: hr.label,
+        tagName: hr.tagName,
+        x: 528,
+        y: 288 + i * 76,
+        width: 466,
+        height: 64,
+      });
+    });
+  } else if (input.template === 'EDGE_LOGGER_CONSOLE') {
+    widgets.push({ id: `${key}_p_log`, type: 'GROUP_PANEL', label: 'CLOUD RUN EDGE LOGGER', x: 14, y: 62, width: 486, height: 466 });
+    if (input.runIdTagName) {
+      widgets.push({
+        id: `${key}_run_id`,
+        type: 'NUMERIC_INPUT',
+        label: 'ACTIVE RUN ID (EDITABLE)',
+        tagName: input.runIdTagName,
+        writeEnabled: true,
+        x: 30,
+        y: 102,
+        width: 310,
+        height: 68,
+      });
+    }
+    if (input.outputs?.[0]) {
+      widgets.push({
+        id: `${key}_flush_btn`,
+        type: 'BIT_BUTTON',
+        label: input.outputs[0].label,
+        tagName: input.outputs[0].tagName,
+        writeEnabled: true,
+        visualRole: input.outputs[0].role ?? 'PRIMARY_ACTION',
+        x: 358,
+        y: 100,
+        width: 124,
+        height: 92,
+      });
+    }
+    if (input.commIndicators?.[0]) {
+      widgets.push({
+        id: `${key}_cloud_lamp`,
+        type: 'BIT_LAMP',
+        label: input.commIndicators[0].label,
+        tagName: input.commIndicators[0].tagName,
+        visualRole: input.commIndicators[0].role ?? 'PRIMARY_ACTION',
+        x: 30,
+        y: 184,
+        width: 310,
+        height: 38,
+      });
+    }
+    (input.heroKpis ?? []).slice(0, 3).forEach((q, i) => {
+      widgets.push({
+        id: `${key}_q_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: q.label,
+        tagName: q.tagName,
+        unit: q.unit ?? 'rows',
+        visualRole: q.role ?? 'KPI_HERO',
+        x: 30 + i * 154,
+        y: 236,
+        width: 146,
+        height: 76,
+      });
+    });
+    (input.leftReadouts ?? []).slice(0, 2).forEach((lr, i) => {
+      widgets.push({
+        id: `${key}_log_msg_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: lr.label,
+        tagName: lr.tagName,
+        x: 30,
+        y: 326 + i * 86,
+        width: 454,
+        height: 72,
+      });
+    });
+
+    widgets.push({ id: `${key}_p_tel`, type: 'GROUP_PANEL', label: 'LIVE STATION CYCLE TELEMETRY', x: 512, y: 62, width: 498, height: 466 });
+    (input.sequenceCounters ?? []).slice(0, 9).forEach((sc, i) => {
+      const col = i % 3;
+      const row = Math.floor(i / 3);
+      widgets.push({
+        id: `${key}_tel_${i}`,
+        type: 'NUMERIC_DISPLAY',
+        label: sc.label,
+        tagName: sc.tagName,
+        unit: sc.unit ?? '',
+        precision: sc.precision,
+        x: 528 + col * 158,
+        y: 108 + row * 136,
+        width: 150,
+        height: 110,
       });
     });
   }

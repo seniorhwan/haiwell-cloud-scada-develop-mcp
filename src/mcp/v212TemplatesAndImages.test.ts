@@ -166,4 +166,69 @@ test('v2.12.0: Hard-coded HMI templates instantiate with 0 collisions/OOB at 102
   assert.equal(depData.mode, 'DRY_RUN');
   assert.ok(depData.deployScript.includes('"1148"'));
   assert.ok(depData.watcherScript.includes('watcher.heartbeat.json'));
+
+  // 5. Verify MAIN_NAVIGATION_HUB (custom PNG logo), STATION_ALARMS_SIMPLE, and EDGE_LOGGER_CONSOLE
+  const t6 = await invokeHaiwellTool(
+    'haiwell_hmi_template_instantiate',
+    {
+      projectId: 'prj_tpl_v212',
+      template: 'MAIN_NAVIGATION_HUB',
+      screenId: 'scr_t6',
+      name: 'Main_display',
+      title: 'FESTO MPS 3-STATION HMI',
+      brandingLogos: [{ base64: btn0.base64, x: 20, y: 16, width: 180, height: 52 }],
+      commTagName: 'START',
+      commLabel: 'ALARM',
+      commands: [{ label: 'START ALL', tagName: 'START', role: 'PRIMARY_ACTION' }],
+      commIndicators: [{ label: 'PLC 1', tagName: 'START' }],
+      ioIndicators: [{ label: 'CLOUD OK', tagName: 'START' }],
+      stationCounter: { label: 'ALARMS', tagName: 'CNT', unit: '' },
+      hubNavCards: [{ label: 'ST1', targetScreenName: 'StationMonitor', targetWindowId: 2 }],
+      heroKpis: [{ label: 'FINISHED', tagName: 'CNT', unit: 'pcs' }],
+      navTabs: [{ label: 'HOME', targetScreenName: 'Main_display', targetWindowId: 1, active: true }],
+    },
+    store
+  );
+  assert.equal(t6.ok, true);
+  assert.equal((t6.data as any).validation.valid, true);
+  assert.equal((t6.data as any).validation.collisions.length, 0);
+
+  const t7 = await invokeHaiwellTool(
+    'haiwell_hmi_template_instantiate',
+    {
+      projectId: 'prj_tpl_v212',
+      template: 'STATION_ALARMS_SIMPLE',
+      screenId: 'scr_t7',
+      name: 'ALARMS',
+      title: 'SYSTEM ALARMS',
+      commTagName: 'START',
+      inputs: [{ label: 'PLC 1 OFFLINE', tagName: 'START' }],
+      stationCounter: { label: 'ACTIVE', tagName: 'CNT', unit: '' },
+      outputs: [{ label: 'ACK ALL', tagName: 'STOP', role: 'WARNING_ACTION' }],
+      leftReadouts: [{ label: 'LATEST', tagName: 'CNT' }],
+    },
+    store
+  );
+  assert.equal(t7.ok, true);
+  assert.equal((t7.data as any).validation.valid, true);
+
+  const t8 = await invokeHaiwellTool(
+    'haiwell_hmi_template_instantiate',
+    {
+      projectId: 'prj_tpl_v212',
+      template: 'EDGE_LOGGER_CONSOLE',
+      screenId: 'scr_t8',
+      name: 'DATA_LOGGING',
+      title: 'CLOUD EDGE LOGGER',
+      runIdTagName: 'CNT',
+      outputs: [{ label: 'FLUSH', tagName: 'START', role: 'PRIMARY_ACTION' }],
+      commIndicators: [{ label: 'CLOUD OK', tagName: 'START' }],
+      heroKpis: [{ label: 'PENDING', tagName: 'CNT', unit: 'rows' }],
+      leftReadouts: [{ label: 'STATUS', tagName: 'CNT' }],
+      sequenceCounters: [{ label: 'ST1 CYCLE', tagName: 'CNT', unit: 'x10ms' }],
+    },
+    store
+  );
+  assert.equal(t8.ok, true);
+  assert.equal((t8.data as any).validation.valid, true);
 });
