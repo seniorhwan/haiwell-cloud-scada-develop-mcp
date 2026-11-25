@@ -1921,7 +1921,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         fileName: compiled.fileName,
         format: 'HAIWELL_NATIVE_HWEXPORT_XML',
         importInstructions:
-          'In Haiwell Cloud Scada 3.50.x, open your .hwdev project and click Project(P) -> Import(I), then select the saved .hwExport file.',
+          'In Haiwell Cloud Scada 3.50.x, open your .hwdev project, expand Display in the left Project Browser, right-click "Project display" -> Import, and select the .hwExport file.',
         screensExported: compiled.screensExported,
         widgetsExported: compiled.widgetsExported,
         variablesBound: compiled.variablesBound,
