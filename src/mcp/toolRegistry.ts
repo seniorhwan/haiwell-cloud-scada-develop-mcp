@@ -5595,8 +5595,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
-      hwdevPath: 'C:\\Users\\user\\Documents\\Haiwell Scada\\Temporary\\Project1.hwdev',
-      outputDir: 'C:\\Users\\user\\Documents\\haiwell_exports',
+      hwdevPath: 'C:\\Users\\<user>\\Documents\\Haiwell Scada\\Temporary\\Project1.hwdev',
+      outputDir: 'C:\\Users\\<user>\\Documents\\haiwell_exports',
       startWindowId: 2,
       dryRun: true,
     },
