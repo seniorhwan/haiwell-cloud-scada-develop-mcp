@@ -444,13 +444,14 @@ export function compileProjectToHwExport(
       const align = opts.align ?? 'left';
       const bg = opts.bg ?? '#FFFFFF';
       const bgOp = opts.bgOpacity ?? 0;
+      const svgFill = bgOp === 0 ? 'none' : bg;
 
       registerTextOnlyRecord(
         'TxtBlock',
         symId,
         hwkey,
         textGroup.groupId,
-        { '0': ensurePic('#FFFFFF') },
+        { '0': ensurePic(bg) },
         text,
         txtColor,
         fontSize,
@@ -459,7 +460,7 @@ export function compileProjectToHwExport(
       );
 
       svgElements.push(
-        `<g transform="matrix(1,0,0,1,${x},${y})" hw-PowerTime="10" sym-type="TxtBlock" v="0.6" id="${symId}" hwkey="${hwkey}" TxtAlign="${align}" TxtColor="${txtColor}" IsResize="false" HWBackColor="${bg}" HWBackOpacity="${bgOp === 0 ? 0 : 100}" Blinking="false" SwCtrl="false" IsOFFCtrl="false" BlinkingTime="1000" IsTextToPicture="false" Txt="${xmlEsc(text)}" IsTextBlock="true" SwCtrlVar=""><hwsymbol id="${hwkey}" newsym="true" defGId="shap001" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Text" title-en="Text" name="TxtBlock" /><g><g sign="state"><g sign="svg" /><g sign="text"><textBlock localid="at" x="0" y="0" width="${w}" height="${h}" fill="${bg}" stroke="none" text-color="${txtColor}" fill-opacity="${bgOp}" text-anchor="${align}" vertical-align="milldle" font-family="Arial" fonten="Arial" font-size="${fontSize}" sh="${(fontSize * 1.33).toFixed(2)}" wrap="nowrap" font-weight="${fontWeight}" font-style="normal" text-decoration="normal">${xmlEsc(text)}</textBlock></g></g></g></g>`
+        `<g transform="matrix(1,0,0,1,${x},${y})" hw-PowerTime="10" sym-type="TxtBlock" v="0.6" id="${symId}" hwkey="${hwkey}" TxtAlign="${align}" TxtColor="${txtColor}" IsResize="false" HWBackColor="${bg}" HWBackOpacity="${bgOp === 0 ? 0 : 100}" Blinking="false" SwCtrl="false" IsOFFCtrl="false" BlinkingTime="1000" IsTextToPicture="false" Txt="${xmlEsc(text)}" IsTextBlock="true" SwCtrlVar=""><hwsymbol id="${hwkey}" newsym="true" defGId="shap001" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Text" title-en="Text" name="TxtBlock" /><g><g sign="state"><g sign="svg" /><g sign="text"><textBlock localid="at" x="0" y="0" width="${w}" height="${h}" fill="${svgFill}" stroke="none" text-color="${txtColor}" fill-opacity="${bgOp}" text-anchor="${align}" vertical-align="milldle" font-family="Arial" fonten="Arial" font-size="${fontSize}" sh="${(fontSize * 1.33).toFixed(2)}" wrap="nowrap" font-weight="${fontWeight}" font-style="normal" text-decoration="normal">${xmlEsc(text)}</textBlock></g></g></g></g>`
       );
     };
 
@@ -590,6 +591,7 @@ export function compileProjectToHwExport(
               fontSize: 14,
               bold: true,
               align: 'left',
+              bg: '#1E293B',
             });
           }
         } else if (theme === 'light_banner') {
@@ -604,6 +606,7 @@ export function compileProjectToHwExport(
               fontSize: 11,
               bold: true,
               align: 'left',
+              bg: '#E2E8F0',
             });
           }
         }
@@ -716,7 +719,7 @@ export function compileProjectToHwExport(
         const symId = `BitLamp_${seq}`;
         const hwkey = `${symId}_${seq}`;
         const horizontal = w.width >= w.height * 2.0;
-        const ledSize = horizontal ? Math.min(28, w.height - 4) : Math.min(34, w.width, Math.max(24, w.height - 20));
+        const ledSize = horizontal ? Math.min(38, w.height - 2) : Math.min(44, w.width, Math.max(28, w.height - 18));
         const lx = horizontal ? w.x + 2 : w.x + (w.width - ledSize) / 2;
         const ly = horizontal ? w.y + (w.height - ledSize) / 2 : w.y;
         const sx = (ledSize / 100).toFixed(6);
@@ -749,19 +752,23 @@ export function compileProjectToHwExport(
           `<g transform="matrix(${sx},0,0,${sy},${lx.toFixed(2)},${ly.toFixed(2)})" hw-PowerTime="10" sym-type="BitLamp" v="0.4" id="${symId}" hwkey="${hwkey}" RvrsSt="false" StCt="2" Model="none" Type="on" IsOFFCtrl="false" FrqTime="1000" EnblExps="" ${rdAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="lamp013" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit lamp" title-en="Bit lamp" name="BitLamp" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
         );
 
+        const lblColor = w.props?.labelColor ? String(w.props.labelColor) : '#0F172A';
+        const isLightLbl = lblColor.toUpperCase() === '#FFFFFF' || lblColor.toUpperCase() === '#F8FAFC';
         if (horizontal) {
-          addTxtBlock(w.x + ledSize + 8, w.y + Math.round((w.height - 18) / 2), Math.max(40, w.width - ledSize - 10), 18, w.label, {
-            color: w.props?.labelColor ? String(w.props.labelColor) : '#0F172A',
+          addTxtBlock(w.x + ledSize + 10, w.y + Math.round((w.height - 18) / 2), Math.max(40, w.width - ledSize - 12), 18, w.label, {
+            color: lblColor,
             fontSize: 11,
             bold: true,
             align: 'left',
+            bg: isLightLbl ? '#1E293B' : '#FFFFFF',
           });
         } else {
           addTxtBlock(w.x, w.y + ledSize + 2, w.width, 18, w.label, {
-            color: w.props?.labelColor ? String(w.props.labelColor) : '#0F172A',
+            color: lblColor,
             fontSize: 10,
             bold: true,
             align: 'center',
+            bg: isLightLbl ? '#1E293B' : '#FFFFFF',
           });
         }
         continue;
@@ -967,11 +974,12 @@ export function compileProjectToHwExport(
             `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WinOpBtn" v="0.1" id="${symId}" hwkey="${hwkey}" Fun="${navFun}" ${navPicAttr} SubPic="" IsPrintHidden="false" ActnEff="false" WhthCnfrmBox="false" ActnLock="false" StCt="1"><hwsymbol id="${hwkey}" newsym="true" defGId="btn214" title="Picture operation button" name="WinOpBtn" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
           );
         }
-        addTxtBlock(w.x + 6, w.y + Math.max(4, Math.round(w.height / 2) - 10), Math.max(30, w.width - 12), 20, w.label, {
+        addTxtBlock(w.x + 6, w.y + Math.max(4, Math.round(w.height / 2) - 11), Math.max(30, w.width - 12), 22, w.label, {
           color: '#FFFFFF',
-          fontSize: 11,
+          fontSize: 12,
           bold: true,
           align: 'center',
+          bg: bgHex,
         });
         continue;
       }

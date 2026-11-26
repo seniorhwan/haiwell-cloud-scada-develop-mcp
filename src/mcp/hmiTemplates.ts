@@ -553,7 +553,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
   } else if (input.template === 'STATION_IO_MONITOR') {
-    widgets.push({ id: `${key}_p_ctrl`, type: 'GROUP_PANEL', label: 'STATION CONTROL', x: 14, y: 62, width: 176, height: 466 });
+    widgets.push({ id: `${key}_p_ctrl`, type: 'GROUP_PANEL', label: 'STATION CONTROL', x: 12, y: 62, width: 196, height: 466 });
     (input.outputs ?? []).slice(0, 3).forEach((cmd, i) => {
       widgets.push({
         id: `${key}_cmd_${i}`,
@@ -562,10 +562,10 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: cmd.tagName,
         writeEnabled: true,
         visualRole: cmd.role ?? 'DEFAULT',
-        x: 50,
-        y: 102 + i * 106,
-        width: 104,
-        height: 96,
+        x: 46,
+        y: 96 + i * 114,
+        width: 128,
+        height: 108,
       });
     });
     if (input.stationCounter) {
@@ -575,14 +575,14 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         label: input.stationCounter.label,
         tagName: input.stationCounter.tagName,
         unit: input.stationCounter.unit ?? 'pcs',
-        x: 26,
-        y: 428,
-        width: 152,
-        height: 82,
+        x: 24,
+        y: 444,
+        width: 172,
+        height: 74,
       });
     }
 
-    widgets.push({ id: `${key}_p_in`, type: 'GROUP_PANEL', label: 'DIGITAL INPUTS (SENSORS X0-X7)', x: 202, y: 62, width: 398, height: 466 });
+    widgets.push({ id: `${key}_p_in`, type: 'GROUP_PANEL', label: 'DIGITAL INPUTS (SENSORS X0-X7)', x: 218, y: 62, width: 390, height: 466 });
     (input.inputs ?? []).slice(0, 8).forEach((inp, i) => {
       widgets.push({
         id: `${key}_in_${i}`,
@@ -590,14 +590,14 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         label: inp.label,
         tagName: inp.tagName,
         visualRole: inp.role ?? 'STATUS_READONLY',
-        x: 216,
-        y: 102 + i * 51,
-        width: 370,
-        height: 40,
+        x: 230,
+        y: 100 + i * 52,
+        width: 366,
+        height: 42,
       });
     });
 
-    widgets.push({ id: `${key}_p_out`, type: 'GROUP_PANEL', label: 'DIGITAL OUTPUTS (COILS Y0-Y7)', x: 612, y: 62, width: 398, height: 466 });
+    widgets.push({ id: `${key}_p_out`, type: 'GROUP_PANEL', label: 'DIGITAL OUTPUTS (COILS Y0-Y7)', x: 618, y: 62, width: 394, height: 466 });
     (input.outputIndicators ?? []).slice(0, 8).forEach((outp, i) => {
       widgets.push({
         id: `${key}_out_ind_${i}`,
@@ -605,10 +605,10 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         label: outp.label,
         tagName: outp.tagName,
         visualRole: outp.role ?? 'STATUS_READONLY',
-        x: 626,
-        y: 102 + i * 51,
+        x: 630,
+        y: 100 + i * 52,
         width: 370,
-        height: 40,
+        height: 42,
       });
     });
   } else if (input.template === 'MAIN_NAVIGATION_HUB') {
@@ -639,19 +639,19 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       id: `${key}_hub_title`,
       type: 'LABEL',
       label: input.title,
-      x: 442,
+      x: 438,
       y: 17,
-      width: 292,
+      width: 288,
       height: 24,
       props: { color: '#0F172A', fontSize: 13, bold: true, align: 'left' },
     });
     widgets.push({
       id: `${key}_hub_sub`,
       type: 'LABEL',
-      label: input.subtitle ?? 'PETRA CHRISTIAN UNIVERSITY • FESTO MPS LAB',
-      x: 442,
+      label: input.subtitle ?? 'PETRA CHRISTIAN UNIV. - TEKNIK MESIN',
+      x: 438,
       y: 43,
-      width: 292,
+      width: 288,
       height: 18,
       props: { color: '#475569', fontSize: 10, bold: false, align: 'left' },
     });
@@ -663,9 +663,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: input.commTagName,
         visualRole: 'DANGER_ACTION',
         x: 742,
-        y: 25,
-        width: 116,
-        height: 34,
+        y: 22,
+        width: 118,
+        height: 40,
       });
     }
     widgets.push({
@@ -692,8 +692,8 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
     const hasBottomNav = Boolean(input.navTabs && input.navTabs.length > 0);
     const panelH = hasBottomNav ? 444 : 500;
 
-    // Left Card: Line Control & PLC Status
-    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: 'LINE CONTROL & PLC STATUS', x: 14, y: 84, width: 264, height: panelH });
+    // Left Card: Line Control & PLC Status (widened for larger START/STOP/RESET buttons & lamps)
+    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: 'LINE CONTROL & PLC STATUS', x: 12, y: 84, width: 298, height: panelH });
     (input.commands ?? []).slice(0, 3).forEach((cmd, i) => {
       widgets.push({
         id: `${key}_cmd_${i}`,
@@ -702,10 +702,10 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: cmd.tagName,
         writeEnabled: true,
         visualRole: cmd.role ?? 'DEFAULT',
-        x: 24 + i * 84,
-        y: hasBottomNav ? 122 : 128,
-        width: 78,
-        height: 86,
+        x: 20 + i * 95,
+        y: hasBottomNav ? 118 : 122,
+        width: 90,
+        height: hasBottomNav ? 98 : 108,
       });
     });
     (input.commIndicators ?? []).slice(0, 3).forEach((ci, i) => {
@@ -715,10 +715,10 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         label: ci.label,
         tagName: ci.tagName,
         visualRole: ci.role ?? 'PRIMARY_ACTION',
-        x: 26,
-        y: (hasBottomNav ? 228 : 242) + i * (hasBottomNav ? 50 : 56),
-        width: 240,
-        height: 38,
+        x: 24,
+        y: (hasBottomNav ? 226 : 244) + i * (hasBottomNav ? 48 : 54),
+        width: 274,
+        height: 42,
       });
     });
     if (input.ioIndicators?.[0]) {
@@ -728,10 +728,10 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         label: input.ioIndicators[0].label,
         tagName: input.ioIndicators[0].tagName,
         visualRole: input.ioIndicators[0].role ?? 'PRIMARY_ACTION',
-        x: 26,
-        y: hasBottomNav ? 386 : 412,
-        width: 240,
-        height: 38,
+        x: 24,
+        y: hasBottomNav ? 376 : 408,
+        width: 274,
+        height: 42,
       });
     }
     if (input.stationCounter) {
@@ -741,15 +741,15 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         label: input.stationCounter.label,
         tagName: input.stationCounter.tagName,
         unit: input.stationCounter.unit ?? '',
-        x: 26,
-        y: hasBottomNav ? 436 : 470,
-        width: 240,
-        height: hasBottomNav ? 76 : 92,
+        x: 24,
+        y: hasBottomNav ? 428 : 464,
+        width: 274,
+        height: hasBottomNav ? 86 : 100,
       });
     }
 
     // Center Card: 5 Large Touch Navigation Cards
-    widgets.push({ id: `${key}_p_center`, type: 'GROUP_PANEL', label: 'SYSTEM NAVIGATION', x: 290, y: 84, width: 444, height: panelH });
+    widgets.push({ id: `${key}_p_center`, type: 'GROUP_PANEL', label: 'SYSTEM NAVIGATION', x: 320, y: 84, width: 416, height: panelH });
     (input.hubNavCards ?? []).slice(0, 5).forEach((card, i) => {
       const isFifth = i === 4;
       const col = i % 2;
@@ -761,9 +761,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         id: `${key}_hub_nav_${i}`,
         type: 'NAV_BAR',
         label: card.label,
-        x: isFifth ? 306 : 306 + col * 214,
+        x: isFifth ? 334 : 334 + col * 200,
         y: isFifth ? startY + 2 * rowStep : startY + row * rowStep,
-        width: isFifth ? 412 : 198,
+        width: isFifth ? 388 : 188,
         height: cardH,
         props: {
           targetScreenName: card.targetScreenName,
@@ -774,7 +774,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
     });
 
     // Right Card: Live Production Summary
-    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: 'LIVE PRODUCTION COUNTERS', x: 746, y: 84, width: 264, height: panelH });
+    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: 'LIVE PRODUCTION COUNTERS', x: 746, y: 84, width: 266, height: panelH });
     (input.heroKpis ?? []).slice(0, 4).forEach((kpi, i) => {
       widgets.push({
         id: `${key}_kpi_${i}`,
@@ -784,9 +784,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         unit: kpi.unit ?? 'pcs',
         precision: kpi.precision,
         visualRole: kpi.role ?? 'KPI_HERO',
-        x: 762,
+        x: 760,
         y: (hasBottomNav ? 122 : 128) + i * (hasBottomNav ? 96 : 110),
-        width: 232,
+        width: 238,
         height: hasBottomNav ? 82 : 94,
       });
     });
