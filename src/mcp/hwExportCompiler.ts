@@ -1030,11 +1030,14 @@ export function compileProjectToHwExport(
         bindings,
         'btn226'
       );
+      const numMin = w.min ?? (bound?.tag.dataType === 'UINT16' || bound?.tag.dataType === 'UINT32' ? 0 : -32768);
+      const rawNumMax = w.max ?? (bound?.tag.dataType === 'UINT16' || bound?.tag.dataType === 'UINT32' ? 65535 : 32767);
+      const numMax = rawNumMax > numMin ? rawNumMax : numMin + 100;
       const attrs = bound
         ? isString
-          ? `IsIput="false" DifVar="false" DispLgth="32" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar="${xmlEsc(bound.fullName)}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
-          : `SignDisp="true" IsPwdDisp="false" KilobitDisp="false" IsIput="${isInput}" ShowLeftTag="false" ShowRightTag="${Boolean(unitStr)}" DifVar="false" LeftTag="" RightTag="${xmlEsc(unitStr)}" NumHex="10" IntNum="6" DcmPls="${decimals}" HwLimit="num" IputMaxVal="${w.max ?? 32767}" IputMinVal="${w.min ?? -32768}" Font="" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar="${xmlEsc(bound.fullName)}" WrtVar="${isInput ? xmlEsc(bound.fullName) : ''}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
-        : `SignDisp="true" IsIput="false" DcmPls="${decimals}" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar=""`;
+          ? `IsIput="${isInput}" DifVar="false" DispLgth="32" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar="${xmlEsc(bound.fullName)}" WrtVar="${isInput ? xmlEsc(bound.fullName) : ''}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"${isInput ? ` WrtVar-UseAddr="false" WrtVar-id="${bound.varId}"` : ''}`
+          : `SignDisp="true" IsPwdDisp="false" KilobitDisp="false" IsIput="${isInput}" ShowLeftTag="false" ShowRightTag="${Boolean(unitStr)}" DifVar="false" LeftTag="" RightTag="${xmlEsc(unitStr)}" NumHex="10" IntNum="6" DcmPls="${decimals}" HwLimit="num" IputMaxVal="${numMax}" MaxValConvert="${numMax}" IputMinVal="${numMin}" MinValConvert="${numMin}" Font="" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar="${xmlEsc(bound.fullName)}" WrtVar="${isInput ? xmlEsc(bound.fullName) : ''}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
+        : `SignDisp="true" IsIput="false" DcmPls="${decimals}" HwLimit="num" IputMaxVal="${numMax}" MaxValConvert="${numMax}" IputMinVal="${numMin}" MinValConvert="${numMin}" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar=""`;
       svgElements.push(
         `<g transform="matrix(${sx},0,0,${sy},${w.x},${boxY})" hw-PowerTime="10" sym-type="${symType}" v="0.4" id="${symId}" hwkey="${hwkey}" ${attrs}><hwsymbol id="${hwkey}" newsym="true" defGId="btn226" title="Numeric input/display" name="${symType}" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="4" ry="4" width="100" height="100" stroke="${cardBorder}" stroke-width="2" fill="${cardFill}" /></g></g><g sign="text"><textBlock localid="at" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#0F172A" text-anchor="center" font-family="Arial" fonten="Arial" font-size="${w.visualRole === 'KPI_HERO' ? 14 : 12}" sh="18" font-weight="bold" cst="0">${isString ? '---' : `0${unitStr ? ` ${xmlEsc(unitStr)}` : ''}`}</textBlock></g></g></g></g>`
       );
@@ -1376,7 +1379,19 @@ ${vg.tags
     const dt = mapHaiwellVarType(t.dataType);
     const fullName = `${vg.groupName}.${t.name}`;
     const rawInit = (t as unknown as { initialValue?: unknown }).initialValue;
-    const initVal = rawInit !== undefined ? String(rawInit) : dt === 'STRING' ? '' : '0';
+    let initVal: string;
+    if (dt === 'BOOL') {
+      if (rawInit === true || rawInit === 1 || String(rawInit).toLowerCase() === 'true' || String(rawInit) === '1') {
+        initVal = '1';
+      } else {
+        initVal = '0';
+      }
+    } else if (dt === 'STRING') {
+      initVal = rawInit !== undefined && rawInit !== null ? String(rawInit) : '';
+    } else {
+      const n = Number(rawInit);
+      initVal = rawInit !== undefined && rawInit !== null && !Number.isNaN(n) ? String(n) : '0';
+    }
     return `          <variable>
             <ID>${700 + gIdx * 100 + tIdx}</ID>
             <ClassifyId>0</ClassifyId>

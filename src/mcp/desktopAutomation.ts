@@ -1072,6 +1072,7 @@ export interface HeadlessHwExportDeployOptions {
   enableAlwaysCollectFullNames?: string[];
   upsertTasks?: HeadlessTaskUpsert[];
   replaceExistingVariableGroups?: boolean;
+  startupWindowId?: number;
   createBackup?: boolean;
   timeoutMs?: number;
 }
@@ -1097,6 +1098,7 @@ export interface HeadlessHwExportDeployResult {
   importedTasks: string[];
   upsertedTasks: string[];
   alwaysCollectUpdated: string[];
+  startupWindowId: number | null;
   importedEventsCount: number;
   activeGuiWarning: string | null;
   error?: string | null;
@@ -1165,6 +1167,7 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
       memo: t.memo ?? '',
     })),
     replaceExistingVariableGroups: options.replaceExistingVariableGroups !== false,
+    startupWindowId: options.startupWindowId ?? 0,
     createBackup: options.createBackup !== false,
   };
   const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
@@ -1220,6 +1223,7 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `    public List<string> importedTasks { get; set; }`,
     `    public List<string> upsertedTasks { get; set; }`,
     `    public List<string> alwaysCollectUpdated { get; set; }`,
+    `    public int startupWindowId { get; set; }`,
     `    public int importedEventsCount { get; set; }`,
     `    public string activeGuiWarning { get; set; }`,
     `    public string error { get; set; }`,
@@ -1290,7 +1294,7 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `        return false;`,
     `    }`,
     ``,
-    `    public static HwHeadlessDeployOutcome Run(string installDir, string hwdevPath, string hwExportPath, string[] deletePrefixes, string[] alwaysCollectPatterns, string[] upsertTaskNames, string[] upsertTaskScripts, string[] upsertTaskMemos, bool replaceExistingVariableGroups, bool createBackup) {`,
+    `    public static HwHeadlessDeployOutcome Run(string installDir, string hwdevPath, string hwExportPath, string[] deletePrefixes, string[] alwaysCollectPatterns, string[] upsertTaskNames, string[] upsertTaskScripts, string[] upsertTaskMemos, bool replaceExistingVariableGroups, int startupWindowNumber, bool createBackup) {`,
     `        var outcome = new HwHeadlessDeployOutcome {`,
     `            ok = false,`,
     `            projectName = "",`,
@@ -1305,6 +1309,7 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `            importedTasks = new List<string>(),`,
     `            upsertedTasks = new List<string>(),`,
     `            alwaysCollectUpdated = new List<string>(),`,
+    `            startupWindowId = 0,`,
     `            importedEventsCount = 0,`,
     `            activeGuiWarning = null,`,
     `            error = null,`,
@@ -1588,6 +1593,33 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `            }`,
     `            int postEventCount = Convert.ToInt32(Q("SELECT count(*) FROM eventItem").Rows[0][0]);`,
     `            outcome.importedEventsCount = Math.Max(0, postEventCount - preEventCount);`,
+    ``,
+    `            // Ensure project.StartWindowId points to a valid user window (auto-heal when Window 1 is replaced)`,
+    `            try {`,
+    `                int curStartId = 0;`,
+    `                var prjRows = Q("SELECT StartWindowId FROM project").Rows;`,
+    `                if (prjRows.Count > 0 && prjRows[0]["StartWindowId"] != DBNull.Value) {`,
+    `                    curStartId = Convert.ToInt32(prjRows[0]["StartWindowId"]);`,
+    `                }`,
+    `                bool curValid = false;`,
+    `                HwHeadlessWindowItem preferredWin = null;`,
+    `                HwHeadlessWindowItem lowestWin = null;`,
+    `                int targetWinNum = startupWindowNumber > 0 ? startupWindowNumber : 1;`,
+    `                foreach (var w in outcome.allUserWindows) {`,
+    `                    if (w.id == curStartId) curValid = true;`,
+    `                    if (w.windowId == targetWinNum) preferredWin = w;`,
+    `                    if (lowestWin == null || w.windowId < lowestWin.windowId) lowestWin = w;`,
+    `                }`,
+    `                if (startupWindowNumber > 0 || !curValid) {`,
+    `                    var chosen = preferredWin ?? lowestWin;`,
+    `                    if (chosen != null) {`,
+    `                        E("UPDATE project SET StartWindowId = " + chosen.id);`,
+    `                        curStartId = chosen.id;`,
+    `                    }`,
+    `                }`,
+    `                outcome.startupWindowId = curStartId;`,
+    `            } catch {}`,
+    ``,
     `            outcome.ok = true;`,
     `        } catch (Exception ex) {`,
     `            Exception root = ex is TargetInvocationException && ex.InnerException != null ? ex.InnerException : ex;`,
@@ -1615,7 +1647,7 @@ export function buildHeadlessHwExportDeployScript(options: HeadlessHwExportDeplo
     `}`,
     `'@ -ReferencedAssemblies System.Windows.Forms, System.Data, System.Xml`,
     ``,
-    `$res = [HwHeadlessDeployer]::Run($cfg.installDir, $cfg.hwdevPath, $cfg.hwExportPath, $deletePrefixes, $alwaysCollectPatterns, $upsertTaskNames, $upsertTaskScripts, $upsertTaskMemos, [bool]$cfg.replaceExistingVariableGroups, [bool]$cfg.createBackup)`,
+    `$res = [HwHeadlessDeployer]::Run($cfg.installDir, $cfg.hwdevPath, $cfg.hwExportPath, $deletePrefixes, $alwaysCollectPatterns, $upsertTaskNames, $upsertTaskScripts, $upsertTaskMemos, [bool]$cfg.replaceExistingVariableGroups, [int]$cfg.startupWindowId, [bool]$cfg.createBackup)`,
     `Write-Output ("__HW_HEADLESS_RESULT__:" + ($res | ConvertTo-Json -Depth 6 -Compress))`,
     `if (-not $res.ok) { exit 1 }`,
   ].join('\n');
@@ -1640,6 +1672,7 @@ export async function deployHwExportHeadless(
       importedTasks: [],
       upsertedTasks: [],
       alwaysCollectUpdated: [],
+      startupWindowId: null,
       importedEventsCount: 0,
       activeGuiWarning: null,
       error: check.reason ?? 'HEADLESS_DOTNET_UNAVAILABLE',
@@ -1692,6 +1725,7 @@ export async function deployHwExportHeadless(
         importedTasks: Array.isArray(parsed.importedTasks) ? parsed.importedTasks.map(String) : [],
         upsertedTasks: Array.isArray(parsed.upsertedTasks) ? parsed.upsertedTasks.map(String) : [],
         alwaysCollectUpdated: Array.isArray(parsed.alwaysCollectUpdated) ? parsed.alwaysCollectUpdated.map(String) : [],
+        startupWindowId: typeof parsed.startupWindowId === 'number' && parsed.startupWindowId > 0 ? parsed.startupWindowId : null,
         importedEventsCount: Number(parsed.importedEventsCount ?? 0),
         activeGuiWarning: parsed.activeGuiWarning ? String(parsed.activeGuiWarning) : null,
         error: parsed.error ? String(parsed.error) : null,
@@ -1724,6 +1758,7 @@ export async function deployHwExportHeadless(
       importedTasks: [],
       upsertedTasks: [],
       alwaysCollectUpdated: [],
+      startupWindowId: null,
       importedEventsCount: 0,
       activeGuiWarning: null,
       error: `HEADLESS_OUTPUT_PARSE_ERROR: ${stdout.trim().slice(0, 400)}`,
@@ -1747,6 +1782,7 @@ export async function deployHwExportHeadless(
       importedTasks: [],
       upsertedTasks: [],
       alwaysCollectUpdated: [],
+      startupWindowId: null,
       importedEventsCount: 0,
       activeGuiWarning: null,
       error: detail,
@@ -1771,6 +1807,7 @@ export interface DeployHwExportOptions {
   enableAlwaysCollectFullNames?: string[];
   upsertTasks?: HeadlessTaskUpsert[];
   replaceExistingVariableGroups?: boolean;
+  startupWindowId?: number;
   deployMode?: 'auto' | 'headless' | 'watcher_or_bat';
   createBackup?: boolean;
   dryRun?: boolean;
@@ -1790,6 +1827,7 @@ export async function deployHwExportToDesktop(options: DeployHwExportOptions) {
     enableAlwaysCollectFullNames: options.enableAlwaysCollectFullNames,
     upsertTasks: options.upsertTasks,
     replaceExistingVariableGroups: options.replaceExistingVariableGroups,
+    startupWindowId: options.startupWindowId,
     createBackup: options.createBackup,
   });
   const deployScript = buildHwExportImportScript({
@@ -1833,6 +1871,7 @@ export async function deployHwExportToDesktop(options: DeployHwExportOptions) {
         enableAlwaysCollectFullNames: options.enableAlwaysCollectFullNames,
         upsertTasks: options.upsertTasks,
         replaceExistingVariableGroups: options.replaceExistingVariableGroups,
+        startupWindowId: options.startupWindowId,
         createBackup: options.createBackup,
         timeoutMs: Math.max(options.waitTimeoutMs ?? 45_000, 30_000),
       });
@@ -1853,6 +1892,7 @@ export async function deployHwExportToDesktop(options: DeployHwExportOptions) {
           importedTasks: headlessResult.importedTasks,
           upsertedTasks: headlessResult.upsertedTasks,
           alwaysCollectUpdated: headlessResult.alwaysCollectUpdated,
+          startupWindowId: headlessResult.startupWindowId,
           importedEventsCount: headlessResult.importedEventsCount,
           activeGuiWarning: headlessResult.activeGuiWarning,
         };

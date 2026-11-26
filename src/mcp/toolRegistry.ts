@@ -5588,6 +5588,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         )
         .optional(),
       replaceExistingVariableGroups: z.boolean().default(true),
+      startupWindowId: z.number().int().min(1).max(9999).optional(),
       deployMode: z.enum(['auto', 'headless', 'watcher_or_bat']).default('auto'),
       createBackup: z.boolean().default(true),
       dryRun: z.boolean().default(false),
@@ -5631,6 +5632,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         enableAlwaysCollectFullNames: input.enableAlwaysCollectFullNames,
         upsertTasks: input.upsertTasks,
         replaceExistingVariableGroups: input.replaceExistingVariableGroups,
+        startupWindowId: input.startupWindowId,
         deployMode: input.deployMode,
         createBackup: input.createBackup,
         dryRun: input.dryRun,
