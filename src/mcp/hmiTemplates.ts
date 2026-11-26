@@ -27,6 +27,7 @@ export interface TemplateIndicatorItem {
   label: string;
   tagName: string;
   role?: HmiVisualRole;
+  invertDisplay?: boolean;
 }
 
 export interface TemplateReadoutItem {
@@ -594,6 +595,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         y: 100 + i * 52,
         width: 366,
         height: 42,
+        ...(inp.invertDisplay ? { props: { invertDisplay: true } } : {}),
       });
     });
 

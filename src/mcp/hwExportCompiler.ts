@@ -748,8 +748,9 @@ export function compileProjectToHwExport(
           varBindings: bound ? [{ propName: 'RdVar-id', varId: bound.varId }] : [],
         });
 
+        const rvrsSt = w.props?.invertDisplay ? 'true' : 'false';
         svgElements.push(
-          `<g transform="matrix(${sx},0,0,${sy},${lx.toFixed(2)},${ly.toFixed(2)})" hw-PowerTime="10" sym-type="BitLamp" v="0.4" id="${symId}" hwkey="${hwkey}" RvrsSt="false" StCt="2" Model="none" Type="on" IsOFFCtrl="false" FrqTime="1000" EnblExps="" ${rdAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="lamp013" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit lamp" title-en="Bit lamp" name="BitLamp" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
+          `<g transform="matrix(${sx},0,0,${sy},${lx.toFixed(2)},${ly.toFixed(2)})" hw-PowerTime="10" sym-type="BitLamp" v="0.4" id="${symId}" hwkey="${hwkey}" RvrsSt="${rvrsSt}" StCt="2" Model="none" Type="on" IsOFFCtrl="false" FrqTime="1000" EnblExps="" ${rdAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="lamp013" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit lamp" title-en="Bit lamp" name="BitLamp" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
         );
 
         const lblColor = w.props?.labelColor ? String(w.props.labelColor) : '#0F172A';

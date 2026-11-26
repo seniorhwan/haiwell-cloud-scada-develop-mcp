@@ -3509,7 +3509,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
         .optional(),
       inputs: z
-        .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            role: z.enum(VISUAL_ROLES).optional(),
+            invertDisplay: z.boolean().optional(),
+          })
+        )
         .optional(),
       outputs: z
         .array(
