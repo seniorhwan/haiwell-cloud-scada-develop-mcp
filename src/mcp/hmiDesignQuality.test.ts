@@ -18,7 +18,12 @@ import { detectWidgetCollisions, renderScreenToSvg, validateHmiScreen } from './
 import { solveAndRepairScreenLayout } from './hmiSpatialEngine';
 import { generateSolidPngBase64 } from './hwPngIcons';
 import { getToolsForProfile, HAIWELL_TOOLS, invokeHaiwellTool, runProjectSafetyAudit } from './toolRegistry';
-import { generateAgentSkillMarkdown, HAIWELL_PROMPTS } from './resourcesAndPrompts';
+import {
+  generateAgentSkillMarkdown,
+  HAIWELL_PROMPTS,
+  HAIWELL_RESOURCES,
+  readHaiwellResource,
+} from './resourcesAndPrompts';
 import { SERVER_VERSION } from './version';
 import type { HmiScreen } from './types';
 
@@ -898,3 +903,131 @@ test('Pass 2 regression: container-aware solveAndRepairScreenLayout, dark-theme 
     assert.ok(tab.y >= 400, `Multi-tab bottom NAV_BAR "${tab.id}" must stay anchored at bottom (got y=${tab.y})`);
   }
 });
+
+test('S&P 500 Factory HMI Playbook resource & domain-aware evidence-tagged human-factors audits', async () => {
+  const store = new HaiwellProjectStore();
+
+  // 1. Playbook resource is registered and separates Facts vs. Standards vs. Opinions with named authorities
+  assert.ok(
+    HAIWELL_RESOURCES.some((r) => r.uri === 'haiwell://knowledge/hmi-engineering-playbook'),
+    'HMI engineering playbook resource must be registered'
+  );
+  const playbook = readHaiwellResource('haiwell://knowledge/hmi-engineering-playbook', store);
+  assert.equal(playbook.mimeType, 'text/markdown');
+  for (const required of [
+    'EMPIRICAL_FACT',
+    'INDUSTRY_STANDARD',
+    'PRACTITIONER_OPINION',
+    'ExxonMobil',
+    'Procter & Gamble',
+    'Ford',
+    'Dr. Mica R. Endsley',
+    'Dr. Peter Bullemer',
+    'Jamie Errington',
+    'Bill Hollifield',
+    'Ian Nimmo',
+    'Dr. Kim J. Vicente',
+    '48%',
+    '10%',
+    'PackML',
+  ]) {
+    assert.ok(playbook.text.includes(required), `Playbook must include "${required}"`);
+  }
+
+  // 2. Continuous process screen with CVD color-only label, alarm color dilution, bare analog readouts,
+  //    danger-button proximity, and density overload triggers all 5 HMI-HF-* warnings with accurate evidenceBasis
+  const flawedProcessScreen: HmiScreen = {
+    id: 'scr_hf_process_bad',
+    name: 'Reactor Process Screen',
+    width: 800,
+    height: 480,
+    layoutStandard: 'ISA_101_HIGH_PERFORMANCE',
+    backgroundColor: '#F1F5F9',
+    autoScaleMobile: true,
+    autoScaleWeb: true,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    widgets: [
+      { id: 'lamp_red', type: 'BIT_LAMP', label: 'RED', x: 16, y: 16, width: 120, height: 48, visualRole: 'DANGER_ACTION' },
+      { id: 'btn_start', type: 'BIT_BUTTON', label: 'START', x: 16, y: 80, width: 120, height: 56, writeEnabled: true, visualRole: 'PRIMARY_ACTION' },
+      { id: 'btn_abort', type: 'BIT_BUTTON', label: 'ABORT', x: 140, y: 80, width: 120, height: 56, writeEnabled: true, visualRole: 'DANGER_ACTION' }, // only 4px gap!
+      { id: 'num_t1', type: 'NUMERIC_DISPLAY', label: 'Reactor Temp', x: 16, y: 150, width: 180, height: 70, props: { backgroundColor: '#EF4444', color: '#FFFFFF' } },
+      { id: 'num_t2', type: 'NUMERIC_DISPLAY', label: 'Jacket Temp', x: 204, y: 150, width: 180, height: 70, props: { backgroundColor: '#F59E0B', color: '#0F172A' } },
+      { id: 'num_p1', type: 'NUMERIC_DISPLAY', label: 'Vessel Pressure', x: 392, y: 150, width: 180, height: 70 },
+      { id: 'num_f1', type: 'NUMERIC_DISPLAY', label: 'Feed Flow', x: 580, y: 150, width: 180, height: 70 },
+      // Large dense tables/cards pushing non-panel coverage > 65%
+      { id: 'big_tbl_1', type: 'DATA_TABLE', label: 'Batch Log', x: 16, y: 230, width: 760, height: 236 },
+    ],
+  };
+
+  const procAudit = auditHmiScreenDesign(flawedProcessScreen, {}, { industryDomain: 'PROCESS_CONTINUOUS' });
+  const procCodes = new Set(procAudit.issues.map((i) => i.code));
+  assert.ok(procCodes.has('HMI-HF-COLOR-ONLY-CODING'), 'Must flag color-only label "RED"');
+  assert.ok(procCodes.has('HMI-HF-ALARM-COLOR-DILUTION'), 'Must flag saturated red/amber backgrounds on non-alarm telemetry');
+  assert.ok(procCodes.has('HMI-HF-MISSING-PROCESS-CONTEXT'), 'Must flag bare analog readouts without units/bounds/trends on PROCESS_CONTINUOUS');
+  assert.ok(procCodes.has('HMI-HF-DANGER-PROXIMITY'), 'Must flag DANGER_ACTION button within < 12px of PRIMARY_ACTION');
+  assert.ok(procCodes.has('HMI-HF-DENSITY-OVERLOAD'), 'Must flag > 65% non-panel canvas density');
+
+  const proximityIssue = procAudit.issues.find((i) => i.code === 'HMI-HF-DANGER-PROXIMITY')!;
+  assert.equal(proximityIssue.evidenceBasis, 'INDUSTRY_STANDARD');
+  const cvdIssue = procAudit.issues.find((i) => i.code === 'HMI-HF-COLOR-ONLY-CODING')!;
+  assert.equal(cvdIssue.evidenceBasis, 'EMPIRICAL_FACT');
+  assert.ok(procAudit.evidenceSummary.empiricalFact >= 4);
+  assert.ok(procAudit.evidenceSummary.industryStandard >= 1);
+
+  // 3. Non-dogmatic check: DISCRETE_MANUFACTURING counter screen must NOT trigger HMI-HF-MISSING-PROCESS-CONTEXT
+  const discreteCounterScreen: HmiScreen = {
+    id: 'scr_discrete_cell',
+    name: 'Body Shop Cell 4',
+    width: 1024,
+    height: 600,
+    layoutStandard: 'ISA_101_HIGH_PERFORMANCE',
+    industryDomain: 'DISCRETE_MANUFACTURING',
+    backgroundColor: '#E2E8F0',
+    autoScaleMobile: true,
+    autoScaleWeb: true,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    widgets: [
+      { id: 'st_load', type: 'STATION', label: 'ST1 LOAD', x: 24, y: 64, width: 180, height: 140 },
+      { id: 'cnt_good', type: 'NUMERIC_DISPLAY', label: 'Good Parts', x: 24, y: 240, width: 160, height: 68, unit: 'pcs' },
+      { id: 'cnt_rej', type: 'NUMERIC_DISPLAY', label: 'Reject Parts', x: 204, y: 240, width: 160, height: 68, unit: 'pcs' },
+      { id: 'cnt_cyc', type: 'NUMERIC_DISPLAY', label: 'Cycle Count', x: 384, y: 240, width: 160, height: 68, unit: 'cycles' },
+      { id: 'cnt_rec', type: 'NUMERIC_DISPLAY', label: 'Recipe ID', x: 564, y: 240, width: 160, height: 68 },
+    ],
+  };
+
+  const discreteAudit = auditHmiScreenDesign(discreteCounterScreen);
+  assert.equal(discreteAudit.industryDomain, 'DISCRETE_MANUFACTURING');
+  assert.ok(
+    !discreteAudit.issues.some((i) => i.code === 'HMI-HF-MISSING-PROCESS-CONTEXT'),
+    'DISCRETE_MANUFACTURING counter screen must not be dogmatically flagged for missing analog trends'
+  );
+
+  // 4. haiwell_hmi_design_audit MCP tool returns evidenceSummary & playbookResource and keeps prj_chiller_plant_01 deploymentReady
+  const toolRes = await invokeHaiwellTool(
+    'haiwell_hmi_design_audit',
+    {
+      projectId: 'prj_chiller_plant_01',
+      screenId: 'scr_chiller_overview',
+      industryDomain: 'PROCESS_CONTINUOUS',
+      screenLevel: 'L1_OVERVIEW',
+      autoFix: false,
+    },
+    store
+  );
+  assert.equal(toolRes.ok, true);
+  const data = toolRes.data as {
+    valid: boolean;
+    playbookResource: string;
+    evidenceSummary: { empiricalFact: number; industryStandard: number; practitionerOpinion: number };
+    screens: { industryDomain: string; screenLevel?: string }[];
+  };
+  assert.equal(data.valid, true);
+  assert.equal(data.playbookResource, 'haiwell://knowledge/hmi-engineering-playbook');
+  assert.equal(data.screens[0].industryDomain, 'PROCESS_CONTINUOUS');
+  assert.equal(data.screens[0].screenLevel, 'L1_OVERVIEW');
+  assert.equal(typeof data.evidenceSummary.empiricalFact, 'number');
+
+  const safety = runProjectSafetyAudit(store.getProject('prj_chiller_plant_01'));
+  assert.equal(safety.deploymentReady, true);
+});
+

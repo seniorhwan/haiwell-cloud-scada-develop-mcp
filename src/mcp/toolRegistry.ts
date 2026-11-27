@@ -3301,19 +3301,26 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
   defineTool({
     name: 'haiwell_hmi_design_audit',
     domain: 'hmi',
-    haiwellFeature: 'HMI Visual Readability, WCAG Contrast & Text-Fit Auditor + Auto-Fixer',
+    haiwellFeature: 'HMI Visual Readability, WCAG Contrast, Text-Fit & S&P 500 Human-Factors Auditor + Auto-Fixer',
     safetyTier: 'design',
     description:
-      'Audit one or all HMI screens in a project for concrete visual readability defects (invisible text / low WCAG contrast against true enclosing surfaces, text overflow/clipping, child widgets overlapping GROUP_PANEL title bars, compact sub-element overflow, and touch targets). Set autoFix=true to automatically repair contrast, font sizes, panel header clearance, and touch dimensions and persist the fixed screen(s).',
+      'Audit one or all HMI screens in a project for visual readability defects (invisible text, low WCAG contrast, text overflow, panel-header overlap, sub-element overflow, touch targets) AND evidence-tagged industrial human-factors issues (red-green CVD color-only coding, alarm color dilution, Endsley SA L2/L3 process context, destructive-button proximity, screen density). Pass industryDomain (PROCESS_CONTINUOUS | DISCRETE_MANUFACTURING | HYBRID_BATCH_CPG) so checks adapt to your factory type instead of enforcing blind refinery dogma. Set autoFix=true to automatically repair visual defects.',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       screenId: z.string().optional(),
+      industryDomain: z
+        .enum(['PROCESS_CONTINUOUS', 'DISCRETE_MANUFACTURING', 'HYBRID_BATCH_CPG'])
+        .optional(),
+      screenLevel: z
+        .enum(['L1_OVERVIEW', 'L2_AREA', 'L3_DETAIL', 'L4_DIAGNOSTICS'])
+        .optional(),
       autoFix: z.boolean().default(false),
       includeSvg: z.boolean().default(false),
     }),
     sampleInput: {
       projectId: DEFAULT_PROJECT_ID,
       screenId: 'scr_chiller_overview',
+      industryDomain: 'PROCESS_CONTINUOUS',
       autoFix: false,
     },
     handler: (input, store) => {
@@ -3330,10 +3337,13 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       let mutated = false;
 
       for (const screen of targets) {
+        const auditOpts = {
+          targetHardware: project.targetHardware,
+          ...(input.industryDomain ? { industryDomain: input.industryDomain } : {}),
+          ...(input.screenLevel ? { screenLevel: input.screenLevel } : {}),
+        };
         if (input.autoFix) {
-          const repaired = autoFixHmiScreenDesign(screen, project.tags, {
-            targetHardware: project.targetHardware,
-          });
+          const repaired = autoFixHmiScreenDesign(screen, project.tags, auditOpts);
           if (repaired.appliedFixes.length > 0) {
             const idx = project.screens.findIndex((s) => s.id === screen.id);
             if (idx >= 0) project.screens[idx] = repaired.screen;
@@ -3346,9 +3356,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             ...(input.includeSvg ? { svg: renderScreenToSvg(repaired.screen, project.tags) } : {}),
           });
         } else {
-          const report = auditHmiScreenDesign(screen, project.tags, {
-            targetHardware: project.targetHardware,
-          });
+          const report = auditHmiScreenDesign(screen, project.tags, auditOpts);
           screenReports.push({
             ...report,
             fixesApplied: 0,
@@ -3363,13 +3371,23 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
 
       const totalBlockingIssues = screenReports.reduce((sum, r) => sum + r.blockingCount, 0);
       const totalWarnings = screenReports.reduce((sum, r) => sum + r.warningCount, 0);
+      const evidenceSummary = screenReports.reduce(
+        (acc, r) => ({
+          empiricalFact: acc.empiricalFact + r.evidenceSummary.empiricalFact,
+          industryStandard: acc.industryStandard + r.evidenceSummary.industryStandard,
+          practitionerOpinion: acc.practitionerOpinion + r.evidenceSummary.practitionerOpinion,
+        }),
+        { empiricalFact: 0, industryStandard: 0, practitionerOpinion: 0 }
+      );
 
       return {
         projectId: project.id,
         themePresets: Object.keys(HMI_THEMES),
+        playbookResource: 'haiwell://knowledge/hmi-engineering-playbook',
         valid: totalBlockingIssues === 0,
         totalBlockingIssues,
         totalWarnings,
+        evidenceSummary,
         autoFixApplied: mutated,
         appliedFixes,
         screens: screenReports,

@@ -232,6 +232,22 @@ export interface HmiPipeRoute {
 
 export type HmiThemeId = 'ISA_101_LIGHT' | 'CONTROL_ROOM_DARK' | 'HIGH_CONTRAST_TOUCH';
 
+export type HmiIndustryDomain =
+  | 'PROCESS_CONTINUOUS'
+  | 'DISCRETE_MANUFACTURING'
+  | 'HYBRID_BATCH_CPG';
+
+export type HmiScreenLevel =
+  | 'L1_OVERVIEW'
+  | 'L2_AREA'
+  | 'L3_DETAIL'
+  | 'L4_DIAGNOSTICS';
+
+export type HmiEvidenceBasis =
+  | 'EMPIRICAL_FACT'
+  | 'INDUSTRY_STANDARD'
+  | 'PRACTITIONER_OPINION';
+
 export interface HmiScreen {
   id: string;
   name: string;
@@ -239,6 +255,8 @@ export interface HmiScreen {
   height: number;
   layoutStandard: 'ISA_101_HIGH_PERFORMANCE' | 'STANDARD_INDUSTRIAL' | 'MOBILE_UNIFIED';
   themeId?: HmiThemeId;
+  industryDomain?: HmiIndustryDomain;
+  screenLevel?: HmiScreenLevel;
   backgroundColor: string;
   autoScaleMobile: boolean;
   autoScaleWeb: boolean;

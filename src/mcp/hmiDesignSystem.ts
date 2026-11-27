@@ -8,13 +8,17 @@
 
 import type {
   HaiwellTargetHardware,
+  HmiEvidenceBasis,
+  HmiIndustryDomain,
   HmiScreen,
+  HmiScreenLevel,
   HmiThemeId,
   HmiVisualRole,
   HmiWidget,
   HmiWidgetType,
   TagDefinition,
 } from './types';
+import { inferHmiIndustryDomain } from './hmiDomainKnowledge';
 
 export interface HmiThemeTokens {
   id: HmiThemeId;
@@ -545,16 +549,28 @@ export type VisualAuditIssueCode =
   | 'HMI-VIS-UNFIXABLE-OVERFLOW'
   | 'HMI-VIS-PANEL-HEADER-OVERLAP'
   | 'HMI-VIS-SUBELEMENT-OVERFLOW'
-  | 'HMI-VIS-TOUCH-TARGET';
+  | 'HMI-VIS-TOUCH-TARGET'
+  | 'HMI-HF-COLOR-ONLY-CODING'
+  | 'HMI-HF-ALARM-COLOR-DILUTION'
+  | 'HMI-HF-MISSING-PROCESS-CONTEXT'
+  | 'HMI-HF-DANGER-PROXIMITY'
+  | 'HMI-HF-DENSITY-OVERLOAD';
 
 export interface VisualAuditIssue {
   code: VisualAuditIssueCode;
   severity: 'ERROR' | 'WARNING';
+  evidenceBasis: HmiEvidenceBasis;
   widgetId: string;
   widgetType: HmiWidgetType;
   message: string;
   measured?: Record<string, string | number>;
   remediation: string;
+}
+
+export interface HmiVisualAuditOptions {
+  targetHardware?: HaiwellTargetHardware;
+  industryDomain?: HmiIndustryDomain;
+  screenLevel?: HmiScreenLevel;
 }
 
 export interface HmiVisualAuditResult {
@@ -564,6 +580,13 @@ export interface HmiVisualAuditResult {
   blockingCount: number;
   warningCount: number;
   themeId: HmiThemeId;
+  industryDomain: HmiIndustryDomain;
+  screenLevel?: HmiScreenLevel;
+  evidenceSummary: {
+    empiricalFact: number;
+    industryStandard: number;
+    practitionerOpinion: number;
+  };
   issues: VisualAuditIssue[];
 }
 
@@ -592,6 +615,7 @@ function pushContrastIssue(
     issues.push({
       code: 'HMI-VIS-INVISIBLE-TEXT',
       severity: 'ERROR',
+      evidenceBasis: 'EMPIRICAL_FACT',
       widgetId: w.id,
       widgetType: w.type,
       message: `${w.type} "${w.id}" ${subject} color ${fg} on ${bg} has contrast ${ratio}:1 (< 3.0:1, unreadable).`,
@@ -602,6 +626,7 @@ function pushContrastIssue(
     issues.push({
       code: 'HMI-VIS-LOW-CONTRAST',
       severity: 'WARNING',
+      evidenceBasis: 'EMPIRICAL_FACT',
       widgetId: w.id,
       widgetType: w.type,
       message: `${w.type} "${w.id}" ${subject} contrast ${ratio}:1 (${fg} on ${bg}) is below WCAG AA 4.5:1.`,
@@ -631,6 +656,7 @@ function pushTextFitIssue(
     issues.push({
       code: 'HMI-VIS-UNFIXABLE-OVERFLOW',
       severity: minFloorW > availW * errFactor ? 'ERROR' : 'WARNING',
+      evidenceBasis: 'EMPIRICAL_FACT',
       widgetId: w.id,
       widgetType: w.type,
       message: `${w.type} "${w.id}" text "${text}" still overflows ${slotLabel} (${availW}px) even at the 8px minimum font floor (~${minFloorW}px).`,
@@ -643,6 +669,7 @@ function pushTextFitIssue(
   issues.push({
     code: 'HMI-VIS-TEXT-OVERFLOW',
     severity: estW > availW * errFactor ? 'ERROR' : 'WARNING',
+    evidenceBasis: 'EMPIRICAL_FACT',
     widgetId: w.id,
     widgetType: w.type,
     message: `${w.type} "${w.id}" text "${text}" (~${estW}px at ${fontSize}px) exceeds ${slotLabel} (${availW}px).`,
@@ -795,19 +822,101 @@ function repairAutoFixCollisions(screen: HmiScreen, appliedFixes: string[]): voi
   }
 }
 
+const COLOR_ONLY_LABEL_RE =
+  /^(red|green|yellow|amber|orange|blue|lamp|led|light|indicator|status|btn|button|on\/off|\d+)$/i;
+const DISCRETE_COUNTER_RE =
+  /\b(count|counter|cycles?|parts?|pcs|qty|batch|recipe|code|fault.?code|shift|index|id)\b/i;
+const ANALOG_PROCESS_LABEL_RE =
+  /\b(temp|temperature|press|pressure|flow|level|ph|humidity|speed|rpm|freq|frequency|voltage|current|power|torque|vacuum|setpoint|delta|dp)\b/i;
+
+function isSaturatedAlarmHue(hex: string | null): boolean {
+  const rgb = parseHexColor(hex);
+  if (!rgb) return false;
+  const r = rgb.r / 255;
+  const g = rgb.g / 255;
+  const b = rgb.b / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+  if (max < 0.55 || delta === 0) return false;
+  const sat = delta / max;
+  if (sat < 0.65) return false;
+  let hue = 0;
+  if (max === r) hue = 60 * (((g - b) / delta) % 6);
+  else if (max === g) hue = 60 * ((b - r) / delta + 2);
+  else hue = 60 * ((r - g) / delta + 4);
+  if (hue < 0) hue += 360;
+  // Red, orange, or amber alarm hues
+  return hue <= 45 || hue >= 340;
+}
+
+function rectEdgeDistance(
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number }
+): number {
+  const dx = Math.max(0, b.x - (a.x + a.width), a.x - (b.x + b.width));
+  const dy = Math.max(0, b.y - (a.y + a.height), a.y - (b.y + b.height));
+  return Math.hypot(dx, dy);
+}
+
+function computeNonPanelCanvasCoverage(screen: HmiScreen, nonPanels: HmiWidget[]): number {
+  if (screen.width <= 0 || screen.height <= 0 || nonPanels.length === 0) return 0;
+  const step = 8;
+  const cols = Math.max(1, Math.ceil(screen.width / step));
+  const rows = Math.max(1, Math.ceil(screen.height / step));
+  const grid = new Uint8Array(cols * rows);
+  for (const w of nonPanels) {
+    const x0 = Math.max(0, Math.floor(w.x / step));
+    const x1 = Math.min(cols - 1, Math.floor((w.x + w.width - 1) / step));
+    const y0 = Math.max(0, Math.floor(w.y / step));
+    const y1 = Math.min(rows - 1, Math.floor((w.y + w.height - 1) / step));
+    for (let ry = y0; ry <= y1; ry++) {
+      const rowOffset = ry * cols;
+      for (let cx = x0; cx <= x1; cx++) {
+        grid[rowOffset + cx] = 1;
+      }
+    }
+  }
+  let occupied = 0;
+  for (let i = 0; i < grid.length; i++) {
+    if (grid[i]) occupied++;
+  }
+  return occupied / grid.length;
+}
+
+function isDiscreteCounterWidget(w: HmiWidget, tag?: TagDefinition): boolean {
+  const text = `${w.label} ${w.tagName ?? ''}`;
+  if (DISCRETE_COUNTER_RE.test(text)) return true;
+  const unit = (w.unit ?? tag?.unit ?? '').trim();
+  if (/^(pcs|cnt|cycles?|units?|parts?)$/i.test(unit)) return true;
+  return false;
+}
+
+function isAnalogProcessWidget(w: HmiWidget, tag?: TagDefinition): boolean {
+  if (isDiscreteCounterWidget(w, tag)) return false;
+  if (tag && (tag.dataType === 'FLOAT32' || tag.dataType === 'FLOAT64')) return true;
+  if (ANALOG_PROCESS_LABEL_RE.test(`${w.label} ${w.tagName ?? ''}`)) return true;
+  return false;
+}
+
 /**
- * Concrete pass/fail visual readability & ergonomics audit for an HMI screen.
+ * Concrete pass/fail visual readability, ergonomics & evidence-tagged human-factors
+ * audit for an HMI screen.
  * Checks WCAG contrast against the true enclosing surface (catching dark-on-dark
  * and white-on-white invisible text), text overflow against available pixel width,
  * unfixable overflow at the 8px minimum font floor, child overlap onto GROUP_PANEL
- * headers, compact sub-element bounds, and touch targets across all HMI widget types.
+ * headers, compact sub-element bounds, touch targets, plus domain-aware human-factors
+ * checks (red-green CVD redundant coding, alarm color dilution, Endsley SA L2/L3
+ * process context, danger button proximity, and screen density).
  */
 export function auditHmiScreenDesign(
   screen: HmiScreen,
-  _tags: Record<string, TagDefinition> = {},
-  options: { targetHardware?: HaiwellTargetHardware } = {}
+  tags: Record<string, TagDefinition> = {},
+  options: HmiVisualAuditOptions = {}
 ): HmiVisualAuditResult {
   const theme = resolveScreenTheme(screen);
+  const industryDomain = options.industryDomain ?? inferHmiIndustryDomain(screen, tags);
+  const screenLevel = options.screenLevel ?? screen.screenLevel;
   const issues: VisualAuditIssue[] = [];
   const isTouchPanel = Boolean(options.targetHardware?.startsWith('CLOUD_HMI_'));
 
@@ -825,6 +934,7 @@ export function auditHmiScreenDesign(
           issues.push({
             code: 'HMI-VIS-PANEL-HEADER-OVERLAP',
             severity: 'ERROR',
+            evidenceBasis: 'EMPIRICAL_FACT',
             widgetId: w.id,
             widgetType: w.type,
             message: `Widget "${w.id}" (y=${w.y}) overlaps the top ${hdrH}px title bar of GROUP_PANEL "${panel.id}" (header ends at y=${panel.y + hdrH}).`,
@@ -840,6 +950,7 @@ export function auditHmiScreenDesign(
       issues.push({
         code: 'HMI-VIS-TOUCH-TARGET',
         severity: isTouchPanel ? 'ERROR' : 'WARNING',
+        evidenceBasis: 'EMPIRICAL_FACT',
         widgetId: w.id,
         widgetType: w.type,
         message: `Interactive widget "${w.id}" is ${w.width}x${w.height}px (< 44x44px minimum touch target).`,
@@ -896,6 +1007,7 @@ export function auditHmiScreenDesign(
         issues.push({
           code: 'HMI-VIS-SUBELEMENT-OVERFLOW',
           severity: 'ERROR',
+          evidenceBasis: 'EMPIRICAL_FACT',
           widgetId: w.id,
           widgetType: w.type,
           message: `BIT_LAMP "${w.id}" caption overflows bottom edge of widget.`,
@@ -924,6 +1036,7 @@ export function auditHmiScreenDesign(
         issues.push({
           code: 'HMI-VIS-SUBELEMENT-OVERFLOW',
           severity: 'ERROR',
+          evidenceBasis: 'EMPIRICAL_FACT',
           widgetId: w.id,
           widgetType: w.type,
           message: `BIT_BUTTON "${w.id}" caption overflows bottom edge of widget.`,
@@ -1019,6 +1132,7 @@ export function auditHmiScreenDesign(
         issues.push({
           code: 'HMI-VIS-SUBELEMENT-OVERFLOW',
           severity: 'WARNING',
+          evidenceBasis: 'EMPIRICAL_FACT',
           widgetId: w.id,
           widgetType: w.type,
           message: `${w.type} "${w.id}" is ${w.width}x${w.height}px, too compact for readable headers/axes.`,
@@ -1059,8 +1173,153 @@ export function auditHmiScreenDesign(
     }
   }
 
+  // 4. Evidence-tagged S&P 500 Factory Human-Factors & Domain-Aware Audits (WARNING-tier guidance)
+  const nonPanels = screen.widgets.filter((w) => w.type !== 'GROUP_PANEL');
+
+  // 4a. [EMPIRICAL_FACT] Redundant coding for ~8% male red-green CVD (never color-only state)
+  for (const w of nonPanels) {
+    if (
+      w.type === 'BIT_LAMP' ||
+      w.type === 'BIT_BUTTON' ||
+      w.type === 'MULTI_STATE_INDICATOR' ||
+      w.type === 'ALARM_BANNER'
+    ) {
+      const trimmed = (w.label ?? '').trim();
+      if (!trimmed || COLOR_ONLY_LABEL_RE.test(trimmed)) {
+        issues.push({
+          code: 'HMI-HF-COLOR-ONLY-CODING',
+          severity: 'WARNING',
+          evidenceBasis: 'EMPIRICAL_FACT',
+          widgetId: w.id,
+          widgetType: w.type,
+          message: `${w.type} "${w.id}" label "${w.label}" relies on color/position alone without descriptive state text (~8% of male operators have red-green color-vision deficiency).`,
+          remediation: `Give "${w.id}" an explicit operational label (e.g., "PUMP 1 RUN", "E-STOP TRIP", "HIGH TEMP") so color is never the sole status indicator.`,
+        });
+      }
+    }
+  }
+
+  // 4b. [EMPIRICAL_FACT] Alarm color dilution — saturated red/amber backgrounds on non-alarm widgets
+  const decorativeAlarmWidgets = nonPanels.filter((w) => {
+    if (w.type === 'ALARM_BANNER') return false;
+    if (w.visualRole === 'DANGER_ACTION' || w.visualRole === 'WARNING_ACTION') return false;
+    const explicitBg = normalizeHexColor(
+      typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined
+    );
+    return isSaturatedAlarmHue(explicitBg);
+  });
+  if (decorativeAlarmWidgets.length >= 2) {
+    issues.push({
+      code: 'HMI-HF-ALARM-COLOR-DILUTION',
+      severity: 'WARNING',
+      evidenceBasis: 'EMPIRICAL_FACT',
+      widgetId: decorativeAlarmWidgets[0].id,
+      widgetType: decorativeAlarmWidgets[0].type,
+      message: `${decorativeAlarmWidgets.length} non-alarm widgets (${decorativeAlarmWidgets.slice(0, 3).map((w) => w.id).join(', ')}) use saturated red/amber backgrounds, diluting visual pop-out for real alarms.`,
+      measured: { saturatedNonAlarmCount: decorativeAlarmWidgets.length },
+      remediation: `Reserve saturated red/amber backgrounds for ALARM_BANNER and DANGER_ACTION/WARNING_ACTION controls; use neutral theme surfaces for normal telemetry.`,
+    });
+  }
+
+  // 4c. [EMPIRICAL_FACT] Endsley SA L2/L3 process context (domain-aware: skipped on DISCRETE_MANUFACTURING counters!)
+  if (industryDomain === 'PROCESS_CONTINUOUS' || industryDomain === 'HYBRID_BATCH_CPG') {
+    const analogNumerics: HmiWidget[] = [];
+    for (const w of nonPanels) {
+      if (w.type !== 'NUMERIC_DISPLAY' && w.type !== 'NUMERIC_INPUT') continue;
+      const tag = w.tagName ? tags[w.tagName] : undefined;
+      if (!isAnalogProcessWidget(w, tag)) continue;
+      analogNumerics.push(w);
+
+      const hasUnit = Boolean((w.unit ?? tag?.unit ?? '').trim());
+      const hasBounds =
+        w.min !== undefined ||
+        w.max !== undefined ||
+        tag?.safeMin !== undefined ||
+        tag?.safeMax !== undefined ||
+        tag?.scaling?.engMin !== undefined ||
+        tag?.scaling?.engMax !== undefined;
+
+      if (!hasUnit && !hasBounds) {
+        issues.push({
+          code: 'HMI-HF-MISSING-PROCESS-CONTEXT',
+          severity: 'WARNING',
+          evidenceBasis: 'EMPIRICAL_FACT',
+          widgetId: w.id,
+          widgetType: w.type,
+          message: `Analog ${w.type} "${w.id}" (${w.label}) lacks both engineering unit and operating bounds (min/max), limiting operators to Level 1 perception without Level 2/3 range context.`,
+          remediation: `Set unit (e.g., "°C", "bar") and min/max (or tag safeMin/safeMax) on "${w.id}".`,
+        });
+      }
+    }
+
+    const hasContextualVisualizer = nonPanels.some(
+      (w) => w.type === 'TREND_CHART' || w.type === 'GAUGE' || w.type === 'BAR_GRAPH' || w.type === 'TANK'
+    );
+    if (industryDomain === 'PROCESS_CONTINUOUS' && analogNumerics.length >= 4 && !hasContextualVisualizer) {
+      issues.push({
+        code: 'HMI-HF-MISSING-PROCESS-CONTEXT',
+        severity: 'WARNING',
+        evidenceBasis: 'EMPIRICAL_FACT',
+        widgetId: analogNumerics[0].id,
+        widgetType: analogNumerics[0].type,
+        message: `Continuous process screen "${screen.name}" displays ${analogNumerics.length} bare analog numeric readouts with zero TREND_CHART/GAUGE/BAR_GRAPH context (ASM/NOVA Chemicals simulator studies showed contextual displays raised pre-alarm detection from 10% to 48%).`,
+        measured: { bareAnalogNumericCount: analogNumerics.length },
+        remediation: `Add an embedded TREND_CHART, BAR_GRAPH, or GAUGE showing normal operating bands and direction of change alongside key process variables.`,
+      });
+    }
+  }
+
+  // 4d. [INDUSTRY_STANDARD] Spatial separation between destructive DANGER_ACTION buttons and PRIMARY_ACTION / NAV_BAR
+  const dangerButtons = nonPanels.filter(
+    (w) => w.type === 'BIT_BUTTON' && w.writeEnabled && w.visualRole === 'DANGER_ACTION'
+  );
+  const routineControls = nonPanels.filter(
+    (w) =>
+      (w.type === 'BIT_BUTTON' && w.visualRole === 'PRIMARY_ACTION') ||
+      w.type === 'NAV_BAR'
+  );
+  for (const danger of dangerButtons) {
+    for (const routine of routineControls) {
+      if (danger.id === routine.id) continue;
+      const dist = Math.round(rectEdgeDistance(danger, routine));
+      if (dist < 12) {
+        issues.push({
+          code: 'HMI-HF-DANGER-PROXIMITY',
+          severity: 'WARNING',
+          evidenceBasis: 'INDUSTRY_STANDARD',
+          widgetId: danger.id,
+          widgetType: danger.type,
+          message: `Destructive button "${danger.id}" (${danger.label}) is only ${dist}px from routine control "${routine.id}" (${routine.label}), risking accidental touch activation (< 12px separation).`,
+          measured: { gapPx: dist, minRecommendedPx: 12 },
+          remediation: `Separate "${danger.id}" from "${routine.id}" by at least 12px (or place stop/abort controls in a dedicated guarded zone).`,
+        });
+      }
+    }
+  }
+
+  // 4e. [EMPIRICAL_FACT] Visual density / clutter overload
+  const coverage = Number(computeNonPanelCanvasCoverage(screen, nonPanels).toFixed(2));
+  const isCompactPanel = screen.width * screen.height <= 800 * 480;
+  if (coverage > 0.65 || (isCompactPanel && nonPanels.length > 30)) {
+    issues.push({
+      code: 'HMI-HF-DENSITY-OVERLOAD',
+      severity: 'WARNING',
+      evidenceBasis: 'EMPIRICAL_FACT',
+      widgetId: nonPanels[0]?.id ?? screen.id,
+      widgetType: nonPanels[0]?.type ?? 'GROUP_PANEL',
+      message: `Screen "${screen.name}" has high visual clutter (${Math.round(coverage * 100)}% canvas coverage, ${nonPanels.length} non-panel widgets), degrading operator visual search speed.`,
+      measured: { coverageRatio: coverage, widgetCount: nonPanels.length },
+      remediation: `Split secondary diagnostics into a Level 3 detail/faceplate screen to keep operator canvas coverage <= 65% and uncluttered.`,
+    });
+  }
+
   const blockingCount = issues.filter((i) => i.severity === 'ERROR').length;
   const warningCount = issues.filter((i) => i.severity === 'WARNING').length;
+  const evidenceSummary = {
+    empiricalFact: issues.filter((i) => i.evidenceBasis === 'EMPIRICAL_FACT').length,
+    industryStandard: issues.filter((i) => i.evidenceBasis === 'INDUSTRY_STANDARD').length,
+    practitionerOpinion: issues.filter((i) => i.evidenceBasis === 'PRACTITIONER_OPINION').length,
+  };
 
   return {
     screenId: screen.id,
@@ -1069,6 +1328,9 @@ export function auditHmiScreenDesign(
     blockingCount,
     warningCount,
     themeId: theme.id,
+    industryDomain,
+    ...(screenLevel ? { screenLevel } : {}),
+    evidenceSummary,
     issues,
   };
 }
@@ -1091,7 +1353,7 @@ export interface HmiVisualAutoFixResult {
 export function autoFixHmiScreenDesign(
   screen: HmiScreen,
   tags: Record<string, TagDefinition> = {},
-  options: { targetHardware?: HaiwellTargetHardware } = {}
+  options: HmiVisualAuditOptions = {}
 ): HmiVisualAutoFixResult {
   const auditBefore = auditHmiScreenDesign(screen, tags, options);
   const theme = resolveScreenTheme(screen);

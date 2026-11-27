@@ -6,6 +6,7 @@
 
 import path from 'node:path';
 import { HAIWELL_REGISTER_MAP } from './haiwellRegisters';
+import { renderHmiEngineeringPlaybookMarkdown } from './hmiDomainKnowledge';
 import { renderScreenToSvg } from './hmiGenerator';
 import { generateOpcUaNodeSet2Xml } from './protocolAdapters';
 import { buildProjectExportBundle, HAIWELL_TOOLS, runProjectSafetyAudit } from './toolRegistry';
@@ -86,7 +87,7 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
       'haiwell_desktop_new_project',
       'haiwell_desktop_deploy_hwexport',
     ],
-    standards: ['ANSI/ISA-101.01', 'ISA-5.1 P&ID', 'WCAG 2.1 Contrast'],
+    standards: ['ANSI/ISA-101.01', 'ISA-TR88.00.02 (PackML)', 'EEMUA 201', 'ISA-5.1 P&ID', 'WCAG 2.1 Contrast'],
   },
   {
     id: 'scripts',
@@ -234,6 +235,12 @@ export const HAIWELL_RESOURCES = [
     description: 'Live pre-deployment safety, interlock, IEC 61131-3, HMI, MQTT, and OPC UA audit findings.',
   },
   {
+    uri: 'haiwell://knowledge/hmi-engineering-playbook',
+    name: 'S&P 500 Factory HMI Engineering Playbook (Facts vs. Standards vs. Opinions)',
+    mimeType: 'text/markdown',
+    description: 'Evidence-tiered industrial HMI engineering know-how (ExxonMobil/Chevron/Dow continuous process, P&G hybrid PackML, Ford/GM discrete cells; Endsley, Bullemer/Reising/Errington ASM studies, Hollifield, Nimmo, Vicente) explicitly separating empirical facts from standards and dogma.',
+  },
+  {
     uri: 'haiwell://skills/agent-skill-md',
     name: 'Agent SKILL.md Playbook',
     mimeType: 'text/markdown',
@@ -290,6 +297,9 @@ export function readHaiwellResource(uri: string, store: HaiwellProjectStore): { 
         2
       ),
     };
+  }
+  if (uri === 'haiwell://knowledge/hmi-engineering-playbook') {
+    return { mimeType: 'text/markdown', text: renderHmiEngineeringPlaybookMarkdown() };
   }
   if (uri === 'haiwell://skills/agent-skill-md') {
     return { mimeType: 'text/markdown', text: generateAgentSkillMarkdown('http://localhost:3000/mcp') };
@@ -376,10 +386,11 @@ export const HAIWELL_PROMPTS = [
   },
   {
     name: 'design_and_audit_hmi_screens',
-    description: 'Audit all HMI screens in a project for invisible text, low contrast, text overflow, panel-header overlap, and spatial collisions, auto-fixing defects before SVG review and .hwExport compilation.',
+    description: 'Audit all HMI screens in a project for invisible text, low contrast, text overflow, panel-header overlap, spatial collisions, and domain-aware S&P 500 human-factors criteria (red-green CVD coding, alarm color dilution, Endsley SA L2/L3 context, danger button spacing), auto-fixing visual defects before SVG review and .hwExport compilation.',
     arguments: [
       { name: 'projectId', description: 'Haiwell project ID', required: true },
       { name: 'themeId', description: 'ISA_101_LIGHT | CONTROL_ROOM_DARK | HIGH_CONTRAST_TOUCH', required: false },
+      { name: 'industryDomain', description: 'PROCESS_CONTINUOUS | DISCRETE_MANUFACTURING | HYBRID_BATCH_CPG', required: false },
     ],
   },
   {
@@ -441,7 +452,7 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
           role: 'user' as const,
           content: {
             type: 'text' as const,
-            text: `Query tags in "${pid}" via haiwell_tag_query, inspect components via haiwell_hmi_toolbox_catalog, then build a collision-free HMI screen "${args.screenTitle ?? 'Process Overview'}" via haiwell_hmi_template_instantiate, haiwell_hmi_pid_compile (for P&ID flows), or haiwell_hmi_screen_generate. Run haiwell_hmi_design_audit (autoFix=true) to verify WCAG contrast, text fit, and panel-header clearance, confirm 0 collisions/port gaps with haiwell_hmi_spatial_verify (repair if needed via haiwell_hmi_layout_solve), inspect clean SVG via haiwell_hmi_screen_render_svg, and export via haiwell_project_export_hwexport or haiwell_desktop_deploy_hwexport.`,
+            text: `Read haiwell://knowledge/hmi-engineering-playbook to choose the right factory archetype (PROCESS_CONTINUOUS vs. DISCRETE_MANUFACTURING vs. HYBRID_BATCH_CPG) and avoid applying refinery grayscale dogma to discrete machinery. Query tags in "${pid}" via haiwell_tag_query, inspect components via haiwell_hmi_toolbox_catalog, then build a collision-free HMI screen "${args.screenTitle ?? 'Process Overview'}" via haiwell_hmi_template_instantiate, haiwell_hmi_pid_compile (for P&ID flows), or haiwell_hmi_screen_generate. Run haiwell_hmi_design_audit (autoFix=true, with industryDomain) to verify WCAG contrast, text fit, panel-header clearance, CVD redundant coding, alarm-color restraint, and process context, confirm 0 collisions/port gaps with haiwell_hmi_spatial_verify (repair if needed via haiwell_hmi_layout_solve), inspect clean SVG via haiwell_hmi_screen_render_svg, and export via haiwell_project_export_hwexport or haiwell_desktop_deploy_hwexport.`,
           },
         },
       ];
@@ -451,11 +462,12 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
           role: 'user' as const,
           content: {
             type: 'text' as const,
-            text: `Inspect screens in "${pid}" (preferred theme: ${args.themeId ?? 'ISA_101_LIGHT'}). Execute strictly in order:
-1. Run haiwell_hmi_design_audit with autoFix=true across the project to repair invisible text, low WCAG contrast, text overflow, and panel-header overlaps.
-2. Run haiwell_hmi_spatial_verify on each screen; if collisions or out-of-bounds widgets remain, run haiwell_hmi_layout_solve and re-verify.
-3. Render clean previews via haiwell_hmi_screen_render_svg (showDebugOverlay=false) to confirm visual clarity.
-4. Run haiwell_project_audit_safety to verify deploymentReady=true before haiwell_project_export_hwexport or haiwell_desktop_deploy_hwexport.`,
+            text: `Inspect screens in "${pid}" (preferred theme: ${args.themeId ?? 'ISA_101_LIGHT'}, industryDomain: ${args.industryDomain ?? 'PROCESS_CONTINUOUS'}). Execute strictly in order:
+1. Consult haiwell://knowledge/hmi-engineering-playbook to match screen density, color restraint, and process context to ${args.industryDomain ?? 'PROCESS_CONTINUOUS'}.
+2. Run haiwell_hmi_design_audit with autoFix=true and industryDomain="${args.industryDomain ?? 'PROCESS_CONTINUOUS'}" across the project to repair invisible text, low WCAG contrast, text overflow, and panel-header overlaps, and review any evidence-tagged HMI-HF-* human-factors warnings.
+3. Run haiwell_hmi_spatial_verify on each screen; if collisions or out-of-bounds widgets remain, run haiwell_hmi_layout_solve and re-verify.
+4. Render clean previews via haiwell_hmi_screen_render_svg (showDebugOverlay=false) to confirm visual clarity.
+5. Run haiwell_project_audit_safety to verify deploymentReady=true before haiwell_project_export_hwexport or haiwell_desktop_deploy_hwexport.`,
           },
         },
       ];
@@ -511,7 +523,7 @@ transports: [streamable-http, stdio]
 2. **Validate multi-vendor PLC addresses**: call \`haiwell_device_validate_address\` with the device protocol and \`addressOffset\` (Haiwell, Modbus, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, BACnet) before creating tags. Never overlap 32-bit/64-bit multi-word register spans.
 3. **Dry-run control writes & recipes**: invoke \`haiwell_tag_read_write\` or \`haiwell_tag_batch_io\` with \`dryRun: true\` before committing live writes; use \`action: "DOWNLOAD_RECIPE"\` in \`haiwell_recipe_transfer\` with \`dryRun: true\` first.
 4. **Gate PLC logic & Haiwell JS on validation**: resolve all \`ERROR\` diagnostics from \`haiwell_iec61131_validate\` before \`haiwell_iec61131_pou_save\`, and author Strict-ES5 Haiwell JS using native \`Variable.GetByFullName\` / \`Variable.SetByFullName\` validated by \`haiwell_script_validate\`.
-5. **Design & verify HMI readability spatially**: prefer \`haiwell_hmi_template_instantiate\`, \`haiwell_hmi_pid_compile\`, or \`haiwell_hmi_screen_generate\` (with theme presets \`ISA_101_LIGHT\`, \`CONTROL_ROOM_DARK\`, or \`HIGH_CONTRAST_TOUCH\`), run \`haiwell_hmi_design_audit\` (\`autoFix: true\`) to guarantee WCAG contrast, text fit, and panel-header clearance, verify 0 collisions/port gaps via \`haiwell_hmi_spatial_verify\` (repairing with \`haiwell_hmi_layout_solve\` if needed), inspect clean previews via \`haiwell_hmi_screen_render_svg\`, and deploy via \`haiwell_desktop_deploy_hwexport\` or \`haiwell_project_export_hwexport\`.
+5. **Design & verify HMI readability + human factors spatially**: consult MCP resource \`haiwell://knowledge/hmi-engineering-playbook\` to select the right factory archetype (\`PROCESS_CONTINUOUS\`, \`DISCRETE_MANUFACTURING\`, or \`HYBRID_BATCH_CPG\`) and lighting-matched theme (\`ISA_101_LIGHT\`, \`CONTROL_ROOM_DARK\`, \`HIGH_CONTRAST_TOUCH\`). Build screens via \`haiwell_hmi_template_instantiate\`, \`haiwell_hmi_pid_compile\`, or \`haiwell_hmi_screen_generate\`, then run \`haiwell_hmi_design_audit\` (\`autoFix: true\`, with \`industryDomain\`) to fix WCAG contrast/overflow/header overlaps and enforce evidence-backed human factors (redundant coding for ~8% male red-green CVD, alarm color restraint, Endsley SA L2/L3 process context on analog loops without forcing trends onto discrete counters, >= 12px destructive button separation). Verify 0 collisions/port gaps via \`haiwell_hmi_spatial_verify\`, inspect clean previews via \`haiwell_hmi_screen_render_svg\`, and deploy via \`haiwell_desktop_deploy_hwexport\` or \`haiwell_project_export_hwexport\`.
 6. **Run FAT simulation + safety audit**: run \`haiwell_simulation_step\` (E-Stop trip test & alarm delay verification) and \`haiwell_project_audit_safety\` (\`deploymentReady: true\`) before \`haiwell_project_export\` or \`haiwell_project_export_hwexport\`.
 
 ## Complete Tool Index (${HAIWELL_TOOLS.length} Tools across 15 Domains)
