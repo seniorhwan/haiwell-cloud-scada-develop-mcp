@@ -9,6 +9,7 @@ import { HAIWELL_REGISTER_MAP } from './haiwellRegisters';
 import { renderScreenToSvg } from './hmiGenerator';
 import { generateOpcUaNodeSet2Xml } from './protocolAdapters';
 import { buildProjectExportBundle, HAIWELL_TOOLS, runProjectSafetyAudit } from './toolRegistry';
+import { SERVER_VERSION } from './version';
 import type { HaiwellProjectStore } from './projectStore';
 
 export interface CapabilityDomainSummary {
@@ -24,7 +25,7 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
     id: 'project',
     title: 'Project Lifecycle, Snapshots, Safe Delete & Audit',
     haiwellModules: ['New Project Wizard (PC/C7/C10/B7/B10/A8/CBOX/IPC)', 'Project Tree', 'Atomic Snapshots & Rollback', 'Referential-Integrity Delete', 'Pre-Deploy Audit', 'Full Bundle Export'],
-    tools: ['haiwell_project_create', 'haiwell_project_inspect', 'haiwell_project_snapshot_rollback', 'haiwell_entity_delete', 'haiwell_project_audit_safety', 'haiwell_project_export'],
+    tools: ['haiwell_project_create', 'haiwell_project_inspect', 'haiwell_project_import_hwrun', 'haiwell_project_snapshot_rollback', 'haiwell_entity_delete', 'haiwell_project_audit_safety', 'haiwell_project_export', 'haiwell_project_export_hwexport'],
     standards: ['ISA-95', 'IEC 62443'],
   },
   {
@@ -57,19 +58,23 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
       '2D Collision-Free Auto-Layout (Zero Silent Drops)',
       'Deterministic 8px-Grid & Collision Auto-Repair Solver',
       'Closed-Loop Spatial Proof & 2D ASCII Occupancy Map',
+      'Visual Readability, WCAG Contrast & Text-Fit Auto-Fixer',
+      'Zero-Pixel-Math ISA-101 Screen Templates & Theme Presets',
       'Reusable Parameterized Faceplates',
       'Font Manager (Embedded Panel Fonts & CJK Packaging)',
       'Shape Library (Custom Vector/SVG Equipment Graphics)',
-      'Calibrated Haiwell Cloud Scada 3.50.x (.hwdev) WinForms UIA Bridge',
+      'Headless .hwExport Compiler & Direct .hwdev Deployer',
     ],
     tools: [
       'haiwell_hmi_toolbox_catalog',
+      'haiwell_hmi_template_instantiate',
       'haiwell_hmi_screen_generate',
       'haiwell_hmi_pid_compile',
       'haiwell_hmi_widget_upsert',
       'haiwell_hmi_layout_solve',
       'haiwell_hmi_faceplate_manage',
       'haiwell_hmi_spatial_verify',
+      'haiwell_hmi_design_audit',
       'haiwell_hmi_screen_render_svg',
       'haiwell_font_manager',
       'haiwell_shape_library_manage',
@@ -79,8 +84,9 @@ export const HAIWELL_CAPABILITY_MATRIX: CapabilityDomainSummary[] = [
       'haiwell_desktop_inspect',
       'haiwell_desktop_launch',
       'haiwell_desktop_new_project',
+      'haiwell_desktop_deploy_hwexport',
     ],
-    standards: ['ANSI/ISA-101.01', 'ISA-5.1 P&ID'],
+    standards: ['ANSI/ISA-101.01', 'ISA-5.1 P&ID', 'WCAG 2.1 Contrast'],
   },
   {
     id: 'scripts',
@@ -362,10 +368,18 @@ export const HAIWELL_PROMPTS = [
   },
   {
     name: 'generate_isa101_hmi_screen',
-    description: 'Auto-layout a collision-free ISA-101 HMI screen with touch-target verification, optional faceplate expansion, and SVG blueprint verification.',
+    description: 'Build a collision-free, readable ISA-101 HMI screen with visual readability audit/autoFix, touch-target verification, optional faceplate expansion, and faithful SVG preview.',
     arguments: [
       { name: 'projectId', description: 'Haiwell project ID', required: true },
       { name: 'screenTitle', description: 'Operator screen title', required: true },
+    ],
+  },
+  {
+    name: 'design_and_audit_hmi_screens',
+    description: 'Audit all HMI screens in a project for invisible text, low contrast, text overflow, panel-header overlap, and spatial collisions, auto-fixing defects before SVG review and .hwExport compilation.',
+    arguments: [
+      { name: 'projectId', description: 'Haiwell project ID', required: true },
+      { name: 'themeId', description: 'ISA_101_LIGHT | CONTROL_ROOM_DARK | HIGH_CONTRAST_TOUCH', required: false },
     ],
   },
   {
@@ -383,7 +397,7 @@ export const HAIWELL_PROMPTS = [
   },
   {
     name: 'pre_commissioning_safety_audit',
-    description: 'Run FAT simulation + full safety audit across multi-word register overlaps, SIL2/SIL3 interlocks, IEC 61131-3 POUs, HMI bounds/touch targets, JS scripts, A/B Key, MQTT TLS, and OPC UA encryption.',
+    description: 'Run FAT simulation + full safety & HMI visual readability audit across multi-word register overlaps, SIL2/SIL3 interlocks, IEC 61131-3 POUs, HMI bounds/contrast/touch targets, JS scripts, A/B Key, MQTT TLS, and OPC UA encryption.',
     arguments: [{ name: 'projectId', description: 'Haiwell project ID', required: true }],
   },
 ] as const;
@@ -402,12 +416,12 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
 2. haiwell_device_add + haiwell_device_validate_address for all registers
 3. haiwell_tag_upsert_batch with explicit scaling, safeMin/safeMax, and SIL safetyClass (zero multi-word overlap)
 4. haiwell_iec61131_validate -> haiwell_iec61131_pou_save (zero errors required)
-5. haiwell_hmi_pid_compile (for P&ID topologies) or haiwell_hmi_screen_generate (ISA_101_HIGH_PERFORMANCE), then haiwell_hmi_spatial_verify (confirm 0px collisions/port gaps) and optionally haiwell_hmi_desktop_bridge_export
+5. haiwell_hmi_template_instantiate / haiwell_hmi_pid_compile / haiwell_hmi_screen_generate, then haiwell_hmi_design_audit (autoFix=true) and haiwell_hmi_spatial_verify (confirm 0px collisions/port gaps and zero invisible text), and preview via haiwell_hmi_screen_render_svg
 6. haiwell_alarm_configure (ISA-18.2 priorities + multi-channel push)
 7. haiwell_mqtt_configure + haiwell_mqtt_topic_bind (Sparkplug B + TLS)
 8. haiwell_opcua_configure + haiwell_opcua_nodeset_map (Basic256Sha256 + SignAndEncrypt)
 9. haiwell_simulation_step (test E-Stop trip & high-temp alarm)
-10. haiwell_project_audit_safety -> confirm deploymentReady=true before haiwell_project_export.`,
+10. haiwell_project_audit_safety -> confirm deploymentReady=true before haiwell_project_export_hwexport or haiwell_project_export.`,
           },
         },
       ];
@@ -427,7 +441,21 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
           role: 'user' as const,
           content: {
             type: 'text' as const,
-            text: `Query tags in "${pid}" via haiwell_tag_query, inspect components via haiwell_hmi_toolbox_catalog, then compile a zero-collision HMI screen "${args.screenTitle ?? 'Process Overview'}" via haiwell_hmi_pid_compile (for process P&ID flows) or haiwell_hmi_screen_generate. Verify with haiwell_hmi_spatial_verify (0 collisions, 0 out-of-bounds, 0 touchTargetViolations, maxPipePortGapPx<=1), repair if needed via haiwell_hmi_layout_solve, render SVG via haiwell_hmi_screen_render_svg, and export native/UIA build artifacts via haiwell_hmi_desktop_bridge_export.`,
+            text: `Query tags in "${pid}" via haiwell_tag_query, inspect components via haiwell_hmi_toolbox_catalog, then build a collision-free HMI screen "${args.screenTitle ?? 'Process Overview'}" via haiwell_hmi_template_instantiate, haiwell_hmi_pid_compile (for P&ID flows), or haiwell_hmi_screen_generate. Run haiwell_hmi_design_audit (autoFix=true) to verify WCAG contrast, text fit, and panel-header clearance, confirm 0 collisions/port gaps with haiwell_hmi_spatial_verify (repair if needed via haiwell_hmi_layout_solve), inspect clean SVG via haiwell_hmi_screen_render_svg, and export via haiwell_project_export_hwexport or haiwell_desktop_deploy_hwexport.`,
+          },
+        },
+      ];
+    case 'design_and_audit_hmi_screens':
+      return [
+        {
+          role: 'user' as const,
+          content: {
+            type: 'text' as const,
+            text: `Inspect screens in "${pid}" (preferred theme: ${args.themeId ?? 'ISA_101_LIGHT'}). Execute strictly in order:
+1. Run haiwell_hmi_design_audit with autoFix=true across the project to repair invisible text, low WCAG contrast, text overflow, and panel-header overlaps.
+2. Run haiwell_hmi_spatial_verify on each screen; if collisions or out-of-bounds widgets remain, run haiwell_hmi_layout_solve and re-verify.
+3. Render clean previews via haiwell_hmi_screen_render_svg (showDebugOverlay=false) to confirm visual clarity.
+4. Run haiwell_project_audit_safety to verify deploymentReady=true before haiwell_project_export_hwexport or haiwell_desktop_deploy_hwexport.`,
           },
         },
       ];
@@ -470,21 +498,21 @@ export function buildPromptMessages(name: string, args: Record<string, string | 
 export function generateAgentSkillMarkdown(mcpEndpointUrl: string): string {
   return `---
 name: haiwell-cloud-scada-develop
-version: 2.8.0
-description: Zero-UI, production-grade headless MCP server (v2.8.0) for Haiwell Cloud SCADA Develop. Covers 15 industrial automation domains across ${HAIWELL_TOOLS.length} strictly validated tools for VS Code, Google Antigravity, Claude Code, and Codex.
+version: ${SERVER_VERSION}
+description: Headless MCP server (v${SERVER_VERSION}) for Haiwell Cloud SCADA Develop. Covers 15 industrial automation domains across ${HAIWELL_TOOLS.length} strictly validated tools for VS Code, Google Antigravity, Claude Code, and Codex.
 mcp_endpoint: ${mcpEndpointUrl}
 transports: [streamable-http, stdio]
 ---
 
-# Haiwell Cloud SCADA Develop — Headless MCP Agent Skill (v2.8.0)
+# Haiwell Cloud SCADA Develop — Headless MCP Agent Skill (v${SERVER_VERSION})
 
 ## Mandatory Safety & Reliability Protocol
 1. **Snapshot before bulk edits**: call \`haiwell_project_snapshot_rollback\` (\`CREATE\`) before mutating tags, logic, or screens; roll back immediately if audit fails.
 2. **Validate multi-vendor PLC addresses**: call \`haiwell_device_validate_address\` with the device protocol and \`addressOffset\` (Haiwell, Modbus, Siemens S7, Mitsubishi MC, Omron FINS, Allen-Bradley EIP, BACnet) before creating tags. Never overlap 32-bit/64-bit multi-word register spans.
 3. **Dry-run control writes & recipes**: invoke \`haiwell_tag_read_write\` or \`haiwell_tag_batch_io\` with \`dryRun: true\` before committing live writes; use \`action: "DOWNLOAD_RECIPE"\` in \`haiwell_recipe_transfer\` with \`dryRun: true\` first.
 4. **Gate PLC logic & Haiwell JS on validation**: resolve all \`ERROR\` diagnostics from \`haiwell_iec61131_validate\` before \`haiwell_iec61131_pou_save\`, and author Strict-ES5 Haiwell JS using native \`Variable.GetByFullName\` / \`Variable.SetByFullName\` validated by \`haiwell_script_validate\`.
-5. **Compile HMI spatially (never blind drag-and-drop)**: use \`haiwell_hmi_pid_compile\` / \`haiwell_hmi_screen_generate\`, verify with \`haiwell_hmi_spatial_verify\` (0 collisions, 0 port gaps, 0 pipe-widget crossings), auto-repair with \`haiwell_hmi_layout_solve\`, calibrate live WinForms selectors once via \`haiwell_desktop_uia_calibrate\`, and export native \`haiwell_variables_import.csv\` + \`haiwell_internal_variables.csv\` via \`haiwell_project_export\` and calibrated UIA plans with \`haiwell_hmi_desktop_bridge_export\` / \`haiwell_open_project_bridge_export\`.
-6. **Run FAT simulation + safety audit**: run \`haiwell_simulation_step\` (E-Stop trip test & alarm delay verification) and \`haiwell_project_audit_safety\` (\`deploymentReady: true\`) before \`haiwell_project_export\`.
+5. **Design & verify HMI readability spatially**: prefer \`haiwell_hmi_template_instantiate\`, \`haiwell_hmi_pid_compile\`, or \`haiwell_hmi_screen_generate\` (with theme presets \`ISA_101_LIGHT\`, \`CONTROL_ROOM_DARK\`, or \`HIGH_CONTRAST_TOUCH\`), run \`haiwell_hmi_design_audit\` (\`autoFix: true\`) to guarantee WCAG contrast, text fit, and panel-header clearance, verify 0 collisions/port gaps via \`haiwell_hmi_spatial_verify\` (repairing with \`haiwell_hmi_layout_solve\` if needed), inspect clean previews via \`haiwell_hmi_screen_render_svg\`, and deploy via \`haiwell_desktop_deploy_hwexport\` or \`haiwell_project_export_hwexport\`.
+6. **Run FAT simulation + safety audit**: run \`haiwell_simulation_step\` (E-Stop trip test & alarm delay verification) and \`haiwell_project_audit_safety\` (\`deploymentReady: true\`) before \`haiwell_project_export\` or \`haiwell_project_export_hwexport\`.
 
 ## Complete Tool Index (${HAIWELL_TOOLS.length} Tools across 15 Domains)
 ${HAIWELL_CAPABILITY_MATRIX.map(

@@ -17,6 +17,7 @@
  *    with UIA read-back assertions (never pixel-dragging to exact coordinates!).
  */
 
+import { getGroupPanelHeaderHeight } from './hmiDesignSystem';
 import { detectWidgetCollisions, renderScreenToSvg, validateHmiScreen } from './hmiGenerator';
 import type {
   HaiwellProject,
@@ -1460,7 +1461,10 @@ export function solveAndRepairScreenLayout(
 ): LayoutRepairResult {
   const screen: HmiScreen = {
     ...inputScreen,
-    widgets: inputScreen.widgets.map((w) => ({ ...w })),
+    widgets: inputScreen.widgets.map((w) => ({
+      ...w,
+      ...(w.props ? { props: { ...w.props } } : {}),
+    })),
     pipes: inputScreen.pipes ? inputScreen.pipes.map((p) => ({ ...p, waypoints: p.waypoints.map((pt) => ({ ...pt })) })) : undefined,
   };
 
@@ -1483,14 +1487,63 @@ export function solveAndRepairScreenLayout(
     return Math.round(clamped);
   };
 
-  const alarmBanner = screen.widgets.find((w) => w.type === 'ALARM_BANNER');
-  const navBar = screen.widgets.find((w) => w.type === 'NAV_BAR');
+  const panels = screen.widgets.filter((w) => w.type === 'GROUP_PANEL');
+  const panelById = new Map<string, HmiWidget>(panels.map((p) => [p.id, p]));
+
+  // Map every non-panel widget to its smallest enclosing GROUP_PANEL (if any) BEFORE moving widgets
+  const parentPanelOf = new Map<string, HmiWidget>();
+  for (const w of screen.widgets) {
+    if (w.type === 'GROUP_PANEL') continue;
+    if (w.parentGroupId && panelById.has(w.parentGroupId)) {
+      parentPanelOf.set(w.id, panelById.get(w.parentGroupId)!);
+      continue;
+    }
+    const cx = w.x + w.width / 2;
+    const cy = w.y + w.height / 2;
+    let bestPanel: HmiWidget | null = null;
+    let smallestArea = Infinity;
+    for (const p of panels) {
+      if (cx >= p.x && cx <= p.x + p.width && cy >= p.y && cy <= p.y + p.height) {
+        const area = p.width * p.height;
+        if (area < smallestArea) {
+          smallestArea = area;
+          bestPanel = p;
+        }
+      }
+    }
+    if (bestPanel) {
+      parentPanelOf.set(w.id, bestPanel);
+    }
+  }
+
+  // Only anchor ALARM_BANNER at screen top if it is NOT nested inside a GROUP_PANEL
+  const alarmBanner = screen.widgets.find(
+    (w) => w.type === 'ALARM_BANNER' && !parentPanelOf.has(w.id) && w.y <= screen.height * 0.25
+  );
+  // Anchor ALL bottom-row NAV_BAR tabs that are NOT nested inside a GROUP_PANEL
+  const bottomNavs = screen.widgets
+    .filter(
+      (w) =>
+        w.type === 'NAV_BAR' &&
+        !parentPanelOf.has(w.id) &&
+        w.y + w.height >= screen.height * 0.78
+    )
+    .sort((a, b) => a.x - b.x);
+  const bottomNavSet = new Set<HmiWidget>(bottomNavs);
+
   if (alarmBanner) {
+    const origX = alarmBanner.x;
+    const origY = alarmBanner.y;
     alarmBanner.width = Math.min(alarmBanner.width, screen.width - pad * 2);
     alarmBanner.x = clampSnapped(alarmBanner.x, pad, screen.width - pad - alarmBanner.width);
     alarmBanner.y = clampSnapped(alarmBanner.y, pad, screen.height - pad - alarmBanner.height);
+    if (alarmBanner.x !== origX || alarmBanner.y !== origY) movedWidgets.add(alarmBanner.id);
   }
-  if (navBar) {
+
+  if (bottomNavs.length === 1) {
+    const navBar = bottomNavs[0];
+    const origX = navBar.x;
+    const origY = navBar.y;
     if (isTouch && (navBar.height < 48 || navBar.width < 48)) {
       navBar.width = Math.max(navBar.width, 48);
       navBar.height = Math.max(navBar.height, 48);
@@ -1499,28 +1552,197 @@ export function solveAndRepairScreenLayout(
     navBar.width = Math.min(navBar.width, screen.width - pad * 2);
     navBar.x = clampSnapped(navBar.x, pad, screen.width - pad - navBar.width);
     navBar.y = clampSnapped(navBar.y, pad, screen.height - pad - navBar.height);
+    if (navBar.x !== origX || navBar.y !== origY) movedWidgets.add(navBar.id);
+  } else if (bottomNavs.length > 1) {
+    const touchMinH = isTouch ? 44 : 24;
+    const marginX = Math.min(pad, Math.max(4, bottomNavs[0].x));
+    const maxRowW = Math.max(44 * bottomNavs.length, screen.width - marginX * 2);
+    let hasRowOverlap = false;
+    let maxNavH = 0;
+
+    for (const nav of bottomNavs) {
+      if (isTouch && (nav.height < touchMinH || nav.width < 44)) {
+        nav.height = Math.max(nav.height, touchMinH);
+        nav.width = Math.max(nav.width, 44);
+        resizedForTouch.push(nav.id);
+      }
+      maxNavH = Math.max(maxNavH, nav.height);
+    }
+
+    const rowY = Math.max(
+      alarmBanner ? alarmBanner.y + alarmBanner.height + gap : 4,
+      Math.min(bottomNavs[0].y, screen.height - maxNavH - 6)
+    );
+
+    for (let i = 0; i < bottomNavs.length; i++) {
+      const nav = bottomNavs[i];
+      const origX = nav.x;
+      const origY = nav.y;
+      nav.y = Math.max(0, Math.min(rowY, screen.height - nav.height));
+      if (nav.x < 0 || nav.x + nav.width > screen.width) hasRowOverlap = true;
+      if (i > 0 && bottomNavs[i - 1].x + bottomNavs[i - 1].width > nav.x) hasRowOverlap = true;
+      if (nav.x !== origX || nav.y !== origY) movedWidgets.add(nav.id);
+    }
+
+    if (hasRowOverlap) {
+      const tabGap = 6;
+      const tabW = Math.max(44, Math.floor((maxRowW - tabGap * (bottomNavs.length - 1)) / bottomNavs.length));
+      bottomNavs.forEach((nav, idx) => {
+        const origX = nav.x;
+        nav.width = Math.min(tabW, Math.max(24, screen.width - marginX - idx * (tabW + tabGap)));
+        nav.x = Math.max(0, Math.min(marginX + idx * (tabW + tabGap), screen.width - nav.width));
+        if (nav.x !== origX) movedWidgets.add(nav.id);
+      });
+    }
   }
+
   const minY = alarmBanner ? alarmBanner.y + alarmBanner.height + gap : pad;
-  const maxY = navBar ? navBar.y - gap : screen.height - pad;
+  const maxY = bottomNavs.length > 0 ? Math.min(...bottomNavs.map((n) => n.y)) - gap : screen.height - pad;
+  const panelMinY = alarmBanner ? alarmBanner.y + alarmBanner.height + gap : 4;
+  const panelMaxY = bottomNavs.length > 0 ? Math.min(...bottomNavs.map((n) => n.y)) - 4 : screen.height - 4;
 
   const placed: HmiWidget[] = [];
   if (alarmBanner) placed.push(alarmBanner);
-  if (navBar) placed.push(navBar);
+  for (const nav of bottomNavs) placed.push(nav);
 
-  const overlapsAny = (cand: { x: number; y: number; width: number; height: number }): boolean => {
+  const rectsOverlap = (
+    a: { x: number; y: number; width: number; height: number },
+    b: { x: number; y: number; width: number; height: number }
+  ): boolean => {
+    const xOv = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+    const yOv = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+    return xOv > 0 && yOv > 0;
+  };
+
+  const overlapsPlaced = (
+    cand: { x: number; y: number; width: number; height: number },
+    ignorePanels: boolean
+  ): boolean => {
     for (const o of placed) {
-      const xOv = Math.min(cand.x + cand.width, o.x + o.width) - Math.max(cand.x, o.x);
-      const yOv = Math.min(cand.y + cand.height, o.y + o.height) - Math.max(cand.y, o.y);
-      if (xOv > 0 && yOv > 0) return true;
+      if (ignorePanels && o.type === 'GROUP_PANEL') continue;
+      if (rectsOverlap(cand, o)) return true;
     }
     return false;
   };
 
+  // Phase 1: Place GROUP_PANEL containers first and track any panel shift deltas for their children
+  const panelShift = new Map<string, { dx: number; dy: number }>();
+  for (const p of panels) {
+    const origX = p.x;
+    const origY = p.y;
+    const maxW = Math.max(48, screen.width - 8);
+    const maxH = Math.max(32, panelMaxY - panelMinY);
+    p.width = Math.min(p.width, maxW);
+    p.height = Math.min(p.height, maxH);
+    p.x = Math.max(0, Math.min(p.x, screen.width - p.width));
+    p.y = Math.max(panelMinY, Math.min(p.y, Math.max(panelMinY, panelMaxY - p.height)));
+
+    if (overlapsPlaced(p, false)) {
+      let bestX = p.x;
+      let bestY = p.y;
+      let bestDist = Infinity;
+      for (const stepPx of [GRID_STEP * 2, GRID_STEP]) {
+        for (let y = panelMinY; y <= panelMaxY - p.height; y += stepPx) {
+          for (let x = 4; x <= screen.width - 4 - p.width; x += stepPx) {
+            if (!overlapsPlaced({ x, y, width: p.width, height: p.height }, false)) {
+              const dist = Math.hypot(x - origX, y - origY);
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestX = x;
+                bestY = y;
+              }
+            }
+          }
+        }
+        if (bestDist < Infinity) break;
+      }
+      if (bestDist < Infinity) {
+        p.x = bestX;
+        p.y = bestY;
+      }
+    }
+
+    p.x = Math.max(0, Math.min(p.x, screen.width - p.width));
+    p.y = Math.max(0, Math.min(p.y, screen.height - p.height));
+    const dx = p.x - origX;
+    const dy = p.y - origY;
+    if (dx !== 0 || dy !== 0) {
+      movedWidgets.add(p.id);
+      panelShift.set(p.id, { dx, dy });
+    }
+    placed.push(p);
+  }
+
+  // Phase 2: Place all non-panel widgets — children stay inside their enclosing GROUP_PANEL
   for (const w of screen.widgets) {
-    if (w === alarmBanner || w === navBar) continue;
+    if (w.type === 'GROUP_PANEL' || w === alarmBanner || bottomNavSet.has(w)) continue;
     const origX = w.x;
     const origY = w.y;
+    const parent = parentPanelOf.get(w.id);
 
+    if (parent) {
+      const shift = panelShift.get(parent.id);
+      if (shift) {
+        w.x += shift.dx;
+        w.y += shift.dy;
+      }
+      const hdrH = getGroupPanelHeaderHeight(parent);
+      const innerPadX = parent.width >= 80 ? 4 : 2;
+      const innerMinX = parent.x + innerPadX;
+      const innerMaxX = Math.max(innerMinX + 20, parent.x + parent.width - innerPadX);
+      const innerMinY = parent.y + (hdrH > 0 ? hdrH + 4 : 2);
+      const innerMaxY = Math.max(innerMinY + 16, parent.y + parent.height - 2);
+      const availW = Math.max(20, innerMaxX - innerMinX);
+      const availH = Math.max(16, innerMaxY - innerMinY);
+
+      const spec = TOOLBOX_BY_TYPE.get(w.type);
+      if (isTouch && (spec?.interactive || w.writeEnabled)) {
+        const targetTouch = Math.min(48, Math.max(44, Math.min(availW, availH)));
+        if ((w.width < 44 || w.height < 44) && availW >= 44 && availH >= 44) {
+          w.width = Math.max(w.width, Math.min(targetTouch, availW));
+          w.height = Math.max(w.height, Math.min(targetTouch, availH));
+          resizedForTouch.push(w.id);
+        }
+      }
+
+      w.width = Math.min(w.width, availW);
+      w.height = Math.min(w.height, availH);
+      w.x = Math.max(innerMinX, Math.min(w.x, innerMaxX - w.width));
+      w.y = Math.max(innerMinY, Math.min(w.y, innerMaxY - w.height));
+
+      if (overlapsPlaced(w, true)) {
+        let bestX = w.x;
+        let bestY = w.y;
+        let bestDist = Infinity;
+        for (const stepPx of [GRID_STEP, 4, 2]) {
+          for (let y = innerMinY; y <= innerMaxY - w.height; y += stepPx) {
+            for (let x = innerMinX; x <= innerMaxX - w.width; x += stepPx) {
+              if (!overlapsPlaced({ x, y, width: w.width, height: w.height }, true)) {
+                const dist = Math.hypot(x - origX, y - origY);
+                if (dist < bestDist) {
+                  bestDist = dist;
+                  bestX = x;
+                  bestY = y;
+                }
+              }
+            }
+          }
+          if (bestDist < Infinity) break;
+        }
+        if (bestDist < Infinity) {
+          w.x = bestX;
+          w.y = bestY;
+        }
+      }
+
+      w.x = Math.max(parent.x, Math.min(w.x, parent.x + parent.width - w.width));
+      w.y = Math.max(parent.y, Math.min(w.y, parent.y + parent.height - w.height));
+      if (w.x !== origX || w.y !== origY) movedWidgets.add(w.id);
+      placed.push(w);
+      continue;
+    }
+
+    // Free widget outside any GROUP_PANEL: treat panels as obstacles so free widgets never cross panel borders
     const spec = TOOLBOX_BY_TYPE.get(w.type);
     if (isTouch && (spec?.interactive || w.writeEnabled)) {
       if (w.width < 48 || w.height < 48) {
@@ -1535,15 +1757,14 @@ export function solveAndRepairScreenLayout(
     w.x = clampSnapped(w.x, pad, screen.width - pad - w.width);
     w.y = clampSnapped(w.y, minY, maxY - w.height);
 
-    if (overlapsAny(w)) {
-      // Deterministic spiral / scanline search for nearest non-overlapping 8px-aligned slot
+    if (overlapsPlaced(w, false)) {
       let bestX = w.x;
       let bestY = w.y;
       let bestDist = Infinity;
       for (const stepPx of [GRID_STEP * 2, GRID_STEP]) {
         for (let y = clampSnapped(minY, minY, maxY - w.height); y <= maxY - w.height; y += stepPx) {
           for (let x = pad; x <= screen.width - pad - w.width; x += stepPx) {
-            if (!overlapsAny({ x, y, width: w.width, height: w.height })) {
+            if (!overlapsPlaced({ x, y, width: w.width, height: w.height }, false)) {
               const dist = Math.hypot(x - origX, y - origY);
               if (dist < bestDist) {
                 bestDist = dist;
@@ -1561,7 +1782,6 @@ export function solveAndRepairScreenLayout(
       }
     }
 
-    // Final hard clamp AFTER snapping so odd viewport sizes never clip past screen bounds
     w.x = Math.max(0, Math.min(w.x, screen.width - w.width));
     w.y = Math.max(0, Math.min(w.y, screen.height - w.height));
 

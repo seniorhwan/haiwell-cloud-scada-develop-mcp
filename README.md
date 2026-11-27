@@ -10,6 +10,6 @@ npm start              # HTTP server
 npm run mcp:stdio      # stdio transport
 ```
 
-See `SKILL.md` for the tool catalog and `FAILURE_DOCUMENTATION.md` for audit notes.
+See `SKILL.md` for the tool catalog and workflow guide.
 
 > Never commit `.env` files, project exports (`*.hwdev`, `*.hwrun`, `*.hwExport`) or personal documents.

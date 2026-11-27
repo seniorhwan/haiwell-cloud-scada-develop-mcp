@@ -348,7 +348,15 @@ test('v2.9.0 AI-Design & P2: sections/GROUP_PANEL, discrete P&ID, styled SVG wit
   const pyTmp = path.join(os.tmpdir(), `bridge_v290_${Date.now()}.py`);
   fs.writeFileSync(pyTmp, bdata.pywinautoScript, 'utf8');
   try {
-    execFileSync('python', ['-m', 'py_compile', pyTmp], { stdio: 'pipe' });
+    for (const pyBin of ['python3', 'python']) {
+      try {
+        execFileSync(pyBin, ['-m', 'py_compile', pyTmp], { stdio: 'pipe' });
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+        throw err;
+      }
+    }
   } finally {
     fs.rmSync(pyTmp, { force: true });
   }

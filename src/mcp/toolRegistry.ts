@@ -1,11 +1,10 @@
 /**
- * Hardened Single-Source-of-Truth MCP Tool Registry:
- * 61 production-grade tools across 15 Haiwell Cloud SCADA Develop domains.
+ * Hardened Single-Source-of-Truth MCP Tool Registry across 15 Haiwell Cloud SCADA Develop domains.
  * Features LLM-tolerant input normalization (prototype-pollution safe), strict Zod v4 validation,
  * multi-vendor PLC register & multi-word/byte overlap detection, binary type/range guards,
- * spatial HMI P&ID compilation & desktop bridge export, ISA-18.2 deduplicating alarm state machine,
- * atomic batch I/O, snapshots/rollback, full referential-integrity deletion, faceplates, webhooks,
- * and headless FAT simulation.
+ * spatial HMI P&ID compilation, visual readability auditing/auto-fix & desktop bridge export,
+ * ISA-18.2 deduplicating alarm state machine, atomic batch I/O, snapshots/rollback,
+ * full referential-integrity deletion, faceplates, webhooks, and headless FAT simulation.
  */
 
 import crypto from 'node:crypto';
@@ -47,7 +46,9 @@ import {
 } from './hmiSpatialEngine';
 import { importHwrunProject } from './hwrunImporter';
 import { compileProjectToHwExport } from './hwExportCompiler';
-import { instantiateHmiTemplate } from './hmiTemplates';
+import { instantiateHmiTemplateDetailed } from './hmiTemplates';
+import { auditHmiScreenDesign, autoFixHmiScreenDesign, HMI_THEMES } from './hmiDesignSystem';
+import { SERVER_VERSION } from './version';
 import {
   buildMqttPayload,
   generateOpcUaNodeSet2Xml,
@@ -137,6 +138,15 @@ const VISUAL_ROLES = [
   'STATUS_READONLY',
   'KPI_HERO',
 ] as const;
+
+const THEME_IDS = ['ISA_101_LIGHT', 'CONTROL_ROOM_DARK', 'HIGH_CONTRAST_TOUCH'] as const;
+
+const WIDGET_PROPS_SCHEMA = z
+  .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+  .optional()
+  .describe(
+    'Optional widget visual/runtime properties (e.g. theme: "dark"|"light_banner", color, labelColor, backgroundColor, fontSize, align: "left"|"center"|"right", bold, invertDisplay, active, customImageBase64, nativeSymbol, targetScreenName, targetWindowId).'
+  );
 
 const SQL_RESERVED = new Set(['SELECT', 'DROP', 'DELETE', 'INSERT', 'UPDATE', 'TABLE', 'FROM', 'WHERE', 'UNION', 'ORDER', 'GROUP', 'INDEX', 'ALTER', 'CREATE', 'EXEC', 'EXECUTE', 'GRANT', 'REVOKE', 'TRUNCATE', 'JOIN']);
 
@@ -416,7 +426,7 @@ export function buildProjectExportBundle(project: HaiwellProject) {
   });
 
   return {
-    format: 'haiwell-cloud-scada-bundle/v2.8',
+    format: `haiwell-cloud-scada-bundle/v${SERVER_VERSION}`,
     exportedAt: new Date().toISOString(),
     projectMeta: {
       id: project.id,
@@ -603,6 +613,24 @@ export function runProjectSafetyAudit(project: HaiwellProject) {
         target: screen.id,
         message: `Screen "${screen.name}" issues: collisions=${res.collisions.length}, outOfBounds=${res.outOfBounds.length}, unresolvedTags=${res.unresolvedTags.length}, brokenNav=${res.brokenNavTargets.length}, touchTargets=${res.touchTargetViolations.length}, duplicateIds=${res.duplicateWidgetIds.length}, roWriteWidgets=${res.readOnlyWriteWidgets.length}, invalidRanges=${res.invalidRanges.length}, disconnectedPipes=${res.disconnectedPipes.length}.`,
         remediation: 'Regenerate or fix widget geometry, bindings, read-only write flags, ranges, pipes, and navigation links.',
+      });
+    }
+    const visAudit = auditHmiScreenDesign(screen, project.tags, {
+      targetHardware: project.targetHardware,
+    });
+    if (!visAudit.valid) {
+      const blocking = visAudit.issues.filter((i) => i.severity === 'ERROR');
+      const sample = blocking
+        .slice(0, 4)
+        .map((i) => `${i.code}@${i.widgetId}`)
+        .join(', ');
+      findings.push({
+        code: 'AUD-HMI-READABILITY',
+        severity: 'HIGH',
+        domain: 'hmi',
+        target: screen.id,
+        message: `Screen "${screen.name}" has ${blocking.length} visual readability defect(s) (${sample}${blocking.length > 4 ? ', ...' : ''}).`,
+        remediation: 'Run haiwell_hmi_design_audit with autoFix=true to repair contrast, text sizing, or header overlaps.',
       });
     }
   }
@@ -2814,6 +2842,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         layoutStandard: z
           .enum(['ISA_101_HIGH_PERFORMANCE', 'STANDARD_INDUSTRIAL', 'MOBILE_UNIFIED'])
           .default('ISA_101_HIGH_PERFORMANCE'),
+        themeId: z.enum(THEME_IDS).optional(),
         columns: z.number().int().min(1).max(8).default(4),
         includeAlarmBanner: z.boolean().default(true),
         includeNavBar: z.boolean().default(true),
@@ -2832,6 +2861,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
               max: z.number().optional(),
               colSpan: z.number().int().min(1).max(8).default(1),
               rowSpan: z.number().int().min(1).max(3).default(1),
+              props: WIDGET_PROPS_SCHEMA,
             })
           )
           .min(1)
@@ -2858,6 +2888,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
                     max: z.number().optional(),
                     colSpan: z.number().int().min(1).max(6).default(1),
                     rowSpan: z.number().int().min(1).max(3).default(1),
+                    props: WIDGET_PROPS_SCHEMA,
                   })
                 )
                 .min(1),
@@ -2889,6 +2920,9 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         knownScreenIds: screenIds,
         targetHardware: project.targetHardware,
       });
+      const visualAudit = auditHmiScreenDesign(screen, project.tags, {
+        targetHardware: project.targetHardware,
+      });
       const idx = project.screens.findIndex((s) => s.id === screen.id);
       if (idx >= 0) project.screens[idx] = screen;
       else project.screens.push(screen);
@@ -2901,6 +2935,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
           ...validation,
           valid: validation.valid && overflowWidgets.length === 0,
         },
+        visualAudit,
         ...(input.returnSvg ? { svg: renderScreenToSvg(screen, project.tags) } : {}),
       };
     },
@@ -2933,6 +2968,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         min: z.number().optional(),
         max: z.number().optional(),
         precision: z.number().int().min(0).max(6).optional(),
+        props: WIDGET_PROPS_SCHEMA,
       }),
     }),
     sampleInput: {
@@ -2961,8 +2997,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         knownScreenIds: new Set(project.screens.map((s) => s.id)),
         targetHardware: project.targetHardware,
       });
+      const visualAudit = auditHmiScreenDesign(screen, project.tags, {
+        targetHardware: project.targetHardware,
+      });
       store.saveProject(project);
-      return { upserted: true, screenId: screen.id, widgetCount: screen.widgets.length, validation };
+      return { upserted: true, screenId: screen.id, widgetCount: screen.widgets.length, validation, visualAudit };
     },
   }),
 
@@ -2992,6 +3031,12 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             height: z.number().int().min(16),
             tagName: z.string().optional(),
             writeEnabled: z.boolean().default(false),
+            visualRole: z.enum(VISUAL_ROLES).optional(),
+            unit: z.string().optional(),
+            min: z.number().optional(),
+            max: z.number().optional(),
+            precision: z.number().int().min(0).max(6).optional(),
+            props: WIDGET_PROPS_SCHEMA,
           })
         )
         .optional(),
@@ -3051,10 +3096,11 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     haiwellFeature: 'Headless Vector SVG HMI Blueprint Generator',
     safetyTier: 'read',
     description:
-      'Render any configured Haiwell HMI screen into a deterministic SVG blueprint with current tag bindings and geometry metadata.',
+      'Render any configured Haiwell HMI screen into a faithful SVG preview matching actual Haiwell surface colors, dark headers, text clipping, and widget geometry (set showDebugOverlay=true only to overlay widget type tags).',
     inputSchema: z.object({
       projectId: z.string().default(DEFAULT_PROJECT_ID),
       screenId: z.string().default('scr_chiller_overview'),
+      showDebugOverlay: z.boolean().default(false),
     }),
     sampleInput: { projectId: DEFAULT_PROJECT_ID, screenId: 'scr_chiller_overview' },
     handler: (input, store) => {
@@ -3065,7 +3111,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         screenId: screen.id,
         name: screen.name,
         dimensions: { width: screen.width, height: screen.height },
-        svg: renderScreenToSvg(screen, project.tags),
+        svg: renderScreenToSvg(screen, project.tags, { showDebugOverlay: input.showDebugOverlay }),
       };
     },
   }),
@@ -3241,9 +3287,92 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         knownScreenIds: new Set(project.screens.map((s) => s.id)),
         targetHardware: project.targetHardware,
       });
+      const visualAudit = auditHmiScreenDesign(screen, project.tags, {
+        targetHardware: project.targetHardware,
+      });
       return {
         ...audit,
+        visualAudit,
         ...(input.includeSvg ? { svg: renderScreenToSvg(screen, project.tags) } : {}),
+      };
+    },
+  }),
+
+  defineTool({
+    name: 'haiwell_hmi_design_audit',
+    domain: 'hmi',
+    haiwellFeature: 'HMI Visual Readability, WCAG Contrast & Text-Fit Auditor + Auto-Fixer',
+    safetyTier: 'design',
+    description:
+      'Audit one or all HMI screens in a project for concrete visual readability defects (invisible text / low WCAG contrast against true enclosing surfaces, text overflow/clipping, child widgets overlapping GROUP_PANEL title bars, compact sub-element overflow, and touch targets). Set autoFix=true to automatically repair contrast, font sizes, panel header clearance, and touch dimensions and persist the fixed screen(s).',
+    inputSchema: z.object({
+      projectId: z.string().default(DEFAULT_PROJECT_ID),
+      screenId: z.string().optional(),
+      autoFix: z.boolean().default(false),
+      includeSvg: z.boolean().default(false),
+    }),
+    sampleInput: {
+      projectId: DEFAULT_PROJECT_ID,
+      screenId: 'scr_chiller_overview',
+      autoFix: false,
+    },
+    handler: (input, store) => {
+      const project = store.getProject(input.projectId);
+      const targets = input.screenId
+        ? project.screens.filter((s) => s.id === input.screenId)
+        : project.screens;
+      if (input.screenId && targets.length === 0) {
+        throw new Error(`Screen "${input.screenId}" not found in project "${project.id}".`);
+      }
+
+      const appliedFixes: { screenId: string; fixes: string[] }[] = [];
+      const screenReports = [];
+      let mutated = false;
+
+      for (const screen of targets) {
+        if (input.autoFix) {
+          const repaired = autoFixHmiScreenDesign(screen, project.tags, {
+            targetHardware: project.targetHardware,
+          });
+          if (repaired.appliedFixes.length > 0) {
+            const idx = project.screens.findIndex((s) => s.id === screen.id);
+            if (idx >= 0) project.screens[idx] = repaired.screen;
+            appliedFixes.push({ screenId: screen.id, fixes: repaired.appliedFixes });
+            mutated = true;
+          }
+          screenReports.push({
+            ...repaired.auditAfter,
+            fixesApplied: repaired.appliedFixes.length,
+            ...(input.includeSvg ? { svg: renderScreenToSvg(repaired.screen, project.tags) } : {}),
+          });
+        } else {
+          const report = auditHmiScreenDesign(screen, project.tags, {
+            targetHardware: project.targetHardware,
+          });
+          screenReports.push({
+            ...report,
+            fixesApplied: 0,
+            ...(input.includeSvg ? { svg: renderScreenToSvg(screen, project.tags) } : {}),
+          });
+        }
+      }
+
+      if (mutated) {
+        store.saveProject(project);
+      }
+
+      const totalBlockingIssues = screenReports.reduce((sum, r) => sum + r.blockingCount, 0);
+      const totalWarnings = screenReports.reduce((sum, r) => sum + r.warningCount, 0);
+
+      return {
+        projectId: project.id,
+        themePresets: Object.keys(HMI_THEMES),
+        valid: totalBlockingIssues === 0,
+        totalBlockingIssues,
+        totalWarnings,
+        autoFixApplied: mutated,
+        appliedFixes,
+        screens: screenReports,
       };
     },
   }),
@@ -3353,6 +3482,19 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       title: z.string().min(2).max(120),
       width: z.number().int().min(320).max(3840).default(1024),
       height: z.number().int().min(240).max(2160).default(600),
+      themeId: z.enum(THEME_IDS).optional(),
+      panelTitles: z
+        .object({
+          left: z.string().min(1).max(80).optional(),
+          middle: z.string().min(1).max(80).optional(),
+          right: z.string().min(1).max(80).optional(),
+          inputs: z.string().min(1).max(80).optional(),
+          outputs: z.string().min(1).max(80).optional(),
+          faults: z.string().min(1).max(80).optional(),
+          alarms: z.string().min(1).max(80).optional(),
+          history: z.string().min(1).max(80).optional(),
+        })
+        .optional(),
       eStopTag: z.string().optional(),
       navTabs: z
         .array(
@@ -3396,7 +3538,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         )
         .optional(),
       commIndicators: z
-        .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            role: z.enum(VISUAL_ROLES).optional(),
+            invertDisplay: z.boolean().optional(),
+          })
+        )
         .optional(),
       leftReadouts: z
         .array(
@@ -3450,7 +3599,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
         )
         .optional(),
       ioIndicators: z
-        .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+        .array(
+          z.object({
+            label: z.string().min(1),
+            tagName: z.string().min(1),
+            role: z.enum(VISUAL_ROLES).optional(),
+            invertDisplay: z.boolean().optional(),
+          })
+        )
         .optional(),
       includeAlarmTable: z.boolean().default(true),
       stations: z
@@ -3461,7 +3617,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             secondaryIcon: z.enum(['HWGear1']).optional(),
             tagName: z.string().optional(),
             ioIndicators: z
-              .array(z.object({ label: z.string().min(1), tagName: z.string().min(1) }))
+              .array(
+                z.object({
+                  label: z.string().min(1),
+                  tagName: z.string().min(1),
+                  role: z.enum(VISUAL_ROLES).optional(),
+                  invertDisplay: z.boolean().optional(),
+                })
+              )
               .optional(),
             kpi: z
               .object({
@@ -3533,6 +3696,7 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
             label: z.string().min(1),
             tagName: z.string().min(1),
             role: z.enum(VISUAL_ROLES).optional(),
+            invertDisplay: z.boolean().optional(),
           })
         )
         .optional(),
@@ -3556,11 +3720,14 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
     },
     handler: (input, store) => {
       const project = store.getProject(input.projectId);
-      const screen = instantiateHmiTemplate(input);
+      const { screen, warnings } = instantiateHmiTemplateDetailed(input);
       const knownScreenIds = new Set(project.screens.map((s) => s.id));
       knownScreenIds.add(screen.id);
       const validation = validateHmiScreen(screen, project.tags, {
         knownScreenIds,
+        targetHardware: project.targetHardware,
+      });
+      const visualAudit = auditHmiScreenDesign(screen, project.tags, {
         targetHardware: project.targetHardware,
       });
       const existingIdx = project.screens.findIndex((s) => s.id === screen.id);
@@ -3571,6 +3738,8 @@ export const HAIWELL_TOOLS: HaiwellToolDefinition[] = [
       return {
         screen,
         validation,
+        visualAudit,
+        ...(warnings.length > 0 ? { templateWarnings: warnings } : {}),
         ...(input.returnSvg ? { svg: renderScreenToSvg(screen, project.tags) } : {}),
       };
     },
@@ -5765,7 +5934,7 @@ export function getToolAnnotations(tool: HaiwellToolDefinition): McpToolAnnotati
   const isIdempotent =
     isRead ||
     (!NON_IDEMPOTENT_TOOLS.has(tool.name) &&
-      /(_upsert|_upsert_batch|_configure|_bind|_define|_save|_map|_policy|_solve|_library_manage)$/.test(tool.name));
+      /(_upsert|_upsert_batch|_configure|_bind|_define|_save|_map|_policy|_solve|_library_manage|_design_audit)$/.test(tool.name));
   const isOpenWorld =
     tool.name === 'haiwell_mqtt_exchange' ||
     tool.name === 'haiwell_webhook_configure' ||
@@ -5789,16 +5958,22 @@ export type ToolProfile = 'all' | 'core' | 'hmi' | 'plc' | 'iiot';
 const CORE_PROFILE_TOOLS = new Set([
   'haiwell_project_create',
   'haiwell_project_inspect',
+  'haiwell_project_import_hwrun',
   'haiwell_project_snapshot_rollback',
   'haiwell_project_audit_safety',
   'haiwell_project_export',
+  'haiwell_project_export_hwexport',
   'haiwell_device_add',
   'haiwell_tag_upsert_batch',
   'haiwell_tag_read_write',
   'haiwell_iec61131_validate',
   'haiwell_iec61131_pou_save',
+  'haiwell_hmi_template_instantiate',
+  'haiwell_hmi_screen_generate',
   'haiwell_hmi_pid_compile',
   'haiwell_hmi_spatial_verify',
+  'haiwell_hmi_design_audit',
+  'haiwell_hmi_screen_render_svg',
   'haiwell_alarm_configure',
   'haiwell_simulation_step',
 ]);
@@ -5875,7 +6050,7 @@ export interface InvokeToolResult {
   executionMs: number;
   idempotentReplay?: boolean;
   data?: unknown;
-  error?: { code: string; message: string; issues?: unknown };
+  error?: { code: string; message: string; issues?: unknown; remediationHint?: string };
 }
 
 const idempotencyCaches = new WeakMap<HaiwellProjectStore, Map<string, InvokeToolResult>>();
@@ -5918,6 +6093,23 @@ export async function invokeHaiwellTool(
   const start = performance.now();
   const tool = HAIWELL_TOOLS.find((t) => t.name === toolName);
   if (!tool) {
+    const tokens = toolName.toLowerCase().split(/[^a-z0-9]+/).filter((tk) => tk.length >= 2 && tk !== 'haiwell');
+    const suggestions = HAIWELL_TOOLS.map((t) => {
+      const lower = t.name.toLowerCase();
+      let score = 0;
+      for (const tk of tokens) {
+        if (lower.includes(tk)) score += 1;
+      }
+      return { name: t.name, score };
+    })
+      .filter((s) => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3)
+      .map((s) => s.name);
+    const remediationHint =
+      suggestions.length > 0
+        ? `Did you mean: ${suggestions.join(', ')}? Call tools/list to inspect all ${HAIWELL_TOOLS.length} tools.`
+        : `Call tools/list to inspect all ${HAIWELL_TOOLS.length} available Haiwell MCP tools.`;
     return {
       ok: false,
       tool: toolName,
@@ -5925,6 +6117,7 @@ export async function invokeHaiwellTool(
       error: {
         code: 'TOOL_NOT_FOUND',
         message: `Unknown MCP tool "${toolName}". Call tools/list to inspect all ${HAIWELL_TOOLS.length} Haiwell tools.`,
+        remediationHint,
       },
     };
   }
@@ -5966,6 +6159,14 @@ export async function invokeHaiwellTool(
 
   const parsed = tool.inputSchema.safeParse(argsForSchema);
   if (!parsed.success) {
+    const issues = parsed.error.issues.map((i) => ({
+      path: i.path.join('.'),
+      code: i.code,
+      message: i.message,
+    }));
+    const failingPaths = Array.from(new Set(issues.map((i) => i.path || '(root)'))).slice(0, 5);
+    const sampleKeys = Object.keys(tool.sampleInput ?? {});
+    const remediationHint = `Fix invalid field(s): ${failingPaths.join(', ')}.${sampleKeys.length > 0 ? ` Valid top-level keys include: ${sampleKeys.join(', ')}.` : ''}`;
     return {
       ok: false,
       tool: tool.name,
@@ -5975,11 +6176,8 @@ export async function invokeHaiwellTool(
       error: {
         code: 'SCHEMA_VALIDATION_ERROR',
         message: 'Input payload failed strict Zod schema validation.',
-        issues: parsed.error.issues.map((i) => ({
-          path: i.path.join('.'),
-          code: i.code,
-          message: i.message,
-        })),
+        issues,
+        remediationHint,
       },
     };
   }

@@ -511,8 +511,8 @@ test('Production MCP #13: Tool annotations, SHA-256 catalog hash, scoped profile
   assert.equal(deleteTool.annotations.readOnlyHint, false);
   assert.equal(deleteTool.annotations.destructiveHint, true);
 
-  // Scoped profiles keep context-window tool count lean (14 tools for core)
-  assert.equal(getToolsForProfile('core').length, 14);
+  // Scoped profiles keep context-window tool count lean (20 tools for core)
+  assert.equal(getToolsForProfile('core').length, 20);
   assert.ok(getToolsForProfile('hmi').length <= 35);
   assert.equal(getToolsForProfile('all').length, HAIWELL_TOOLS.length);
 
@@ -628,7 +628,7 @@ test('Production MCP #14: HTTP Bearer auth, Origin DNS-rebinding guard, scoped ?
     });
     assert.equal(coreList.status, 200);
     const listBody = (await coreList.json()) as { result: { tools: { name: string; annotations?: { readOnlyHint?: boolean } }[] } };
-    assert.equal(listBody.result.tools.length, 14);
+    assert.equal(listBody.result.tools.length, 20);
     const inspectMeta = listBody.result.tools.find((t) => t.name === 'haiwell_project_inspect');
     assert.equal(inspectMeta?.annotations?.readOnlyHint, true);
 

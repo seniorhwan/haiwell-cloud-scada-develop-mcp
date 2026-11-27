@@ -33,6 +33,7 @@ const TOOL_OUTPUT_ENVELOPE_SCHEMA = {
       code: z.string(),
       message: z.string(),
       issues: z.unknown().optional(),
+      remediationHint: z.string().optional(),
     })
     .optional(),
 };
@@ -53,7 +54,7 @@ export function createHaiwellMcpServer(
         prompts: {},
       },
       instructions:
-        'Zero-UI headless industrial automation MCP server covering all 22 Haiwell Cloud Scada 3.50.x (.hwdev) Project Browser nodes. Always snapshot before bulk edits, validate multi-vendor PLC addresses and word-spans, dry-run physical control writes, validate IEC 61131-3 logic, compile HMI spatially via P&ID/solver tools, calibrate live WinForms UIA via haiwell_desktop_uia_calibrate before desktop bridge export, test E-Stop via haiwell_simulation_step, and verify deploymentReady=true via haiwell_project_audit_safety before export.',
+        'Headless industrial automation MCP server covering all 22 Haiwell Cloud Scada 3.50.x (.hwdev) Project Browser nodes. Snapshot before bulk edits, validate multi-vendor PLC addresses and word-spans, dry-run physical control writes, validate IEC 61131-3 logic, build HMI screens via haiwell_hmi_template_instantiate / haiwell_hmi_pid_compile / haiwell_hmi_screen_generate, run haiwell_hmi_design_audit (autoFix=true) and haiwell_hmi_spatial_verify to guarantee zero invisible text, zero clipping, and zero collisions, inspect clean SVG via haiwell_hmi_screen_render_svg, test E-Stop via haiwell_simulation_step, and verify deploymentReady=true via haiwell_project_audit_safety before haiwell_project_export_hwexport or haiwell_desktop_deploy_hwexport.',
     }
   );
 

@@ -1,6 +1,19 @@
 import crypto from 'node:crypto';
 import { HAIWELL_NATIVE_SYMBOLS, type NativeSymbolBBox } from './haiwellNativeSymbols';
 import {
+  computeBannerTitleAvailableWidth,
+  computeBitButtonGeometry,
+  computeBitLampGeometry,
+  fitFontSizeToWidth,
+  getGroupPanelColors,
+  getGroupPanelHeaderHeight,
+  getRoleCardColors,
+  normalizeHexColor,
+  pickReadableTextColor,
+  resolveScreenTheme,
+  resolveWidgetSurfaceContext,
+} from './hmiDesignSystem';
+import {
   generateLedLampPng,
   generatePushbuttonPng,
   generateSolidPngBase64,
@@ -374,9 +387,10 @@ export function compileProjectToHwExport(
       bold: boolean,
       localId = 'at',
       varBindings: { propName: string; varId: number }[] = [],
-      defaultGroupId = groupId
+      defaultGroupId = groupId,
+      explicitSeq?: number
     ) => {
-      const seq = nextSymDbId++;
+      const seq = explicitSeq ?? nextSymDbId++;
       const single = {
         t: text,
         f: 'Arial',
@@ -456,7 +470,10 @@ export function compileProjectToHwExport(
         txtColor,
         fontSize,
         bold,
-        'at'
+        'at',
+        [],
+        textGroup.groupId,
+        seq
       );
 
       svgElements.push(
@@ -476,11 +493,28 @@ export function compileProjectToHwExport(
       const seq = nextSymDbId++;
       const symId = `Shape_${seq}`;
       const hwkey = `${symId}_${seq}`;
-      registerTextOnlyRecord('Shape', symId, hwkey, textGroup.groupId, { '0': ensurePic(fillHex) }, '', '#0F172A', 12, false, 'st');
+      registerTextOnlyRecord(
+        'Shape',
+        symId,
+        hwkey,
+        textGroup.groupId,
+        { '0': ensurePic(fillHex) },
+        '',
+        '#0F172A',
+        12,
+        false,
+        'st',
+        [],
+        textGroup.groupId,
+        seq
+      );
       svgElements.push(
         `<g transform="matrix(${(w / 100).toFixed(6)},0,0,${(h / 100).toFixed(6)},${x},${y})" hw-PowerTime="10" sym-type="Shape" v="0.2" id="${symId}" hwkey="${hwkey}" StCt="1" RemoteOperation="true"><hwsymbol id="${hwkey}" newsym="true" defGId="shap001" title="Graphics" name="Shape" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="${rx}" ry="${rx}" width="100" height="100" stroke="${strokeHex}" stroke-width="1.5" fill="${fillHex}" /></g></g></g></g></g>`
       );
     };
+
+    const screenTheme = resolveScreenTheme(screen);
+    const screenBg = normalizeHexColor(screen.backgroundColor) ?? screenTheme.canvasBg;
 
     const placeDllSymbol = (
       dllKey: string,
@@ -512,6 +546,16 @@ export function compileProjectToHwExport(
         .replace(/>仪表</g, '>%<')
         .replace(/>游标</g, '>Qty<')
         .replace(/>000</g, '>0<');
+      if (lang === 'en_0') {
+        vis = vis
+          .replace(/font-family="宋体"/g, 'font-family="Arial"')
+          .replace(/fonten="SimSun"/g, 'fonten="Arial"');
+        if (dllKey === 'HWCursor3') {
+          vis = vis
+            .replace('localid="HWCursor3BoxColor" x="60" y="310" width="70" height="20" stroke="none" fill="#0080FF"', 'localid="HWCursor3BoxColor" x="60" y="310" width="70" height="20" stroke="none" fill="#1E293B"')
+            .replace('localid="HWCursor3Value" x="60" y="310" width="70" height="20" fill="none" stroke="none" text-color="black"', 'localid="HWCursor3Value" x="60" y="310" width="70" height="20" fill="none" stroke="none" text-color="#FFFFFF"');
+        }
+      }
       if (opts.transformVisual) vis = opts.transformVisual(vis);
       const ctrlAttr = def.control ? ` control="${def.control}"` : '';
       const ctpAttr = def.changeToPicture ? ' ChangeToPicture="true"' : '';
@@ -529,7 +573,9 @@ export function compileProjectToHwExport(
         12,
         false,
         'st',
-        opts.varBindings ?? []
+        opts.varBindings ?? [],
+        grpId,
+        seq
       );
 
       svgElements.push(
@@ -565,48 +611,81 @@ export function compileProjectToHwExport(
         if (pipe.label) {
           const midX = Math.round((p0.x + p1.x) / 2) - 60;
           const midY = Math.round((p0.y + p1.y) / 2) - 24;
+          const pipeTxtColor = pickReadableTextColor(
+            screenBg,
+            pipe.fluid === 'SIGNAL' ? '#1D4ED8' : screenTheme.textSecondary,
+            3.0
+          );
           addTxtBlock(Math.max(0, midX), Math.max(0, midY), 120, 18, pipe.label, {
-            color: pipe.fluid === 'SIGNAL' ? '#1D4ED8' : '#334155',
-            fontSize: 10,
+            color: pipeTxtColor,
+            fontSize: fitFontSizeToWidth(pipe.label, 116, 10, 8, true),
             bold: true,
             align: 'center',
+            bg: screenBg,
           });
         }
       }
     }
 
-    for (const w of screen.widgets) {
+    // Paint GROUP_PANEL background containers first (outermost first) so child widgets always render in front
+    const orderedWidgets = [
+      ...screen.widgets
+        .filter((w) => w.type === 'GROUP_PANEL')
+        .sort((a, b) => b.width * b.height - a.width * a.height),
+      ...screen.widgets.filter((w) => w.type !== 'GROUP_PANEL'),
+    ];
+
+    for (const w of orderedWidgets) {
       totalWidgets++;
       const bound = bindTag(w.tagName);
       if (bound) usedVarIds.add(bound.varId);
+      const surface = resolveWidgetSurfaceContext(screen, w);
 
-      // 1. GROUP_PANEL -> Razor-sharp ISA-101 flat card with dedicated 28px header strip
+      // 1. GROUP_PANEL -> Flat industrial card with surface-matched header text
       if (w.type === 'GROUP_PANEL') {
-        const theme = w.props?.theme;
-        if (theme === 'dark') {
-          addFlatRectShape(w.x, w.y, w.width, w.height, '#1E293B', '#0F172A', 2);
+        const panelCols = getGroupPanelColors(w, screenTheme);
+        if (panelCols.isDarkBar) {
+          addFlatRectShape(w.x, w.y, w.width, w.height, panelCols.bodyBg, panelCols.border, 2);
           if (w.label) {
-            addTxtBlock(w.x + 14, w.y + Math.max(6, Math.round((w.height - 22) / 2)), Math.max(80, w.width - 28), 22, w.label, {
-              color: '#F8FAFC',
-              fontSize: 14,
+            const availW = computeBannerTitleAvailableWidth(screen, w);
+            const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 14;
+            const fittedSize = fitFontSizeToWidth(w.label, availW, prefSize, 9, true);
+            addTxtBlock(w.x + 14, w.y + Math.max(6, Math.round((w.height - 22) / 2)), availW, 22, w.label, {
+              color: panelCols.headerText,
+              fontSize: fittedSize,
               bold: true,
               align: 'left',
-              bg: '#1E293B',
+              bg: panelCols.bodyBg,
             });
           }
-        } else if (theme === 'light_banner') {
-          addFlatRectShape(w.x, w.y, w.width, w.height, '#FFFFFF', '#CBD5E1', 2);
-        } else {
-          addFlatRectShape(w.x, w.y, w.width, w.height, '#FFFFFF', '#CBD5E1', 2);
-          const hdrH = Math.min(28, Math.max(22, Math.round(w.height * 0.12)));
-          addFlatRectShape(w.x, w.y, w.width, hdrH, '#E2E8F0', '#CBD5E1', 2);
+        } else if (w.props?.theme === 'light_banner') {
+          addFlatRectShape(w.x, w.y, w.width, w.height, panelCols.bodyBg, panelCols.border, 2);
           if (w.label) {
-            addTxtBlock(w.x + 10, w.y + Math.round((hdrH - 18) / 2), Math.max(80, w.width - 20), 18, w.label, {
-              color: '#0F172A',
-              fontSize: 11,
+            const availW = computeBannerTitleAvailableWidth(screen, w);
+            const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 14;
+            const fittedSize = fitFontSizeToWidth(w.label, availW, prefSize, 9, true);
+            addTxtBlock(w.x + 14, w.y + Math.max(6, Math.round((w.height - 22) / 2)), availW, 22, w.label, {
+              color: panelCols.headerText,
+              fontSize: fittedSize,
               bold: true,
               align: 'left',
-              bg: '#E2E8F0',
+              bg: panelCols.bodyBg,
+            });
+          }
+        } else {
+          addFlatRectShape(w.x, w.y, w.width, w.height, panelCols.bodyBg, panelCols.border, 2);
+          const hdrH = getGroupPanelHeaderHeight(w);
+          addFlatRectShape(w.x, w.y, w.width, hdrH, panelCols.headerBg, panelCols.border, 2);
+          if (w.label) {
+            const availW = Math.max(60, w.width - 20);
+            const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 11;
+            const fittedSize = fitFontSizeToWidth(w.label, availW, prefSize, 8, true);
+            addTxtBlock(w.x + 10, w.y + Math.round((hdrH - 18) / 2), availW, 18, w.label, {
+              color: panelCols.headerText,
+              fontSize: fittedSize,
+              bold: true,
+              align: 'left',
+              bg: panelCols.headerBg,
             });
           }
         }
@@ -616,10 +695,30 @@ export function compileProjectToHwExport(
       // 2. LABEL (or HWClock4 live digital clock or custom PNG logo)
       if (w.type === 'LABEL') {
         if (typeof w.props?.customImageBase64 === 'string' && w.props.customImageBase64.length > 0) {
-          const b64 = w.props.customImageBase64;
-          const md5 = crypto.createHash('md5').update(Buffer.from(b64, 'base64')).digest('hex').toLowerCase();
+          const cleanedB64 = w.props.customImageBase64
+            .replace(/^data:image\/png;base64,/i, '')
+            .replace(/\s+/g, '');
+          const decodedBuf = Buffer.from(cleanedB64, 'base64');
+          const hasPngMagic =
+            decodedBuf.length >= 8 &&
+            decodedBuf[0] === 0x89 &&
+            decodedBuf[1] === 0x50 &&
+            decodedBuf[2] === 0x4e &&
+            decodedBuf[3] === 0x47 &&
+            decodedBuf[4] === 0x0d &&
+            decodedBuf[5] === 0x0a &&
+            decodedBuf[6] === 0x1a &&
+            decodedBuf[7] === 0x0a;
+          if (!hasPngMagic) {
+            warnings.push(
+              `Skipped invalid customImageBase64 on LABEL "${w.id}" in screen "${screen.name}": payload is not a valid PNG image.`
+            );
+            continue;
+          }
+          const canonicalB64 = decodedBuf.toString('base64');
+          const md5 = crypto.createHash('md5').update(decodedBuf).digest('hex').toLowerCase();
           const grp = ensureImageGroup(`logo_${md5.slice(0, 12)}`, [
-            { stateKey: '0', color: '#FFFFFF', png: { base64: b64, md5 } },
+            { stateKey: '0', color: '#FFFFFF', png: { base64: canonicalB64, md5 } },
           ]);
           const seq = nextSymDbId++;
           const symId = `Shape_${seq}`;
@@ -627,7 +726,21 @@ export function compileProjectToHwExport(
           const scale = w.height / 100;
           const imgBoxW = (w.width / Math.max(0.01, scale)).toFixed(2);
           const scStr = scale.toFixed(6);
-          registerTextOnlyRecord('Shape', symId, hwkey, grp.groupId, { '0': symbolLibs.get(grp.stateIds['0'])!.md5 }, '', '#0F172A', 11, false, 'at');
+          registerTextOnlyRecord(
+            'Shape',
+            symId,
+            hwkey,
+            grp.groupId,
+            { '0': symbolLibs.get(grp.stateIds['0'])!.md5 },
+            '',
+            '#0F172A',
+            11,
+            false,
+            'at',
+            [],
+            grp.groupId,
+            seq
+          );
           svgElements.push(
             `<g transform="matrix(${scStr},0,0,${scStr},${w.x},${w.y})" hw-PowerTime="10" sym-type="Shape" v="0.2" id="${symId}" hwkey="${hwkey}" StCt="1" RemoteOperation="true"><hwsymbol id="${hwkey}" newsym="true" defGId="${grp.groupId}" title="Graphics" name="Shape" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="${imgBoxW}" height="100" preserveAspectRatio="xMidYMid meet" md5file="${md5}" /></g><g sign="text" /></g></g></g>`
           );
@@ -635,22 +748,47 @@ export function compileProjectToHwExport(
           const seq = nextSymDbId++;
           const symId = `Clock4_${seq}`;
           const hwkey = `HWClock4_${seq}_${seq}`;
-          registerTextOnlyRecord('HWClock4', symId, hwkey, textGroup.groupId, { '0': ensurePic('#1E293B') }, '00:00:00', '#38BDF8', 13, true, 'at');
+          const clkBg = surface.isDarkSurface ? surface.surfaceBg : screenTheme.clockBg;
+          const clkFg = screenTheme.clockText;
+          registerTextOnlyRecord(
+            'HWClock4',
+            symId,
+            hwkey,
+            textGroup.groupId,
+            { '0': ensurePic(clkBg) },
+            '00:00:00',
+            clkFg,
+            13,
+            true,
+            'at',
+            [],
+            textGroup.groupId,
+            seq
+          );
           svgElements.push(
-            `<g transform="matrix(1,0,0,1,${w.x},${w.y})" hw-PowerTime="10" sym-type="HWClock4" v="0.3" id="${symId}" hwkey="${hwkey}" Font="" TxtColor="#38BDF8" HWBackColor="#1E293B" HWBackOpacity="100" IsTextBlock="true" DateEnable="true" DataType="7" DataSign="/" WeekEnable="false" TimeEnable="true"><hwsymbol ChangeToPicture="true" id="${hwkey}" newSym="true" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Clock" name="HWClock4" /><g><g sign="state"><g sign="svg" /><g sign="text"><textBlock localid="at" x="0" y="0" width="${w.width}" height="${w.height}" fill="#1E293B" fill-opacity="0" stroke="none" text-color="#38BDF8" text-anchor="right" font-family="Arial" fonten="Arial" font-size="13" sh="17.3" font-weight="bold" wrap="nowrap">2026/11/25 21:45</textBlock></g></g></g></g>`
+            `<g transform="matrix(1,0,0,1,${w.x},${w.y})" hw-PowerTime="10" sym-type="HWClock4" v="0.3" id="${symId}" hwkey="${hwkey}" Font="" TxtColor="${clkFg}" HWBackColor="${clkBg}" HWBackOpacity="100" IsTextBlock="true" DateEnable="true" DataType="7" DataSign="/" WeekEnable="false" TimeEnable="true"><hwsymbol ChangeToPicture="true" id="${hwkey}" newSym="true" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Clock" name="HWClock4" /><g><g sign="state"><g sign="svg" /><g sign="text"><textBlock localid="at" x="0" y="0" width="${w.width}" height="${w.height}" fill="none" stroke="none" text-color="${clkFg}" text-anchor="right" font-family="Arial" fonten="Arial" font-size="13" sh="17.3" font-weight="bold" wrap="nowrap">00:00:00</textBlock></g></g></g></g>`
           );
         } else {
+          const explicitBg = normalizeHexColor(typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined);
+          const lblBg = explicitBg ?? surface.surfaceBg;
+          const prefColor = typeof w.props?.color === 'string' ? w.props.color : surface.defaultTextColor;
+          const safeColor = pickReadableTextColor(lblBg, prefColor, 3.0);
+          const bold = w.props?.bold !== false;
+          const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 12;
+          const fittedSize = fitFontSizeToWidth(w.label, Math.max(24, w.width - 4), prefSize, 8, bold);
           addTxtBlock(w.x, w.y, w.width, w.height, w.label, {
-            color: typeof w.props?.color === 'string' ? w.props.color : '#0F172A',
-            fontSize: typeof w.props?.fontSize === 'number' ? w.props.fontSize : 12,
-            bold: w.props?.bold !== false,
+            color: safeColor,
+            fontSize: fittedSize,
+            bold,
             align: (w.props?.align as 'left' | 'center' | 'right') ?? 'left',
+            bg: lblBg,
+            bgOpacity: explicitBg ? 1 : 0,
           });
         }
         continue;
       }
 
-      // 3. BIT_BUTTON -> Native Haiwell <SymbolType>image</SymbolType> BitSw with 96x96 3D pushbutton PNG
+      // 3. BIT_BUTTON -> Native Haiwell <SymbolType>image</SymbolType> BitSw with bounds-safe caption
       if (w.type === 'BIT_BUTTON') {
         const pal = getPushbuttonPalette(w.visualRole);
         const png0 = generatePushbuttonPng(pal.state0, false, 96);
@@ -663,15 +801,22 @@ export function compileProjectToHwExport(
         const seq = nextSymDbId++;
         const symId = `BitSw_${seq}`;
         const hwkey = `${symId}_${seq}`;
-        const size = Math.min(w.width, Math.max(40, w.height - 20));
-        const bx = w.x + (w.width - size) / 2;
-        const by = w.y;
-        const sx = (size / 100).toFixed(6);
-        const sy = (size / 100).toFixed(6);
+        const geom = computeBitButtonGeometry(w);
+        const sx = (geom.iconSize / 100).toFixed(6);
+        const sy = (geom.iconSize / 100).toFixed(6);
         const wrtAttrs = bound
           ? `WrtVar="${xmlEsc(bound.fullName)}" WrtVar-UseAddr="false" WrtVar-id="${bound.varId}"`
           : `WrtVar=""`;
-        const txtCfg = buildTwoStateTextConfig(lang, pal.text, 10, true);
+        const lblColor = pickReadableTextColor(
+          surface.surfaceBg,
+          typeof w.props?.labelColor === 'string'
+            ? w.props.labelColor
+            : typeof w.props?.color === 'string'
+              ? w.props.color
+              : surface.defaultTextColor,
+          3.0
+        );
+        const txtCfg = buildTwoStateTextConfig(lang, lblColor, 10, true);
 
         symRecords.push({
           id: seq,
@@ -686,25 +831,27 @@ export function compileProjectToHwExport(
           stateCount: 2,
           textContent: txtCfg.contentConfig,
           textLocalId: 'st',
-          textColor: pal.text,
+          textColor: lblColor,
           fontSize: 10,
           fontWeight: 'bold',
           varBindings: bound ? [{ propName: 'WrtVar-id', varId: bound.varId }] : [],
         });
 
         svgElements.push(
-          `<g transform="matrix(${sx},0,0,${sy},${bx.toFixed(2)},${by.toFixed(2)})" hw-PowerTime="10" sym-type="BitSw" v="0.1" id="${symId}" hwkey="${hwkey}" RvrsSt="false" DifVar="false" ActnLock="false" LockMode="var" LockExpress-Express="" LockExpress-Enable="false" LockLogic="off" LockStyle="show" StCt="2" ActnType="sw" ActnEff="false" WhthCnfrmBox="false" CnfrmType="all" UseMiniTime="false" MiniTime="3.0" UseDisplayTime="true" DisplayLocal="up_down" IsNoticeEnable="false" NoticeOrderType="before" NoticeType="bit" ActionType="sw" NumVarValue="1" ${wrtAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="sw006" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit switch" title-en="Bit switch" name="BitSw" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
+          `<g transform="matrix(${sx},0,0,${sy},${geom.iconX.toFixed(2)},${geom.iconY.toFixed(2)})" hw-PowerTime="10" sym-type="BitSw" v="0.1" id="${symId}" hwkey="${hwkey}" RvrsSt="false" DifVar="false" ActnLock="false" LockMode="var" LockExpress-Express="" LockExpress-Enable="false" LockLogic="off" LockStyle="show" StCt="2" ActnType="sw" ActnEff="false" WhthCnfrmBox="false" CnfrmType="all" UseMiniTime="false" MiniTime="3.0" UseDisplayTime="true" DisplayLocal="up_down" IsNoticeEnable="false" NoticeOrderType="before" NoticeType="bit" ActionType="sw" NumVarValue="1" ${wrtAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="sw006" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit switch" title-en="Bit switch" name="BitSw" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
         );
-        addTxtBlock(w.x, w.y + size + 2, w.width, 18, w.label, {
-          color: '#0F172A',
-          fontSize: 10,
+        const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 10;
+        addTxtBlock(geom.labelX, geom.labelY, geom.labelW, geom.labelH, w.label, {
+          color: lblColor,
+          fontSize: fitFontSizeToWidth(w.label, geom.labelW, prefSize, 8, true),
           bold: true,
-          align: 'center',
+          align: geom.labelAlign,
+          bg: surface.surfaceBg,
         });
         continue;
       }
 
-      // 4. BIT_LAMP -> Native Haiwell <SymbolType>image</SymbolType> BitLamp with 96x96 3D pilot LED PNG
+      // 4. BIT_LAMP -> Native Haiwell <SymbolType>image</SymbolType> BitLamp with surface-matched label & bounds safety
       if (w.type === 'BIT_LAMP') {
         const offHex = w.visualRole === 'DANGER_ACTION' ? '#DC2626' : '#64748B';
         const onHex = '#22C55E';
@@ -718,16 +865,22 @@ export function compileProjectToHwExport(
         const seq = nextSymDbId++;
         const symId = `BitLamp_${seq}`;
         const hwkey = `${symId}_${seq}`;
-        const horizontal = w.width >= w.height * 2.0;
-        const ledSize = horizontal ? Math.min(38, w.height - 2) : Math.min(44, w.width, Math.max(28, w.height - 18));
-        const lx = horizontal ? w.x + 2 : w.x + (w.width - ledSize) / 2;
-        const ly = horizontal ? w.y + (w.height - ledSize) / 2 : w.y;
-        const sx = (ledSize / 100).toFixed(6);
-        const sy = (ledSize / 100).toFixed(6);
+        const geom = computeBitLampGeometry(w);
+        const sx = (geom.ledSize / 100).toFixed(6);
+        const sy = (geom.ledSize / 100).toFixed(6);
         const rdAttrs = bound
           ? `RdVar="${xmlEsc(bound.fullName)}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
           : `RdVar=""`;
-        const txtCfg = buildTwoStateTextConfig(lang, '#0F172A', 10, true);
+        const lblColor = pickReadableTextColor(
+          surface.surfaceBg,
+          typeof w.props?.labelColor === 'string'
+            ? w.props.labelColor
+            : typeof w.props?.color === 'string'
+              ? w.props.color
+              : surface.defaultTextColor,
+          3.0
+        );
+        const txtCfg = buildTwoStateTextConfig(lang, lblColor, 10, true);
 
         symRecords.push({
           id: seq,
@@ -742,7 +895,7 @@ export function compileProjectToHwExport(
           stateCount: 2,
           textContent: txtCfg.contentConfig,
           textLocalId: 'st',
-          textColor: '#0F172A',
+          textColor: lblColor,
           fontSize: 10,
           fontWeight: 'bold',
           varBindings: bound ? [{ propName: 'RdVar-id', varId: bound.varId }] : [],
@@ -750,39 +903,30 @@ export function compileProjectToHwExport(
 
         const rvrsSt = w.props?.invertDisplay ? 'true' : 'false';
         svgElements.push(
-          `<g transform="matrix(${sx},0,0,${sy},${lx.toFixed(2)},${ly.toFixed(2)})" hw-PowerTime="10" sym-type="BitLamp" v="0.4" id="${symId}" hwkey="${hwkey}" RvrsSt="${rvrsSt}" StCt="2" Model="none" Type="on" IsOFFCtrl="false" FrqTime="1000" EnblExps="" ${rdAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="lamp013" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit lamp" title-en="Bit lamp" name="BitLamp" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
+          `<g transform="matrix(${sx},0,0,${sy},${geom.ledX.toFixed(2)},${geom.ledY.toFixed(2)})" hw-PowerTime="10" sym-type="BitLamp" v="0.4" id="${symId}" hwkey="${hwkey}" RvrsSt="${rvrsSt}" StCt="2" Model="none" Type="on" IsOFFCtrl="false" FrqTime="1000" EnblExps="" ${rdAttrs}><hwsymbol id="${hwkey}" newsym="true" defGId="lamp013" IsShowSafe="false" IsShowRemoteControl="false" IsShowShortcutKey="false" title="Bit lamp" title-en="Bit lamp" name="BitLamp" /><g><g sign="state"><g sign="svg"><image localid="si" x="0" y="0" width="100" height="100" md5file="${png0.md5}" newsym="true" /></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#000000" text-anchor="center" font-family="Arial" fonten="Arial" font-size="10" sh="13.33" font-weight="normal" font-style="normal" text-decoration="normal" cst="0" /></g></g></g></g>`
         );
 
-        const lblColor = w.props?.labelColor ? String(w.props.labelColor) : '#0F172A';
-        const isLightLbl = lblColor.toUpperCase() === '#FFFFFF' || lblColor.toUpperCase() === '#F8FAFC';
-        if (horizontal) {
-          addTxtBlock(w.x + ledSize + 10, w.y + Math.round((w.height - 18) / 2), Math.max(40, w.width - ledSize - 12), 18, w.label, {
-            color: lblColor,
-            fontSize: 11,
-            bold: true,
-            align: 'left',
-            bg: isLightLbl ? '#1E293B' : '#FFFFFF',
-          });
-        } else {
-          addTxtBlock(w.x, w.y + ledSize + 2, w.width, 18, w.label, {
-            color: lblColor,
-            fontSize: 10,
-            bold: true,
-            align: 'center',
-            bg: isLightLbl ? '#1E293B' : '#FFFFFF',
-          });
-        }
+        const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : geom.horizontal ? 11 : 10;
+        addTxtBlock(geom.labelX, geom.labelY, geom.labelW, geom.labelH, w.label, {
+          color: lblColor,
+          fontSize: fitFontSizeToWidth(w.label, geom.labelW, prefSize, 8, true),
+          bold: true,
+          align: geom.labelAlign,
+          bg: surface.surfaceBg,
+        });
         continue;
       }
 
       // 5. GAUGE -> Real Haiwell HWIstrument3 circular dial gauge
       if (w.type === 'GAUGE') {
         const headerH = 18;
-        addTxtBlock(w.x, w.y, w.width, headerH, `${w.label}${w.unit ? ` (${w.unit})` : ''}`, {
-          color: '#1E293B',
-          fontSize: 11,
+        const gaugeTitle = `${w.label}${w.unit ? ` (${w.unit})` : ''}`;
+        addTxtBlock(w.x, w.y, w.width, headerH, gaugeTitle, {
+          color: surface.defaultTextColor,
+          fontSize: fitFontSizeToWidth(gaugeTitle, Math.max(30, w.width - 4), 11, 8, true),
           bold: true,
           align: 'center',
+          bg: surface.surfaceBg,
         });
         const extra = bound
           ? `HWNumVar="${xmlEsc(bound.fullName)}" HWNumVar-id="${bound.varId}" HWMaxValue="${w.max ?? 100}" HWMinValue="${w.min ?? 0}" HWPoints="${w.precision ?? 1}" HwLimit="num"`
@@ -798,11 +942,13 @@ export function compileProjectToHwExport(
       // 6. BAR_GRAPH -> Real Haiwell HWCursor3 vertical level bar
       if (w.type === 'BAR_GRAPH') {
         const headerH = 18;
-        addTxtBlock(w.x, w.y, w.width, headerH, `${w.label}${w.unit ? ` (${w.unit})` : ''}`, {
-          color: '#1E293B',
-          fontSize: 11,
+        const barTitle = `${w.label}${w.unit ? ` (${w.unit})` : ''}`;
+        addTxtBlock(w.x, w.y, w.width, headerH, barTitle, {
+          color: surface.defaultTextColor,
+          fontSize: fitFontSizeToWidth(barTitle, Math.max(30, w.width - 4), 11, 8, true),
           bold: true,
           align: 'center',
+          bg: surface.surfaceBg,
         });
         const extra = bound
           ? `HWNumVar="${xmlEsc(bound.fullName)}" HWNumVar-id="${bound.varId}" HWMaxValue="${w.max ?? 100}" HWMinValue="${w.min ?? 0}" HWPoints="0" HwLimit="num"`
@@ -860,7 +1006,7 @@ export function compileProjectToHwExport(
         continue;
       }
 
-      // 11. STATION / ACTUATOR / PUMP / VALVE / TANK -> Crisp ISA-101 Station Card + Native Machinery Symbol
+      // 11. STATION / ACTUATOR / PUMP / VALVE / TANK -> Crisp Station Card + Native Machinery Symbol
       if (w.type === 'STATION' || w.type === 'ACTUATOR' || w.type === 'PUMP' || w.type === 'VALVE' || w.type === 'TANK') {
         const iconKey =
           typeof w.props?.nativeSymbol === 'string' && HAIWELL_NATIVE_SYMBOLS.dllSymbols[w.props.nativeSymbol]
@@ -872,13 +1018,16 @@ export function compileProjectToHwExport(
                 : 'HWReactor25';
 
         if (w.type === 'STATION') {
-          addFlatRectShape(w.x, w.y, w.width, w.height, '#FFFFFF', '#94A3B8', 2);
+          addFlatRectShape(w.x, w.y, w.width, w.height, screenTheme.cardBg, screenTheme.cardBorder, 2);
           addFlatRectShape(w.x, w.y, w.width, 28, '#334155', '#1E293B', 2);
-          addTxtBlock(w.x + 8, w.y + 5, Math.max(60, w.width - 16), 18, w.label, {
-            color: '#F8FAFC',
-            fontSize: 11,
+          const hdrAvailW = Math.max(24, w.width - 16);
+          const hdrColor = pickReadableTextColor('#334155', typeof w.props?.color === 'string' ? w.props.color : '#F8FAFC', 3.0);
+          addTxtBlock(w.x + 8, w.y + 5, hdrAvailW, 18, w.label, {
+            color: hdrColor,
+            fontSize: fitFontSizeToWidth(w.label, hdrAvailW, 11, 8, true),
             bold: true,
             align: 'center',
+            bg: '#334155',
           });
           const iconZoneH = typeof w.props?.iconZoneHeight === 'number'
             ? w.props.iconZoneHeight
@@ -906,7 +1055,13 @@ export function compileProjectToHwExport(
           (w.targetScreenId && targetScreens.find((s) => s.id === w.targetScreenId)?.name) ||
           firstScreenName;
         const activeNav = Boolean(w.props?.active);
-        const bgHex = activeNav ? '#0284C7' : '#334155';
+        const bgHex = normalizeHexColor(typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined)
+          ?? (activeNav ? screenTheme.navActiveBg : screenTheme.navBg);
+        const navTxtColor = pickReadableTextColor(
+          bgHex,
+          typeof w.props?.color === 'string' ? w.props.color : screenTheme.navText,
+          3.0
+        );
         const seq = nextSymDbId++;
         const btnAsset = HAIWELL_NATIVE_SYMBOLS.librarySymbols['btn214_0'];
         const grp = ensureSvgGroup(`btn214_${bgHex.replace('#', '')}`, [
@@ -939,15 +1094,16 @@ export function compileProjectToHwExport(
             grp.groupId,
             { '0': symbolLibs.get(grp.stateIds['0'])!.md5 },
             '',
-            '#FFFFFF',
+            navTxtColor,
             12,
             true,
             'st',
             [{ propName: 'WrtVar-id', varId: showWinVarId }],
-            'btn201'
+            'btn201',
+            seq
           );
           svgElements.push(
-            `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WordSw" v="0.1" id="${symId}" hwkey="${hwkey}" WhthCnfrmBox="false" ActnEff="false" CnfrmTxt="Make sure to perform the current operation" ActnFun="asgn" Opds="${targetWindowId}" LmtIsVar="false" LmtRet="false" LmtNum="80" RetNum="0" ActnLock="false" LockMode="var" LockLogic="off" LockStyle="show" StCt="1" WrtVar="$ShowWindowId" WrtVar-UseAddr="false" WrtVar-id="${showWinVarId}" LmtVar="" LockVar="" NoticeBitVar="" NoticeNumVar="" RemoteOperation="true"><hwsymbol id="${hwkey}" newsym="true" defGId="btn201" title="Word switch" name="WordSw" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
+            `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WordSw" v="0.1" id="${symId}" hwkey="${hwkey}" WhthCnfrmBox="false" ActnEff="false" CnfrmTxt="Make sure to perform the current operation" ActnFun="asgn" Opds="${targetWindowId}" LmtIsVar="false" LmtRet="false" LmtNum="80" RetNum="0" ActnLock="false" LockMode="var" LockLogic="off" LockStyle="show" StCt="1" WrtVar="$ShowWindowId" WrtVar-UseAddr="false" WrtVar-id="${showWinVarId}" LmtVar="" LockVar="" NoticeBitVar="" NoticeNumVar="" RemoteOperation="true"><hwsymbol id="${hwkey}" newsym="true" defGId="btn201" title="Word switch" name="WordSw" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="${navTxtColor}" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
           );
         } else {
           const symId = `WinOpBtn_${seq}`;
@@ -964,20 +1120,23 @@ export function compileProjectToHwExport(
             grp.groupId,
             { '0': symbolLibs.get(grp.stateIds['0'])!.md5 },
             '',
-            '#FFFFFF',
+            navTxtColor,
             12,
             true,
             'st',
             [],
-            'btn214'
+            'btn214',
+            seq
           );
           svgElements.push(
-            `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WinOpBtn" v="0.1" id="${symId}" hwkey="${hwkey}" Fun="${navFun}" ${navPicAttr} SubPic="" IsPrintHidden="false" ActnEff="false" WhthCnfrmBox="false" ActnLock="false" StCt="1"><hwsymbol id="${hwkey}" newsym="true" defGId="btn214" title="Picture operation button" name="WinOpBtn" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#FFFFFF" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
+            `<g transform="matrix(${sx},0,0,${sy},${w.x},${w.y})" hw-PowerTime="10" sym-type="WinOpBtn" v="0.1" id="${symId}" hwkey="${hwkey}" Fun="${navFun}" ${navPicAttr} SubPic="" IsPrintHidden="false" ActnEff="false" WhthCnfrmBox="false" ActnLock="false" StCt="1"><hwsymbol id="${hwkey}" newsym="true" defGId="btn214" title="Picture operation button" name="WinOpBtn" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="6" ry="6" width="100" height="100" stroke="#0F172A" stroke-width="2" fill="${bgHex}" /></g></g><g sign="text"><textBlock localid="st" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="${navTxtColor}" text-anchor="center" font-family="Arial" fonten="Arial" font-size="12" sh="16" cst="0" /></g></g></g></g>`
           );
         }
-        addTxtBlock(w.x + 6, w.y + Math.max(4, Math.round(w.height / 2) - 11), Math.max(30, w.width - 12), 22, w.label, {
-          color: '#FFFFFF',
-          fontSize: 12,
+        const navLabelW = Math.max(24, w.width - 12);
+        const prefNavSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 12;
+        addTxtBlock(w.x + 6, w.y + Math.max(4, Math.round(w.height / 2) - 11), navLabelW, 22, w.label, {
+          color: navTxtColor,
+          fontSize: fitFontSizeToWidth(w.label, navLabelW, prefNavSize, 8, true),
           bold: true,
           align: 'center',
           bg: bgHex,
@@ -985,7 +1144,144 @@ export function compileProjectToHwExport(
         continue;
       }
 
-      // 13. NUMERIC_DISPLAY / NUMERIC_INPUT -> Real Haiwell NumShowIput (btn226) / TxtShowIput (btn212)
+      // 13. MULTI_STATE_INDICATOR -> Live RdVar-bound status pill (NumShowIput / TxtShowIput)
+      if (w.type === 'MULTI_STATE_INDICATOR') {
+        const cardCols = getRoleCardColors(w.visualRole, screenTheme);
+        const pillBg = normalizeHexColor(typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined) ?? '#1E293B';
+        const pillFg = pickReadableTextColor(pillBg, typeof w.props?.color === 'string' ? w.props.color : '#F8FAFC', 3.0);
+        const lblColor = pickReadableTextColor(surface.surfaceBg, typeof w.props?.labelColor === 'string' ? w.props.labelColor : surface.secondaryTextColor, 3.0);
+        const labelH = Math.min(18, Math.max(14, Math.floor(w.height * 0.35)));
+        const pillY = w.y + labelH;
+        const pillH = Math.max(20, w.height - labelH);
+        const prefLabelSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 10;
+        addTxtBlock(w.x + 2, w.y, Math.max(30, w.width - 4), labelH, w.label, {
+          color: lblColor,
+          fontSize: fitFontSizeToWidth(w.label, Math.max(30, w.width - 4), prefLabelSize, 8, true),
+          bold: true,
+          align: 'left',
+          bg: surface.surfaceBg,
+        });
+
+        const isString = bound?.tag.dataType === 'STRING';
+        const seq = nextSymDbId++;
+        const symType = isString ? 'TxtShowIput' : 'NumShowIput';
+        const symId = `${symType}_${seq}`;
+        const hwkey = `${symId}_${seq}`;
+        const stateText = bound ? String(bound.tag.currentValue) : '0';
+        const heightCapped = Math.max(8, Math.min(12, Math.floor((pillH - 4) * 0.68)));
+        const pillFontSize = fitFontSizeToWidth(stateText, Math.max(24, w.width - 8), heightCapped, 8, true);
+        const btn226 = HAIWELL_NATIVE_SYMBOLS.librarySymbols['btn226_0'];
+        const grp = ensureSvgGroup(`btn226_${pillBg.replace('#', '')}`, [
+          {
+            stateKey: '0',
+            symbolId: `btn226_${pillBg.replace('#', '')}_0`,
+            color: pillBg,
+            symbolXml: btn226.symbolXml.replace(/#C7E1F0/gi, pillBg),
+          },
+        ]);
+        const bindings = bound ? [{ propName: 'RdVar-id', varId: bound.varId }] : [];
+        registerTextOnlyRecord(
+          symType,
+          symId,
+          hwkey,
+          grp.groupId,
+          { '0': symbolLibs.get(grp.stateIds['0'])!.md5 },
+          stateText,
+          pillFg,
+          pillFontSize,
+          true,
+          'at',
+          bindings,
+          'btn226',
+          seq
+        );
+        const numExtras = `PGEnbl="false" Gain="1" Ofst="0" ActnLock="false" LockMode="var" LockLogic="off" LockStyle="show" ThldEnbl="false" ThldIsVar="false" ThldMaxNum="80" ThldMinNum="20" UpLmtColor="red" LowLmtColor="yellow" WrngTxtEnbl="false" UpLmtTxt="" LowLmtTxt="" IsNoticeEnable="false" NoticeOrderType="before" NoticeType="bit" ActionType="sw" NumVarValue="1" MaxVar="" MinVar="" LockVar="" ThldMaxVar="" ThldMinVar="" NoticeBitVar="" NoticeNumVar=""`;
+        const attrs = bound
+          ? isString
+            ? `IsIput="false" DifVar="false" DispLgth="32" TxtAlign="center" TxtColor="${pillFg}" HWBackColor="${pillBg}" StCt="1" RdVar="${xmlEsc(bound.fullName)}" WrtVar="" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
+            : `SignDisp="true" IsPwdDisp="false" KilobitDisp="false" IsIput="false" ShowLeftTag="false" ShowRightTag="false" DifVar="false" LeftTag="" RightTag="" NumHex="10" IntNum="6" DcmPls="0" HwLimit="num" IputMaxVal="65535" MaxValConvert="65535" IputMinVal="0" MinValConvert="0" Font="" TxtAlign="center" TxtColor="${pillFg}" HWBackColor="${pillBg}" StCt="1" ${numExtras} RdVar="${xmlEsc(bound.fullName)}" WrtVar="" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
+          : `SignDisp="true" IsIput="false" DcmPls="0" HwLimit="num" IputMaxVal="65535" MaxValConvert="65535" IputMinVal="0" MinValConvert="0" TxtAlign="center" TxtColor="${pillFg}" HWBackColor="${pillBg}" StCt="1" ${numExtras} RdVar=""`;
+        svgElements.push(
+          `<g transform="matrix(1,0,0,1,${w.x},${pillY})" hw-PowerTime="10" sym-type="${symType}" v="0.4" id="${symId}" hwkey="${hwkey}" ${attrs}><hwsymbol id="${hwkey}" newsym="true" defGId="btn226" title="State indicator" name="${symType}" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="4" ry="4" width="${w.width}" height="${pillH}" stroke="${cardCols.border}" stroke-width="1.5" fill="${pillBg}" /></g></g><g sign="text"><textBlock localid="at" x="0" y="0" width="${w.width}" height="${pillH}" fill="none" stroke="none" text-color="${pillFg}" text-anchor="center" vertical-align="milldle" font-family="Arial" fonten="Arial" font-size="${pillFontSize}" sh="${(pillFontSize * 1.33).toFixed(2)}" font-weight="bold" cst="0">${xmlEsc(stateText)}</textBlock></g></g></g></g>`
+        );
+        continue;
+      }
+
+      // 14. RECIPE_SELECTOR -> Framed recipe control panel
+      if (w.type === 'RECIPE_SELECTOR') {
+        const hdrH = Math.min(24, Math.max(18, Math.floor(w.height * 0.35)));
+        addFlatRectShape(w.x, w.y, w.width, w.height, screenTheme.cardBg, screenTheme.cardBorder, 4);
+        addFlatRectShape(w.x, w.y, w.width, hdrH, screenTheme.panelHeaderBg, screenTheme.cardBorder, 4);
+        addTxtBlock(w.x + 8, w.y + Math.max(2, Math.round((hdrH - 16) / 2)), Math.max(30, w.width - 16), 16, w.label, {
+          color: screenTheme.panelHeaderText,
+          fontSize: fitFontSizeToWidth(w.label, Math.max(30, w.width - 16), 11, 8, true),
+          bold: true,
+          align: 'left',
+          bg: screenTheme.panelHeaderBg,
+        });
+        const recVal = bound ? String(bound.tag.currentValue) : 'Select Recipe';
+        addTxtBlock(w.x + 8, w.y + hdrH + Math.max(4, Math.round((w.height - hdrH - 18) / 2)), Math.max(30, w.width - 16), 18, recVal, {
+          color: pickReadableTextColor(screenTheme.cardBg, screenTheme.textPrimary),
+          fontSize: fitFontSizeToWidth(recVal, Math.max(30, w.width - 16), 12, 8, true),
+          bold: false,
+          align: 'left',
+          bg: screenTheme.cardBg,
+        });
+        continue;
+      }
+
+      // 15. CAMERA_VIEW -> Dark viewport frame with live camera caption
+      if (w.type === 'CAMERA_VIEW') {
+        addFlatRectShape(w.x, w.y, w.width, w.height, '#0F172A', '#334155', 4);
+        addTxtBlock(w.x + 10, w.y + 8, Math.max(40, w.width - 20), 18, w.label, {
+          color: '#F8FAFC',
+          fontSize: fitFontSizeToWidth(w.label, Math.max(40, w.width - 20), 11, 8, true),
+          bold: true,
+          align: 'left',
+          bg: '#0F172A',
+        });
+        const camHint = 'LIVE VIDEO STREAM';
+        addTxtBlock(w.x + 10, w.y + Math.round(w.height / 2) - 9, Math.max(40, w.width - 20), 18, camHint, {
+          color: '#94A3B8',
+          fontSize: fitFontSizeToWidth(camHint, Math.max(40, w.width - 20), 11, 8, true),
+          bold: false,
+          align: 'center',
+          bg: '#0F172A',
+        });
+        continue;
+      }
+
+      // 16. FACEPLATE_INSTANCE -> Bordered composite faceplate frame
+      if (w.type === 'FACEPLATE_INSTANCE') {
+        const hdrH = Math.min(24, Math.max(18, Math.floor(w.height * 0.25)));
+        addFlatRectShape(w.x, w.y, w.width, w.height, screenTheme.cardBg, screenTheme.accentPrimary, 4);
+        addFlatRectShape(w.x, w.y, w.width, hdrH, screenTheme.darkHeaderBg, screenTheme.darkHeaderBorder, 4);
+        addTxtBlock(w.x + 8, w.y + Math.max(2, Math.round((hdrH - 16) / 2)), Math.max(30, w.width - 16), 16, w.label, {
+          color: screenTheme.darkHeaderText,
+          fontSize: fitFontSizeToWidth(w.label, Math.max(30, w.width - 16), 11, 8, true),
+          bold: true,
+          align: 'left',
+          bg: screenTheme.darkHeaderBg,
+        });
+        continue;
+      }
+
+      // 17. PIPELINE widget -> Solid pipe segment instead of numeric input box
+      if (w.type === 'PIPELINE') {
+        addFlatRectShape(w.x, w.y, w.width, w.height, '#94A3B8', '#334155', 2);
+        if (w.label && w.width >= 40 && w.height >= 16) {
+          addTxtBlock(w.x + 4, w.y + Math.max(0, Math.round((w.height - 14) / 2)), Math.max(24, w.width - 8), 14, w.label, {
+            color: '#0F172A',
+            fontSize: fitFontSizeToWidth(w.label, Math.max(24, w.width - 8), 9, 8, true),
+            bold: true,
+            align: 'center',
+            bg: '#94A3B8',
+          });
+        }
+        continue;
+      }
+
+      // 18. NUMERIC_DISPLAY / NUMERIC_INPUT -> Unstretched 1:1 NumShowIput / TxtShowIput with complete WrtVar-id
       const isString = bound?.tag.dataType === 'STRING';
       const isInput = w.type === 'NUMERIC_INPUT';
       const decimals = w.precision ?? (bound?.tag.dataType === 'FLOAT32' ? 1 : 0);
@@ -993,19 +1289,36 @@ export function compileProjectToHwExport(
       const labelH = 18;
       const boxY = w.y + labelH;
       const boxH = Math.max(24, w.height - labelH);
-      addTxtBlock(w.x + 2, w.y, Math.max(40, w.width - 4), labelH, w.label, {
-        color: '#334155',
-        fontSize: 10,
+      const labelColor = pickReadableTextColor(
+        surface.surfaceBg,
+        typeof w.props?.labelColor === 'string' ? w.props.labelColor : surface.secondaryTextColor,
+        3.0
+      );
+      const prefLabelSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 10;
+      addTxtBlock(w.x + 2, w.y, Math.max(36, w.width - 4), labelH, w.label, {
+        color: labelColor,
+        fontSize: fitFontSizeToWidth(w.label, Math.max(36, w.width - 4), prefLabelSize, 8, true),
         bold: true,
         align: 'left',
+        bg: surface.surfaceBg,
       });
 
       const seq = nextSymDbId++;
       const symType = isString ? 'TxtShowIput' : 'NumShowIput';
       const symId = `${symType}_${seq}`;
       const hwkey = `${symId}_${seq}`;
-      const cardFill = w.visualRole === 'KPI_HERO' ? '#EFF6FF' : w.visualRole === 'DANGER_ACTION' ? '#FEF2F2' : '#FFFFFF';
-      const cardBorder = w.visualRole === 'KPI_HERO' ? '#2563EB' : w.visualRole === 'DANGER_ACTION' ? '#DC2626' : '#94A3B8';
+      const cardCols = getRoleCardColors(w.visualRole, screenTheme);
+      const cardFill = normalizeHexColor(typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined) ?? cardCols.fill;
+      const cardBorder = cardCols.border;
+      const valueColor = pickReadableTextColor(
+        cardFill,
+        typeof w.props?.color === 'string' ? w.props.color : cardCols.valueColor,
+        3.0
+      );
+      const prefValSize = w.visualRole === 'KPI_HERO' ? 14 : 12;
+      const heightCappedValSize = Math.max(8, Math.min(prefValSize, Math.floor((boxH - 4) * 0.68)));
+      const sampleValStr = isString ? '---' : `0000${unitStr ? ` ${unitStr}` : ''}`;
+      const valFontSize = fitFontSizeToWidth(sampleValStr, Math.max(24, w.width - 10), heightCappedValSize, 8, true);
       const btn226 = HAIWELL_NATIVE_SYMBOLS.librarySymbols['btn226_0'];
       const grp = ensureSvgGroup(`btn226_${cardFill.replace('#', '')}`, [
         {
@@ -1015,8 +1328,6 @@ export function compileProjectToHwExport(
           symbolXml: btn226.symbolXml.replace(/#C7E1F0/gi, cardFill),
         },
       ]);
-      const sx = (w.width / 100).toFixed(6);
-      const sy = (boxH / 100).toFixed(6);
       const bindings = bound
         ? isInput
           ? [
@@ -1032,12 +1343,13 @@ export function compileProjectToHwExport(
         grp.groupId,
         { '0': symbolLibs.get(grp.stateIds['0'])!.md5 },
         isString ? '---' : `0${unitStr ? ` ${unitStr}` : ''}`,
-        '#0F172A',
-        w.visualRole === 'KPI_HERO' ? 14 : 12,
+        valueColor,
+        valFontSize,
         true,
         'at',
         bindings,
-        'btn226'
+        'btn226',
+        seq
       );
       const numMin = w.min ?? (bound?.tag.dataType === 'UINT16' || bound?.tag.dataType === 'UINT32' ? 0 : -32768);
       const rawNumMax = w.max ?? (bound?.tag.dataType === 'UINT16' || bound?.tag.dataType === 'UINT32' ? 65535 : 32767);
@@ -1045,11 +1357,12 @@ export function compileProjectToHwExport(
       const numCommonExtras = `PGEnbl="false" Gain="1" Ofst="0" ActnLock="false" LockMode="var" LockLogic="off" LockStyle="show" ThldEnbl="false" ThldIsVar="false" ThldMaxNum="80" ThldMinNum="20" UpLmtColor="red" LowLmtColor="yellow" WrngTxtEnbl="false" UpLmtTxt="" LowLmtTxt="" IsNoticeEnable="false" NoticeOrderType="before" NoticeType="bit" ActionType="sw" NumVarValue="1" MaxVar="" MinVar="" LockVar="" ThldMaxVar="" ThldMinVar="" NoticeBitVar="" NoticeNumVar=""`;
       const attrs = bound
         ? isString
-          ? `IsIput="${isInput}" DifVar="false" DispLgth="32" TxtAlign="center" TxtColor="#0F172A" StCt="1" RdVar="${xmlEsc(bound.fullName)}" WrtVar="${isInput ? xmlEsc(bound.fullName) : ''}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"${isInput ? ` WrtVar-UseAddr="false" WrtVar-id="${bound.varId}"` : ''}`
-          : `SignDisp="true" IsPwdDisp="false" KilobitDisp="false" IsIput="${isInput}" ShowLeftTag="false" ShowRightTag="${Boolean(unitStr)}" DifVar="false" LeftTag="" RightTag="${xmlEsc(unitStr)}" NumHex="10" IntNum="6" DcmPls="${decimals}" HwLimit="num" IputMaxVal="${numMax}" MaxValConvert="${numMax}" IputMinVal="${numMin}" MinValConvert="${numMin}" Font="" TxtAlign="center" TxtColor="#0F172A" StCt="1" ${numCommonExtras} RdVar="${xmlEsc(bound.fullName)}" WrtVar="${isInput ? xmlEsc(bound.fullName) : ''}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"`
-        : `SignDisp="true" IsIput="false" DcmPls="${decimals}" HwLimit="num" IputMaxVal="${numMax}" MaxValConvert="${numMax}" IputMinVal="${numMin}" MinValConvert="${numMin}" TxtAlign="center" TxtColor="#0F172A" StCt="1" ${numCommonExtras} RdVar=""`;
+          ? `IsIput="${isInput}" DifVar="false" DispLgth="32" TxtAlign="center" TxtColor="${valueColor}" HWBackColor="${cardFill}" StCt="1" RdVar="${xmlEsc(bound.fullName)}" WrtVar="${isInput ? xmlEsc(bound.fullName) : ''}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"${isInput ? ` WrtVar-UseAddr="false" WrtVar-id="${bound.varId}"` : ''}`
+          : `SignDisp="true" IsPwdDisp="false" KilobitDisp="false" IsIput="${isInput}" ShowLeftTag="false" ShowRightTag="${Boolean(unitStr)}" DifVar="false" LeftTag="" RightTag="${xmlEsc(unitStr)}" NumHex="10" IntNum="6" DcmPls="${decimals}" HwLimit="num" IputMaxVal="${numMax}" MaxValConvert="${numMax}" IputMinVal="${numMin}" MinValConvert="${numMin}" Font="" TxtAlign="center" TxtColor="${valueColor}" HWBackColor="${cardFill}" StCt="1" ${numCommonExtras} RdVar="${xmlEsc(bound.fullName)}" WrtVar="${isInput ? xmlEsc(bound.fullName) : ''}" RdVar-UseAddr="false" RdVar-id="${bound.varId}"${isInput ? ` WrtVar-UseAddr="false" WrtVar-id="${bound.varId}"` : ''}`
+        : `SignDisp="true" IsIput="false" DcmPls="${decimals}" HwLimit="num" IputMaxVal="${numMax}" MaxValConvert="${numMax}" IputMinVal="${numMin}" MinValConvert="${numMin}" TxtAlign="center" TxtColor="${valueColor}" HWBackColor="${cardFill}" StCt="1" ${numCommonExtras} RdVar=""`;
+      // Use identity 1:1 matrix with explicit pixel width/height so font glyphs are never non-uniformly stretched
       svgElements.push(
-        `<g transform="matrix(${sx},0,0,${sy},${w.x},${boxY})" hw-PowerTime="10" sym-type="${symType}" v="0.4" id="${symId}" hwkey="${hwkey}" ${attrs}><hwsymbol id="${hwkey}" newsym="true" defGId="btn226" title="Numeric input/display" name="${symType}" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="4" ry="4" width="100" height="100" stroke="${cardBorder}" stroke-width="2" fill="${cardFill}" /></g></g><g sign="text"><textBlock localid="at" x="0" y="0" width="100" height="100" fill="none" stroke="none" text-color="#0F172A" text-anchor="center" font-family="Arial" fonten="Arial" font-size="${w.visualRole === 'KPI_HERO' ? 14 : 12}" sh="18" font-weight="bold" cst="0">${isString ? '---' : `0${unitStr ? ` ${xmlEsc(unitStr)}` : ''}`}</textBlock></g></g></g></g>`
+        `<g transform="matrix(1,0,0,1,${w.x},${boxY})" hw-PowerTime="10" sym-type="${symType}" v="0.4" id="${symId}" hwkey="${hwkey}" ${attrs}><hwsymbol id="${hwkey}" newsym="true" defGId="btn226" title="Numeric input/display" name="${symType}" /><g><g sign="state"><g sign="svg"><g><rect x="0" y="0" rx="4" ry="4" width="${w.width}" height="${boxH}" stroke="${cardBorder}" stroke-width="1.5" fill="${cardFill}" /></g></g><g sign="text"><textBlock localid="at" x="0" y="0" width="${w.width}" height="${boxH}" fill="none" stroke="none" text-color="${valueColor}" text-anchor="center" vertical-align="milldle" font-family="Arial" fonten="Arial" font-size="${valFontSize}" sh="${(valFontSize * 1.33).toFixed(2)}" font-weight="bold" cst="0">${isString ? '---' : `0${unitStr ? ` ${xmlEsc(unitStr)}` : ''}`}</textBlock></g></g></g></g>`
       );
     }
 
@@ -1072,7 +1385,7 @@ export function compileProjectToHwExport(
               <IsSubWindow>${screen.isPopup ? 1 : 0}</IsSubWindow>
               <Width>${screen.width}</Width>
               <Height>${screen.height}</Height>
-              <CanvasColor>${xmlEsc(screen.backgroundColor || '#F1F5F9')}</CanvasColor>
+              <CanvasColor>${xmlEsc(screenBg)}</CanvasColor>
               <CanvasBackground />
               <DockType />
               <PutDock>0</PutDock>

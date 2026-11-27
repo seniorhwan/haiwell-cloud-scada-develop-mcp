@@ -230,12 +230,15 @@ export interface HmiPipeRoute {
   waypoints: { x: number; y: number }[];
 }
 
+export type HmiThemeId = 'ISA_101_LIGHT' | 'CONTROL_ROOM_DARK' | 'HIGH_CONTRAST_TOUCH';
+
 export interface HmiScreen {
   id: string;
   name: string;
   width: number;
   height: number;
   layoutStandard: 'ISA_101_HIGH_PERFORMANCE' | 'STANDARD_INDUSTRIAL' | 'MOBILE_UNIFIED';
+  themeId?: HmiThemeId;
   backgroundColor: string;
   autoScaleMobile: boolean;
   autoScaleWeb: boolean;

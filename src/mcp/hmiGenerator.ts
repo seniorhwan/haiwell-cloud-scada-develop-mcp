@@ -4,10 +4,24 @@
  * Never silently drops overflowing widgets!
  */
 
+import {
+  computeBannerTitleAvailableWidth,
+  computeBitButtonGeometry,
+  computeBitLampGeometry,
+  fitFontSizeToWidth,
+  getGroupPanelColors,
+  getGroupPanelHeaderHeight,
+  getRoleCardColors,
+  normalizeHexColor,
+  pickReadableTextColor,
+  resolveScreenTheme,
+  resolveWidgetSurfaceContext,
+} from './hmiDesignSystem';
 import type {
   HaiwellTargetHardware,
   HmiFaceplateTemplate,
   HmiScreen,
+  HmiThemeId,
   HmiVisualRole,
   HmiWidget,
   HmiWidgetType,
@@ -189,6 +203,7 @@ export interface AutoLayoutItemSpec {
   max?: number;
   colSpan?: number;
   rowSpan?: number;
+  props?: Record<string, string | number | boolean>;
 }
 
 export interface AutoLayoutSectionSpec {
@@ -205,6 +220,7 @@ export interface AutoLayoutSpec {
   width: number;
   height: number;
   layoutStandard: HmiScreen['layoutStandard'];
+  themeId?: HmiThemeId;
   includeAlarmBanner?: boolean;
   includeNavBar?: boolean;
   columns?: number;
@@ -303,6 +319,7 @@ function packItemsInGrid(
         min: p.item.min,
         max: p.item.max,
         precision: 2,
+        ...(p.item.props ? { props: { ...p.item.props } } : {}),
       });
     } else {
       overflowWidgets.push(id);
@@ -393,7 +410,7 @@ export function generateAutoLayoutScreenDetailed(spec: AutoLayoutSpec): AutoLayo
     }
 
     const outerColW = Math.floor((usableWidth - gap * (outerCols - 1)) / outerCols);
-    const headerH = 26;
+    const headerH = 28;
     const innerPad = 10;
     const innerGap = 8;
 
@@ -454,6 +471,13 @@ export function generateAutoLayoutScreenDetailed(spec: AutoLayoutSpec): AutoLayo
     });
   }
 
+  const theme = spec.themeId ? resolveScreenTheme({ themeId: spec.themeId, backgroundColor: '#F1F5F9' }) : null;
+  const defaultBg = theme
+    ? theme.canvasBg
+    : spec.layoutStandard === 'ISA_101_HIGH_PERFORMANCE'
+      ? '#E5E7EB'
+      : '#F1F5F9';
+
   return {
     screen: {
       id: spec.screenId,
@@ -461,7 +485,8 @@ export function generateAutoLayoutScreenDetailed(spec: AutoLayoutSpec): AutoLayo
       width: spec.width,
       height: spec.height,
       layoutStandard: spec.layoutStandard,
-      backgroundColor: spec.layoutStandard === 'ISA_101_HIGH_PERFORMANCE' ? '#E5E7EB' : '#F1F5F9',
+      ...(spec.themeId ? { themeId: spec.themeId } : {}),
+      backgroundColor: defaultBg,
       autoScaleMobile: true,
       autoScaleWeb: true,
       widgets,
@@ -530,10 +555,17 @@ function getRoleAccentColor(role?: HmiVisualRole): string {
   }
 }
 
+export interface RenderSvgOptions {
+  showDebugOverlay?: boolean;
+}
+
 export function renderScreenToSvg(
   screen: HmiScreen,
-  tags: Record<string, TagDefinition>
+  tags: Record<string, TagDefinition>,
+  options: RenderSvgOptions = {}
 ): string {
+  const showDebug = Boolean(options.showDebugOverlay);
+  const theme = resolveScreenTheme(screen);
   const hasOwnTag = (name: string) => Object.prototype.hasOwnProperty.call(tags, name);
   const pipeElements = (screen.pipes ?? []).map((p) => {
     const pts = p.waypoints.map((pt) => `${pt.x},${pt.y}`).join(' ');
@@ -541,7 +573,6 @@ export function renderScreenToSvg(
       ? PIPE_FLUID_COLOR[p.fluid]
       : '#334155';
     const dashAttr = p.fluid === 'SIGNAL' ? ' stroke-dasharray="6,4"' : '';
-    // Place pipe label at midpoint of the longest straight segment rather than an elbow corner
     let mid = p.waypoints[0];
     let bestLen = -1;
     for (let i = 0; i < p.waypoints.length - 1; i++) {
@@ -561,8 +592,8 @@ export function renderScreenToSvg(
       `    <polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linejoin="round"${dashAttr} marker-end="url(#pid-arrow)" />`,
       ...(labelText && mid
         ? [
-            `    <rect x="${mid.x - Math.round(boxW / 2)}" y="${mid.y - 16}" width="${boxW}" height="16" rx="2" fill="#FFFFFF" fill-opacity="0.92" stroke="#CBD5E1" stroke-width="0.75" />`,
-            `    <text x="${mid.x}" y="${mid.y - 5}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="#0F172A">${escapeXml(labelText)}</text>`,
+            `    <rect x="${mid.x - Math.round(boxW / 2)}" y="${mid.y - 16}" width="${boxW}" height="16" rx="2" fill="${theme.cardBg}" fill-opacity="0.94" stroke="${theme.panelBorder}" stroke-width="0.75" />`,
+            `    <text x="${mid.x}" y="${mid.y - 5}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="${theme.textPrimary}">${escapeXml(labelText)}</text>`,
           ]
         : []),
       `  </g>`,
@@ -582,46 +613,104 @@ export function renderScreenToSvg(
 
   const elements = sortedWidgets.map((w, idx) => {
     const safeClipId = `clip_${idx}_${w.id.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+    const surface = resolveWidgetSurfaceContext(screen, w);
     const tag = w.tagName && hasOwnTag(w.tagName) ? tags[w.tagName] : undefined;
     const rawVal = tag !== undefined ? tag.currentValue : undefined;
     const valueText = rawVal !== undefined ? String(rawVal) : '--';
-    const isTruthy = rawVal === true || rawVal === 1 || rawVal === '1' || rawVal === 'true';
+    const rawTruthy = rawVal === true || rawVal === 1 || rawVal === '1' || rawVal === 'true';
+    const isTruthy = w.props?.invertDisplay ? !rawTruthy : rawTruthy;
     const roleAccent = getRoleAccentColor(w.visualRole);
-    const badgeY = w.height >= 44 ? w.y + w.height - 6 : w.y + 16;
-    const valueY = w.height >= 44 ? Math.min(w.y + w.height - 16, w.y + 40) : w.y + Math.min(w.height - 10, 36);
+    const badgeY = w.height >= 44 ? w.y + w.height - 5 : w.y + 14;
+    const valueY = w.height >= 44 ? Math.min(w.y + w.height - 10, w.y + 42) : w.y + Math.min(w.height - 8, 34);
 
     const inner: string[] = [];
 
     if (w.type === 'GROUP_PANEL') {
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1.25" />`);
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="24" rx="4" fill="#334155" />`);
-      inner.push(`    <rect x="${w.x}" y="${w.y + 16}" width="${w.width}" height="8" fill="#334155" />`);
-      inner.push(`    <text x="${w.x + 10}" y="${w.y + 16}" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="700" fill="#F8FAFC" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      const pCols = getGroupPanelColors(w, theme);
+      if (pCols.isDarkBar) {
+        inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${pCols.bodyBg}" stroke="${pCols.border}" stroke-width="1.25" />`);
+        if (w.label) {
+          const availW = computeBannerTitleAvailableWidth(screen, w);
+          const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 14;
+          const fitted = fitFontSizeToWidth(w.label, availW, prefSize, 9, true);
+          inner.push(`    <text x="${w.x + 14}" y="${w.y + Math.round(w.height / 2) + Math.round(fitted * 0.35)}" font-family="IBM Plex Sans, sans-serif" font-size="${fitted}" font-weight="700" fill="${pCols.headerText}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+        }
+      } else if (w.props?.theme === 'light_banner') {
+        inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${pCols.bodyBg}" stroke="${pCols.border}" stroke-width="1.25" />`);
+        if (w.label) {
+          const availW = computeBannerTitleAvailableWidth(screen, w);
+          const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 14;
+          const fitted = fitFontSizeToWidth(w.label, availW, prefSize, 9, true);
+          inner.push(`    <text x="${w.x + 14}" y="${w.y + Math.round(w.height / 2) + Math.round(fitted * 0.35)}" font-family="IBM Plex Sans, sans-serif" font-size="${fitted}" font-weight="700" fill="${pCols.headerText}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+        }
+      } else {
+        const hdrH = getGroupPanelHeaderHeight(w);
+        inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${pCols.bodyBg}" stroke="${pCols.border}" stroke-width="1.25" />`);
+        inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${hdrH}" rx="4" fill="${pCols.headerBg}" />`);
+        inner.push(`    <rect x="${w.x}" y="${w.y + hdrH - 6}" width="${w.width}" height="6" fill="${pCols.headerBg}" />`);
+        if (w.label) {
+          const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 11;
+          const fitted = fitFontSizeToWidth(w.label, Math.max(40, w.width - 20), prefSize, 8, true);
+          inner.push(`    <text x="${w.x + 10}" y="${w.y + Math.round(hdrH / 2) + Math.round(fitted * 0.35)}" font-family="IBM Plex Sans, sans-serif" font-size="${fitted}" font-weight="700" fill="${pCols.headerText}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+        }
+      }
+    } else if (w.type === 'LABEL') {
+      if (typeof w.props?.customImageBase64 === 'string' && w.props.customImageBase64.length > 0) {
+        const cleanB64 = w.props.customImageBase64.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/i, '').replace(/\s+/g, '');
+        inner.push(`    <image x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" preserveAspectRatio="xMidYMid meet" href="data:image/png;base64,${cleanB64}" />`);
+      } else if (w.props?.nativeSymbol === 'HWClock4') {
+        const clkBg = surface.isDarkSurface ? surface.surfaceBg : theme.clockBg;
+        inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="${clkBg}" />`);
+        inner.push(`    <text x="${w.x + w.width - 4}" y="${w.y + Math.round(w.height / 2) + 5}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="700" fill="${theme.clockText}" clip-path="url(#${safeClipId})">12:00:00</text>`);
+      } else {
+        const explicitBg = normalizeHexColor(typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined);
+        const bg = explicitBg ?? surface.surfaceBg;
+        const fg = normalizeHexColor(typeof w.props?.color === 'string' ? w.props.color : undefined) ?? surface.defaultTextColor;
+        const align = w.props?.align === 'center' ? 'middle' : w.props?.align === 'right' ? 'end' : 'start';
+        const tx = align === 'middle' ? w.x + Math.round(w.width / 2) : align === 'end' ? w.x + w.width - 2 : w.x + 2;
+        const bold = w.props?.bold !== false;
+        const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 12;
+        const fitted = fitFontSizeToWidth(w.label, Math.max(20, w.width - 4), prefSize, 8, bold);
+        if (explicitBg) {
+          inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="2" fill="${bg}" />`);
+        }
+        inner.push(`    <text x="${tx}" y="${w.y + Math.round(w.height / 2) + Math.round(fitted * 0.35)}" text-anchor="${align}" font-family="IBM Plex Sans, sans-serif" font-size="${fitted}" font-weight="${bold ? 700 : 400}" fill="${fg}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      }
     } else if (w.type === 'ALARM_BANNER') {
       inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="#1E293B" stroke="#0F172A" stroke-width="1" />`);
       inner.push(`    <rect x="${w.x + 10}" y="${w.y + 11}" width="64" height="22" rx="11" fill="#16A34A" />`);
       inner.push(`    <text x="${w.x + 42}" y="${w.y + 26}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="700" fill="#FFFFFF">ALM OK</text>`);
       inner.push(`    <text x="${w.x + 86}" y="${w.y + 26}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="#F8FAFC" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <text x="${w.x + w.width - 10}" y="${w.y + 26}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="9" fill="#94A3B8">ALARM_BANNER</text>`);
     } else if (w.type === 'NAV_BAR') {
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="#334155" stroke="#1E293B" stroke-width="1" />`);
-      inner.push(`    <text x="${w.x + 14}" y="${w.y + 26}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="#F8FAFC" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <text x="${w.x + w.width - 10}" y="${w.y + 26}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="9" fill="#CBD5E1">NAV_BAR</text>`);
+      const activeNav = Boolean(w.props?.active);
+      const navBg = normalizeHexColor(typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined)
+        ?? (activeNav ? theme.navActiveBg : theme.navBg);
+      const navFg = normalizeHexColor(typeof w.props?.color === 'string' ? w.props.color : undefined) ?? theme.navText;
+      const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 12;
+      const fitted = fitFontSizeToWidth(w.label, Math.max(24, w.width - 12), prefSize, 8, true);
+      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${navBg}" stroke="#0F172A" stroke-width="1" />`);
+      inner.push(`    <text x="${w.x + Math.round(w.width / 2)}" y="${w.y + Math.round(w.height / 2) + Math.round(fitted * 0.35)}" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="${fitted}" font-weight="700" fill="${navFg}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
     } else if (w.type === 'BIT_BUTTON') {
-      const btnBg =
-        w.visualRole === 'DANGER_ACTION'
-          ? '#FEF2F2'
-          : w.visualRole === 'PRIMARY_ACTION'
-            ? '#F0FDF4'
-            : w.visualRole === 'WARNING_ACTION'
-              ? '#FFFBEB'
-              : '#E2E8F0';
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${btnBg}" stroke="#64748B" stroke-width="1.25" />`);
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="6" height="${w.height}" rx="2" fill="${roleAccent}" />`);
-      inner.push(`    <text x="${w.x + 14}" y="${w.y + 20}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="700" fill="#0F172A" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <text x="${w.x + 14}" y="${valueY}" font-family="IBM Plex Mono, monospace" font-size="12" fill="#475569">${isTruthy ? 'ACTIVE' : 'CMD'}</text>`);
-      inner.push(`    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#64748B">BIT_BUTTON</text>`);
-    } else if (w.type === 'BIT_LAMP' || w.type === 'MULTI_STATE_INDICATOR') {
+      const geom = computeBitButtonGeometry(w);
+      const lblFg = normalizeHexColor(
+        typeof w.props?.labelColor === 'string'
+          ? w.props.labelColor
+          : typeof w.props?.color === 'string'
+            ? w.props.color
+            : undefined
+      ) ?? surface.defaultTextColor;
+      const r = Math.max(8, Math.floor(geom.iconSize / 2) - 2);
+      const cx = Math.round(geom.iconX + geom.iconSize / 2);
+      const cy = Math.round(geom.iconY + geom.iconSize / 2);
+      const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : 10;
+      const fitted = fitFontSizeToWidth(w.label, geom.labelW, prefSize, 8, true);
+      const align = geom.labelAlign === 'center' ? 'middle' : 'start';
+      const tx = geom.labelAlign === 'center' ? geom.labelX + Math.round(geom.labelW / 2) : geom.labelX;
+      inner.push(`    <circle cx="${cx}" cy="${cy}" r="${r}" fill="${roleAccent}" stroke="#475569" stroke-width="2" />`);
+      inner.push(`    <circle cx="${cx}" cy="${cy}" r="${Math.max(4, Math.round(r * 0.65))}" fill="${roleAccent}" fill-opacity="0.85" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="1.5" />`);
+      inner.push(`    <text x="${tx}" y="${geom.labelY + Math.round(geom.labelH / 2) + Math.round(fitted * 0.35)}" text-anchor="${align}" font-family="IBM Plex Sans, sans-serif" font-size="${fitted}" font-weight="700" fill="${lblFg}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+    } else if (w.type === 'BIT_LAMP') {
+      const geom = computeBitLampGeometry(w);
       const ledColor =
         w.visualRole === 'DANGER_ACTION'
           ? isTruthy
@@ -629,52 +718,72 @@ export function renderScreenToSvg(
             : '#DC2626'
           : isTruthy
             ? '#16A34A'
-            : '#94A3B8';
-      const stateStr = w.type === 'BIT_LAMP' ? (isTruthy ? 'ON' : 'OFF') : valueText;
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1" />`);
-      inner.push(`    <circle cx="${w.x + 18}" cy="${w.y + Math.round(w.height / 2)}" r="8" fill="${ledColor}" stroke="#475569" stroke-width="1" />`);
-      inner.push(`    <text x="${w.x + 34}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="11.5" font-weight="600" fill="#0F172A" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <text x="${w.x + 34}" y="${valueY}" font-family="IBM Plex Mono, monospace" font-size="13" font-weight="600" fill="#334155" clip-path="url(#${safeClipId})">${escapeXml(stateStr)}</text>`);
-      inner.push(`    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#64748B">${escapeXml(w.type)}</text>`);
+            : '#64748B';
+      const lblFg = normalizeHexColor(
+        typeof w.props?.labelColor === 'string'
+          ? w.props.labelColor
+          : typeof w.props?.color === 'string'
+            ? w.props.color
+            : undefined
+      ) ?? surface.defaultTextColor;
+      const r = Math.max(6, Math.floor(geom.ledSize / 2) - 2);
+      const cx = Math.round(geom.ledX + geom.ledSize / 2);
+      const cy = Math.round(geom.ledY + geom.ledSize / 2);
+      const prefSize = typeof w.props?.fontSize === 'number' ? w.props.fontSize : geom.horizontal ? 11 : 10;
+      const fitted = fitFontSizeToWidth(w.label, geom.labelW, prefSize, 8, true);
+      const align = geom.labelAlign === 'center' ? 'middle' : 'start';
+      const tx = geom.labelAlign === 'center' ? geom.labelX + Math.round(geom.labelW / 2) : geom.labelX;
+      inner.push(`    <circle cx="${cx}" cy="${cy}" r="${r}" fill="${ledColor}" stroke="#475569" stroke-width="1.5" />`);
+      inner.push(`    <text x="${tx}" y="${geom.labelY + Math.round(geom.labelH / 2) + Math.round(fitted * 0.35)}" text-anchor="${align}" font-family="IBM Plex Sans, sans-serif" font-size="${fitted}" font-weight="700" fill="${lblFg}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+    } else if (w.type === 'MULTI_STATE_INDICATOR') {
+      const labelFg = normalizeHexColor(typeof w.props?.labelColor === 'string' ? w.props.labelColor : undefined) ?? surface.secondaryTextColor;
+      const pillBg = normalizeHexColor(typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined) ?? '#1E293B';
+      const pillFg = normalizeHexColor(typeof w.props?.color === 'string' ? w.props.color : undefined) ?? pickReadableTextColor(pillBg);
+      const labelH = 18;
+      const pillH = Math.max(20, w.height - labelH);
+      const fittedLbl = fitFontSizeToWidth(w.label, Math.max(24, w.width - 8), 10, 8, true);
+      inner.push(`    <text x="${w.x + 2}" y="${w.y + 13}" font-family="IBM Plex Sans, sans-serif" font-size="${fittedLbl}" font-weight="700" fill="${labelFg}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      inner.push(`    <rect x="${w.x}" y="${w.y + labelH}" width="${w.width}" height="${pillH}" rx="4" fill="${pillBg}" stroke="${theme.cardBorder}" stroke-width="1" />`);
+      inner.push(`    <text x="${w.x + Math.round(w.width / 2)}" y="${w.y + labelH + Math.round(pillH / 2) + 4}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="700" fill="${pillFg}" clip-path="url(#${safeClipId})">${escapeXml(valueText)}</text>`);
     } else if (w.type === 'GAUGE') {
       const minV = w.min ?? 0;
       const maxV = w.max ?? 100;
       const numV = typeof rawVal === 'number' ? rawVal : Number(rawVal ?? minV) || minV;
       const ratio = maxV > minV ? Math.max(0, Math.min(1, (numV - minV) / (maxV - minV))) : 0;
-      const arcR = Math.min(24, Math.max(14, Math.floor((w.height - 26) / 2)));
-      const cx = w.x + w.width - arcR - 18;
-      const cy = w.y + Math.round(w.height / 2) + 8;
+      const arcR = Math.min(28, Math.max(14, Math.floor((Math.min(w.width, w.height) - 44) / 2)));
+      const cx = w.x + Math.round(w.width / 2);
+      const cy = w.y + Math.round(w.height * 0.62);
       const endX = cx - arcR * Math.cos(Math.PI * ratio);
       const endY = cy - arcR * Math.sin(Math.PI * ratio);
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1" />`);
-      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="#0F172A" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <text x="${w.x + 10}" y="${valueY}" font-family="IBM Plex Mono, monospace" font-size="16" font-weight="700" fill="#0284C7">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`);
-      inner.push(`    <path d="M ${cx - arcR} ${cy} A ${arcR} ${arcR} 0 0 1 ${cx + arcR} ${cy}" fill="none" stroke="#E2E8F0" stroke-width="6" stroke-linecap="round" />`);
+      const fittedLbl = fitFontSizeToWidth(w.label, Math.max(24, w.width - 16), 11, 8, true);
+      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${theme.cardBg}" stroke="${theme.cardBorder}" stroke-width="1" />`);
+      inner.push(`    <text x="${cx}" y="${w.y + 17}" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="${fittedLbl}" font-weight="700" fill="${theme.textPrimary}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      inner.push(`    <path d="M ${cx - arcR} ${cy} A ${arcR} ${arcR} 0 0 1 ${cx + arcR} ${cy}" fill="none" stroke="${theme.panelBorder}" stroke-width="6" stroke-linecap="round" />`);
       if (ratio > 0.01) {
-        inner.push(`    <path d="M ${cx - arcR} ${cy} A ${arcR} ${arcR} 0 0 1 ${endX.toFixed(1)} ${endY.toFixed(1)}" fill="none" stroke="#0284C7" stroke-width="6" stroke-linecap="round" />`);
+        inner.push(`    <path d="M ${cx - arcR} ${cy} A ${arcR} ${arcR} 0 0 1 ${endX.toFixed(1)} ${endY.toFixed(1)}" fill="none" stroke="${theme.accentPrimary}" stroke-width="6" stroke-linecap="round" />`);
       }
-      inner.push(`    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#64748B">GAUGE</text>`);
+      inner.push(`    <text x="${cx}" y="${Math.min(w.y + w.height - 8, cy + 20)}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="14" font-weight="700" fill="${theme.accentPrimary}" clip-path="url(#${safeClipId})">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`);
     } else if (w.type === 'BAR_GRAPH') {
       const minV = w.min ?? 0;
       const maxV = w.max ?? 100;
       const numV = typeof rawVal === 'number' ? rawVal : Number(rawVal ?? minV) || minV;
       const ratio = maxV > minV ? Math.max(0, Math.min(1, (numV - minV) / (maxV - minV))) : 0;
-      const barW = Math.max(40, w.width - 20);
+      const fittedLbl = fitFontSizeToWidth(w.label, Math.max(24, w.width - 16), 11, 8, true);
+      const barW = Math.max(24, w.width - 20);
       const fillW = Math.round(barW * ratio);
-      const barY = Math.min(w.y + w.height - 20, w.y + 38);
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1" />`);
-      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="#0F172A" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <text x="${w.x + w.width - 10}" y="${w.y + 18}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="700" fill="#0284C7">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`);
-      inner.push(`    <rect x="${w.x + 10}" y="${barY}" width="${barW}" height="10" rx="3" fill="#E2E8F0" />`);
+      const barY = Math.min(w.y + w.height - 18, w.y + 42);
+      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${theme.cardBg}" stroke="${theme.cardBorder}" stroke-width="1" />`);
+      inner.push(`    <text x="${w.x + 10}" y="${w.y + 16}" font-family="IBM Plex Sans, sans-serif" font-size="${fittedLbl}" font-weight="700" fill="${theme.textPrimary}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      inner.push(`    <text x="${w.x + 10}" y="${w.y + 33}" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="700" fill="${theme.accentPrimary}" clip-path="url(#${safeClipId})">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`);
+      inner.push(`    <rect x="${w.x + 10}" y="${barY}" width="${barW}" height="10" rx="3" fill="${theme.panelBorder}" />`);
       if (fillW > 0) {
-        inner.push(`    <rect x="${w.x + 10}" y="${barY}" width="${fillW}" height="10" rx="3" fill="#0284C7" />`);
+        inner.push(`    <rect x="${w.x + 10}" y="${barY}" width="${fillW}" height="10" rx="3" fill="${theme.accentPrimary}" />`);
       }
-      inner.push(`    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#64748B">BAR_GRAPH</text>`);
     } else if (w.type === 'TREND_CHART') {
       const gx = w.x + 14;
       const gy = w.y + 28;
       const gw = Math.max(40, w.width - 28);
-      const gh = Math.max(30, w.height - 46);
+      const gh = Math.max(24, w.height - 40);
       const pts = [0, 0.2, 0.4, 0.6, 0.8, 1]
         .map((t, i) => {
           const px = gx + Math.round(t * gw);
@@ -682,55 +791,70 @@ export function renderScreenToSvg(
           return `${px},${py}`;
         })
         .join(' ');
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1" />`);
-      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="#0F172A" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <rect x="${gx}" y="${gy}" width="${gw}" height="${gh}" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="0.75" />`);
-      inner.push(`    <line x1="${gx}" y1="${gy + Math.round(gh / 2)}" x2="${gx + gw}" y2="${gy + Math.round(gh / 2)}" stroke="#E2E8F0" stroke-dasharray="3,3" />`);
-      inner.push(`    <polyline points="${pts}" fill="none" stroke="#0284C7" stroke-width="2" />`);
-      inner.push(`    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#64748B">TREND_CHART</text>`);
+      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${theme.cardBg}" stroke="${theme.cardBorder}" stroke-width="1" />`);
+      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="11.5" font-weight="700" fill="${theme.textPrimary}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      inner.push(`    <rect x="${gx}" y="${gy}" width="${gw}" height="${gh}" fill="${theme.canvasBg}" stroke="${theme.panelBorder}" stroke-width="0.75" />`);
+      inner.push(`    <line x1="${gx}" y1="${gy + Math.round(gh / 2)}" x2="${gx + gw}" y2="${gy + Math.round(gh / 2)}" stroke="${theme.panelBorder}" stroke-dasharray="3,3" />`);
+      inner.push(`    <polyline points="${pts}" fill="none" stroke="${theme.accentPrimary}" stroke-width="2" />`);
     } else if (w.type === 'DATA_TABLE') {
       const tx = w.x + 10;
       const ty = w.y + 26;
       const tw = Math.max(40, w.width - 20);
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1" />`);
-      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="#0F172A" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <rect x="${tx}" y="${ty}" width="${tw}" height="18" fill="#E2E8F0" />`);
-      inner.push(`    <rect x="${tx}" y="${ty + 18}" width="${tw}" height="18" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="0.5" />`);
-      inner.push(`    <text x="${tx + 6}" y="${ty + 31}" font-family="IBM Plex Mono, monospace" font-size="11" fill="#334155">${escapeXml(w.tagName ?? 'ROW')}: ${escapeXml(valueText)}</text>`);
-      inner.push(`    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#64748B">DATA_TABLE</text>`);
+      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${theme.cardBg}" stroke="${theme.cardBorder}" stroke-width="1" />`);
+      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="11.5" font-weight="700" fill="${theme.textPrimary}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      inner.push(`    <rect x="${tx}" y="${ty}" width="${tw}" height="18" fill="${theme.panelHeaderBg}" />`);
+      inner.push(`    <rect x="${tx}" y="${ty + 18}" width="${tw}" height="18" fill="${theme.canvasBg}" stroke="${theme.panelBorder}" stroke-width="0.5" />`);
+      inner.push(`    <text x="${tx + 6}" y="${ty + 31}" font-family="IBM Plex Mono, monospace" font-size="11" fill="${theme.textSecondary}" clip-path="url(#${safeClipId})">${escapeXml(w.tagName ?? 'ROW')}: ${escapeXml(valueText)}</text>`);
+    } else if (w.type === 'CAMERA_VIEW') {
+      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="#0F172A" stroke="#334155" stroke-width="1.25" />`);
+      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="11.5" font-weight="700" fill="#F8FAFC" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      inner.push(`    <text x="${w.x + Math.round(w.width / 2)}" y="${w.y + Math.round(w.height / 2) + 4}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="#94A3B8" clip-path="url(#${safeClipId})">LIVE STREAM</text>`);
     } else if (w.type === 'STATION' || w.type === 'CONVEYOR' || w.type === 'ACTUATOR' || w.type === 'PUMP' || w.type === 'VALVE' || w.type === 'TANK') {
       const gx = w.x + w.width - 34;
       const gy = w.y + Math.round(w.height / 2);
       const statusCol = isTruthy ? '#16A34A' : '#475569';
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="#FFFFFF" stroke="#64748B" stroke-width="1.25" />`);
-      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="700" fill="#0F172A" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <text x="${w.x + 10}" y="${valueY}" font-family="IBM Plex Mono, monospace" font-size="13" fill="#334155" clip-path="url(#${safeClipId})">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`);
+      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="4" fill="${theme.cardBg}" stroke="${theme.cardBorder}" stroke-width="1.25" />`);
+      if (w.type === 'STATION') {
+        inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="26" rx="4" fill="#334155" />`);
+        inner.push(`    <text x="${w.x + Math.round(w.width / 2)}" y="${w.y + 17}" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="${fitFontSizeToWidth(w.label, Math.max(30, w.width - 16), 11, 8, true)}" font-weight="700" fill="#F8FAFC" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      } else {
+        inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="${fitFontSizeToWidth(w.label, Math.max(30, w.width - 48), 11.5, 8, true)}" font-weight="700" fill="${theme.textPrimary}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+        inner.push(`    <text x="${w.x + 10}" y="${valueY}" font-family="IBM Plex Mono, monospace" font-size="12" fill="${theme.textSecondary}" clip-path="url(#${safeClipId})">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`);
+      }
       if (w.type === 'PUMP') {
-        inner.push(`    <circle cx="${gx}" cy="${gy}" r="13" fill="#F1F5F9" stroke="${statusCol}" stroke-width="2" />`);
+        inner.push(`    <circle cx="${gx}" cy="${gy}" r="13" fill="${theme.canvasBg}" stroke="${statusCol}" stroke-width="2" />`);
         inner.push(`    <polygon points="${gx - 5},${gy - 6} ${gx - 5},${gy + 6} ${gx + 7},${gy}" fill="${statusCol}" />`);
       } else if (w.type === 'VALVE') {
         inner.push(`    <polygon points="${gx - 12},${gy - 8} ${gx},${gy} ${gx - 12},${gy + 8}" fill="${statusCol}" />`);
         inner.push(`    <polygon points="${gx + 12},${gy - 8} ${gx},${gy} ${gx + 12},${gy + 8}" fill="${statusCol}" />`);
       } else if (w.type === 'TANK') {
-        inner.push(`    <rect x="${gx - 10}" y="${gy - 14}" width="20" height="28" rx="3" fill="#E2E8F0" stroke="#475569" stroke-width="1.5" />`);
-        inner.push(`    <rect x="${gx - 8}" y="${gy}" width="16" height="12" fill="#0284C7" />`);
+        inner.push(`    <rect x="${gx - 10}" y="${gy - 14}" width="20" height="28" rx="3" fill="${theme.panelBorder}" stroke="#475569" stroke-width="1.5" />`);
+        inner.push(`    <rect x="${gx - 8}" y="${gy}" width="16" height="12" fill="${theme.accentPrimary}" />`);
       } else if (w.type === 'CONVEYOR') {
-        inner.push(`    <rect x="${gx - 16}" y="${gy - 5}" width="32" height="10" rx="5" fill="#E2E8F0" stroke="${statusCol}" stroke-width="1.5" />`);
+        inner.push(`    <rect x="${gx - 16}" y="${gy - 5}" width="32" height="10" rx="5" fill="${theme.panelBorder}" stroke="${statusCol}" stroke-width="1.5" />`);
         inner.push(`    <circle cx="${gx - 10}" cy="${gy}" r="2.5" fill="${statusCol}" />`);
         inner.push(`    <circle cx="${gx + 10}" cy="${gy}" r="2.5" fill="${statusCol}" />`);
       } else {
-        inner.push(`    <rect x="${gx - 12}" y="${gy - 12}" width="24" height="24" rx="3" fill="#F1F5F9" stroke="${statusCol}" stroke-width="1.75" />`);
+        inner.push(`    <rect x="${gx - 12}" y="${gy - 12}" width="24" height="24" rx="3" fill="${theme.canvasBg}" stroke="${statusCol}" stroke-width="1.75" />`);
         inner.push(`    <circle cx="${gx}" cy="${gy}" r="5" fill="${isTruthy ? '#16A34A' : '#94A3B8'}" />`);
       }
-      inner.push(`    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#64748B">${escapeXml(w.type)}</text>`);
     } else {
-      const cardFill = w.visualRole === 'KPI_HERO' ? '#F0F9FF' : '#FFFFFF';
-      const cardStroke = w.visualRole === 'KPI_HERO' ? '#0284C7' : '#94A3B8';
-      const valSize = w.visualRole === 'KPI_HERO' ? 18 : 14;
-      inner.push(`    <rect x="${w.x}" y="${w.y}" width="${w.width}" height="${w.height}" rx="3" fill="${cardFill}" stroke="${cardStroke}" stroke-width="1" />`);
-      inner.push(`    <text x="${w.x + 10}" y="${w.y + 18}" font-family="IBM Plex Sans, sans-serif" font-size="11.5" font-weight="600" fill="#0F172A" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
-      inner.push(`    <text x="${w.x + 10}" y="${valueY}" font-family="IBM Plex Mono, monospace" font-size="${valSize}" font-weight="600" fill="#334155" clip-path="url(#${safeClipId})">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`);
-      inner.push(`    <text x="${w.x + w.width - 8}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#64748B">${escapeXml(String(w.type))}</text>`);
+      const cardCols = getRoleCardColors(w.visualRole, theme);
+      const cardFill = normalizeHexColor(typeof w.props?.backgroundColor === 'string' ? w.props.backgroundColor : undefined) ?? cardCols.fill;
+      const cardStroke = cardCols.border;
+      const lblFg = normalizeHexColor(typeof w.props?.labelColor === 'string' ? w.props.labelColor : undefined) ?? surface.secondaryTextColor;
+      const valFg = normalizeHexColor(typeof w.props?.color === 'string' ? w.props.color : undefined) ?? cardCols.valueColor;
+      const labelH = 18;
+      const boxH = Math.max(20, w.height - labelH);
+      const fittedLbl = fitFontSizeToWidth(w.label, Math.max(24, w.width - 8), typeof w.props?.fontSize === 'number' ? w.props.fontSize : 10, 8, true);
+      const valSize = w.visualRole === 'KPI_HERO' ? 16 : 13;
+      inner.push(`    <text x="${w.x + 2}" y="${w.y + 13}" font-family="IBM Plex Sans, sans-serif" font-size="${fittedLbl}" font-weight="700" fill="${lblFg}" clip-path="url(#${safeClipId})">${escapeXml(w.label)}</text>`);
+      inner.push(`    <rect x="${w.x}" y="${w.y + labelH}" width="${w.width}" height="${boxH}" rx="4" fill="${cardFill}" stroke="${cardStroke}" stroke-width="1.25" />`);
+      inner.push(`    <text x="${w.x + Math.round(w.width / 2)}" y="${w.y + labelH + Math.round(boxH / 2) + Math.round(valSize * 0.35)}" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="${valSize}" font-weight="700" fill="${valFg}" clip-path="url(#${safeClipId})">${escapeXml(valueText)}${w.unit ? ' ' + escapeXml(w.unit) : ''}</text>`);
+    }
+
+    if (showDebug && w.type !== 'GROUP_PANEL') {
+      inner.push(`    <text x="${w.x + w.width - 4}" y="${badgeY}" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="8" fill="#64748B" opacity="0.85">${escapeXml(String(w.type))}</text>`);
     }
 
     return [

@@ -144,7 +144,7 @@ function makeSeedProject(): HaiwellProject {
 
   const mainScreen = generateAutoLayoutScreen({
     screenId: 'scr_chiller_overview',
-    name: 'Chiller Plant Overview (ISA-101)',
+    name: 'Chiller Plant Overview',
     width: 1280,
     height: 800,
     layoutStandard: 'ISA_101_HIGH_PERFORMANCE',

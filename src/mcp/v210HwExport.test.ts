@@ -111,7 +111,34 @@ test('v2.10.0: haiwell_project_export_hwexport generates valid <HwExportModel> X
   const winDocSection = data.xml.slice(data.xml.indexOf('<DicWinAndDoc>'), data.xml.indexOf('</DicWinAndDoc>'));
   assert.ok(!winDocSection.includes('id=&quot;HWIDone&quot;'), 'Shared HWIDone gradient IDs in WindowDocument must be uniquely prefixed per widget');
 
-  // Verify PNG MD5s & inner SVG XML parsing using Python ElementTree
+  // Verify PNG magic bytes, MD5s, PicMd5 cross-references & inner SVG XML natively in Node.js
+  // (plus ElementTree cross-check via python3 or python when available on PATH)
+  const picMap = new Map<string, Buffer>();
+  const picRe = /<SerializableDictionary>\s*<key>\s*<string>([a-f0-9]{32})<\/string>\s*<\/key>\s*<value>\s*<windowDocumentPicture>[\s\S]*?<SourcePicture>([^<]+)<\/SourcePicture>/g;
+  let m: RegExpExecArray | null;
+  while ((m = picRe.exec(data.xml)) !== null) {
+    const [, md5, b64] = m;
+    const raw = Buffer.from(b64.trim(), 'base64');
+    assert.deepEqual([...raw.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    assert.equal(crypto.createHash('md5').update(raw).digest('hex'), md5);
+    picMap.set(md5, raw);
+  }
+  assert.ok(picMap.size > 0, 'Expected at least one embedded PNG in DicSymPic');
+
+  const libRe = /<PicMd5>([a-f0-9]{32})<\/PicMd5>/g;
+  while ((m = libRe.exec(data.xml)) !== null) {
+    assert.ok(picMap.has(m[1]), `Missing PicMd5 ${m[1]} in DicSymPic`);
+  }
+
+  const docMatch = /<WindowDocument>[\s\S]*?<Document>([\s\S]*?)<\/Document>/.exec(data.xml);
+  assert.ok(docMatch, 'Expected WindowDocument/Document');
+  const unescapedSvg = docMatch[1]
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+  assert.ok(unescapedSvg.includes('<svg ') && unescapedSvg.includes('</svg>'));
+
   const tmpXml = path.join(os.tmpdir(), `hwexp_test_${Date.now()}.hwExport`);
   fs.writeFileSync(tmpXml, data.xml, 'utf8');
   try {
@@ -136,8 +163,16 @@ svg_root = ET.fromstring(docs[0].text.encode("utf-8"))
 assert svg_root.tag.endswith("svg")
 print("OK_PY_VERIFY", len(pics), len(list(svg_root)))
 `;
-    const out = execFileSync('python', ['-c', pyCheck, tmpXml], { encoding: 'utf8' });
-    assert.ok(out.includes('OK_PY_VERIFY'));
+    for (const pyBin of ['python3', 'python']) {
+      try {
+        const out = execFileSync(pyBin, ['-c', pyCheck, tmpXml], { encoding: 'utf8' });
+        assert.ok(out.includes('OK_PY_VERIFY'));
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+        throw err;
+      }
+    }
   } finally {
     fs.rmSync(tmpXml, { force: true });
   }

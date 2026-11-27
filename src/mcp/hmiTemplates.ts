@@ -1,4 +1,5 @@
-import type { HmiPipeRoute, HmiScreen, HmiVisualRole, HmiWidget } from './types';
+import { getGroupPanelHeaderHeight, resolveScreenTheme } from './hmiDesignSystem';
+import type { HmiPipeRoute, HmiScreen, HmiThemeId, HmiVisualRole, HmiWidget } from './types';
 
 export type HmiTemplateKind =
   | 'INDUSTRIAL_LINE_OVERVIEW'
@@ -53,11 +54,24 @@ export interface TemplateTransferItem {
   conveyorTagName?: string;
 }
 
+export interface TemplatePanelTitles {
+  left?: string;
+  middle?: string;
+  right?: string;
+  inputs?: string;
+  outputs?: string;
+  faults?: string;
+  alarms?: string;
+  history?: string;
+}
+
 export interface InstantiateTemplateInput {
   template: HmiTemplateKind;
   screenId: string;
   name: string;
   title: string;
+  themeId?: HmiThemeId;
+  panelTitles?: TemplatePanelTitles;
   width?: number;
   height?: number;
   eStopTag?: string;
@@ -92,6 +106,26 @@ export interface InstantiateTemplateInput {
   subtitle?: string;
   brandingLogos?: { base64: string; x: number; y: number; width: number; height: number }[];
   hubNavCards?: TemplateNavTab[];
+}
+
+export interface InstantiateTemplateResult {
+  screen: HmiScreen;
+  warnings: string[];
+}
+
+function takeWithWarning<T>(
+  items: T[] | undefined,
+  max: number,
+  fieldName: string,
+  warnings: string[]
+): T[] {
+  const list = items ?? [];
+  if (list.length > max) {
+    warnings.push(
+      `Template truncated "${fieldName}" from ${list.length} items to max ${max} slots (${list.length - max} omitted).`
+    );
+  }
+  return list.slice(0, max);
 }
 
 function makeHeader(
@@ -140,8 +174,8 @@ function makeHeader(
   return out;
 }
 
-function makeNavBar(key: string, tabs: TemplateNavTab[] = []): HmiWidget[] {
-  const list = tabs.slice(0, 6);
+function makeNavBar(key: string, tabs: TemplateNavTab[] | undefined, warnings: string[]): HmiWidget[] {
+  const list = takeWithWarning(tabs, 6, 'navTabs', warnings);
   if (list.length === 0) return [];
   const totalW = 996;
   const gap = 8;
@@ -162,41 +196,181 @@ function makeNavBar(key: string, tabs: TemplateNavTab[] = []): HmiWidget[] {
   }));
 }
 
+const SCALE_INTERACTIVE_TYPES = new Set(['NAV_BAR', 'BIT_BUTTON', 'NUMERIC_INPUT']);
+
 function scaleScreen(screen: HmiScreen, targetW: number, targetH: number): HmiScreen {
   if (targetW === 1024 && targetH === 600) return screen;
   const sx = targetW / 1024;
-  const sy = targetH / 600;
+  const hasBottomNav = screen.widgets.some((w) => w.type === 'NAV_BAR' && w.y >= 520);
+  const rawNavH = Math.round(46 * (targetH / 600));
+  const preserveTouchNav = hasBottomNav && rawNavH < 44 && targetH >= 320;
+  const navH = preserveTouchNav ? 44 : Math.max(24, rawNavH);
+  const navY = preserveTouchNav ? targetH - navH - 6 : Math.round(540 * (targetH / 600));
+  const bodySy = preserveTouchNav ? (navY - 8) / 532 : targetH / 600;
+  const fontScale = Math.min(sx, bodySy);
+  const enforceTouchTargets = targetW >= 480 && targetH >= 320;
+
+  // Map each non-panel widget to its original enclosing GROUP_PANEL so scaling preserves header clearance and panel bounds
+  const origPanels = screen.widgets.filter((w) => w.type === 'GROUP_PANEL');
+  const origPanelById = new Map<string, HmiWidget>(origPanels.map((p) => [p.id, p]));
+  const origParentById = new Map<string, string>();
+  for (const w of screen.widgets) {
+    if (w.type === 'GROUP_PANEL') continue;
+    const cx = w.x + w.width / 2;
+    const cy = w.y + w.height / 2;
+    let bestId: string | null = null;
+    let bestArea = Infinity;
+    for (const p of origPanels) {
+      if (cx >= p.x && cx <= p.x + p.width && cy >= p.y && cy <= p.y + p.height) {
+        const area = p.width * p.height;
+        if (area < bestArea) {
+          bestArea = area;
+          bestId = p.id;
+        }
+      }
+    }
+    if (bestId) origParentById.set(w.id, bestId);
+  }
+
+  const scaleProps = (w: HmiWidget): HmiWidget['props'] => {
+    if (!w.props) return undefined;
+    const nextProps = { ...w.props };
+    if (typeof nextProps.fontSize === 'number') {
+      nextProps.fontSize = Math.max(8, Number((nextProps.fontSize * fontScale).toFixed(1)));
+    }
+    return nextProps;
+  };
+
+  // Pre-compute scaled GROUP_PANEL bounds and header heights first so child widgets map cleanly into scaled panel bodies
+  const scaledPanelById = new Map<string, HmiWidget>();
+  for (const p of origPanels) {
+    const width = Math.min(targetW, Math.max(24, Math.round(p.width * sx)));
+    const height = Math.min(targetH, Math.max(20, Math.round(p.height * bodySy)));
+    const x = Math.max(0, Math.min(Math.round(p.x * sx), targetW - width));
+    const y = Math.max(0, Math.min(Math.round(p.y * bodySy), targetH - height));
+    scaledPanelById.set(p.id, { ...p, x, y, width, height });
+  }
+
+  // First pass: scale all widgets (mapping titled GROUP_PANEL children proportionally inside the scaled body below the header)
+  const scaledWidgets = screen.widgets.map((w) => {
+    const nextProps = scaleProps(w);
+    if (w.type === 'GROUP_PANEL') {
+      const sp = scaledPanelById.get(w.id)!;
+      return {
+        ...w,
+        ...(nextProps ? { props: nextProps } : {}),
+        x: sp.x,
+        y: sp.y,
+        width: sp.width,
+        height: sp.height,
+      };
+    }
+
+    if (preserveTouchNav && w.type === 'NAV_BAR' && w.y >= 520) {
+      const width = Math.min(targetW, Math.max(44, Math.round(w.width * sx)));
+      const x = Math.max(0, Math.min(Math.round(w.x * sx), targetW - width));
+      const y = Math.max(0, Math.min(navY, targetH - navH));
+      return {
+        ...w,
+        ...(nextProps ? { props: nextProps } : {}),
+        x,
+        y,
+        width,
+        height: navH,
+      };
+    }
+
+    let width = Math.min(targetW, Math.max(24, Math.round(w.width * sx)));
+    let height = Math.min(targetH, Math.max(20, Math.round(w.height * bodySy)));
+    let x = Math.max(0, Math.min(Math.round(w.x * sx), targetW - width));
+    let y = Math.max(0, Math.min(Math.round(w.y * bodySy), targetH - height));
+
+    const parentId = origParentById.get(w.id);
+    if (parentId) {
+      const origP = origPanelById.get(parentId)!;
+      const scaledP = scaledPanelById.get(parentId)!;
+      const origHdr = getGroupPanelHeaderHeight(origP);
+      const scaledHdr = getGroupPanelHeaderHeight(scaledP);
+      if (origHdr > 0 && scaledHdr > 0 && w.y >= origP.y + origHdr) {
+        const origBodyTop = origP.y + origHdr;
+        const origBodyH = Math.max(24, origP.height - origHdr);
+        const scaledBodyTop = scaledP.y + scaledHdr;
+        const scaledBodyH = Math.max(24, scaledP.height - scaledHdr);
+        const localSy = scaledBodyH / origBodyH;
+        height = Math.min(scaledBodyH, Math.max(20, Math.round(w.height * localSy)));
+        y = Math.max(
+          scaledBodyTop,
+          Math.min(scaledBodyTop + Math.round((w.y - origBodyTop) * localSy), scaledP.y + scaledP.height - height)
+        );
+      }
+    }
+
+    return {
+      ...w,
+      ...(nextProps ? { props: nextProps } : {}),
+      x,
+      y,
+      width,
+      height,
+    };
+  });
+
+  // Second pass: protect interactive touch targets >= 44px clamped cleanly within enclosing panel body or screen
+  if (enforceTouchTargets) {
+    for (const w of scaledWidgets) {
+      if (w.type === 'GROUP_PANEL') continue;
+      if (!SCALE_INTERACTIVE_TYPES.has(w.type) && !w.writeEnabled) continue;
+      const pId = origParentById.get(w.id);
+      const bounds = pId ? scaledPanelById.get(pId) : undefined;
+      const hdrH = bounds ? getGroupPanelHeaderHeight(bounds) : 0;
+      const minX = bounds ? bounds.x + 2 : 0;
+      const maxX = bounds ? bounds.x + bounds.width - 2 : targetW;
+      const minY = bounds ? bounds.y + (hdrH > 0 ? hdrH + 2 : 2) : 0;
+      const maxY = bounds ? bounds.y + bounds.height - 2 : targetH;
+      const maxW = Math.max(24, maxX - minX);
+      const maxH = Math.max(20, maxY - minY);
+
+      if (w.width < 44 && maxW >= 44) {
+        w.width = 44;
+      }
+      if (w.height < 44 && maxH >= 44) {
+        w.height = 44;
+      }
+      w.x = Math.max(minX, Math.min(w.x, Math.max(minX, maxX - w.width)));
+      w.y = Math.max(minY, Math.min(w.y, Math.max(minY, maxY - w.height)));
+    }
+  }
+
   return {
     ...screen,
     width: targetW,
     height: targetH,
-    widgets: screen.widgets.map((w) => ({
-      ...w,
-      x: Math.round(w.x * sx),
-      y: Math.round(w.y * sy),
-      width: Math.max(24, Math.round(w.width * sx)),
-      height: Math.max(20, Math.round(w.height * sy)),
-    })),
+    widgets: scaledWidgets,
     pipes: screen.pipes?.map((p) => ({
       ...p,
       waypoints: p.waypoints.map((pt) => ({
         x: Math.round(pt.x * sx),
-        y: Math.round(pt.y * sy),
+        y: Math.round(pt.y * bodySy),
       })),
     })),
   };
 }
 
+function makeIndicatorProps(item: TemplateIndicatorItem): Record<string, string | number | boolean> | undefined {
+  return item.invertDisplay ? { invertDisplay: true } : undefined;
+}
+
 /**
- * Instantiates a hard-coded, zero-overlap ISA-101 HMI screen template.
- * AI agents supply only semantic bindings (titles, tags, stations, nav tabs);
- * all coordinates, margins, and card paddings are guaranteed pixel-aligned.
+ * Instantiates a pixel-aligned HMI screen template and returns truncation warnings
+ * when supplied arrays exceed the template's visual slot limits.
  */
-export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScreen {
+export function instantiateHmiTemplateDetailed(input: InstantiateTemplateInput): InstantiateTemplateResult {
+  const warnings: string[] = [];
   const targetW = input.width ?? 1024;
   const targetH = input.height ?? 600;
   const key = input.screenId.replace(/[^a-zA-Z0-9_]/g, '_');
   const now = new Date().toISOString();
+  const theme = resolveScreenTheme({ themeId: input.themeId, backgroundColor: '#F1F5F9' });
   const headerTag = input.eStopTag ?? input.commTagName;
   const headerLabel = input.eStopTag ? 'E-STOP OK' : (input.commLabel ?? 'PLC ONLINE');
   const headerRole = input.eStopTag ? 'DANGER_ACTION' : 'STATUS_READONLY';
@@ -207,9 +381,16 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
   const pipes: HmiPipeRoute[] = [];
 
   if (input.template === 'INDUSTRIAL_LINE_OVERVIEW') {
-    // 3 equal-height cards: Left (x=14..324), Center (x=338..682), Right (x=696..1010)
-    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: 'LINE COMMANDS & PLC COMM', x: 14, y: 62, width: 310, height: 466 });
-    const cmds = (input.commands ?? []).slice(0, 3);
+    widgets.push({
+      id: `${key}_p_left`,
+      type: 'GROUP_PANEL',
+      label: input.panelTitles?.left ?? 'LINE COMMANDS & PLC COMM',
+      x: 14,
+      y: 62,
+      width: 310,
+      height: 466,
+    });
+    const cmds = takeWithWarning(input.commands, 3, 'commands', warnings);
     cmds.forEach((c, i) => {
       widgets.push({
         id: `${key}_cmd_${i}`,
@@ -225,21 +406,24 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
 
-    const comms = (input.commIndicators ?? []).slice(0, 4);
+    const comms = takeWithWarning(input.commIndicators, 4, 'commIndicators', warnings);
     comms.forEach((cm, i) => {
+      const indProps = makeIndicatorProps(cm);
       widgets.push({
         id: `${key}_comm_${i}`,
         type: 'BIT_LAMP',
         label: cm.label,
         tagName: cm.tagName,
+        ...(cm.role ? { visualRole: cm.role } : {}),
         x: 28,
         y: 204 + i * 40,
         width: 282,
         height: 34,
+        ...(indProps ? { props: indProps } : {}),
       });
     });
 
-    const leftReads = (input.leftReadouts ?? []).slice(0, 2);
+    const leftReads = takeWithWarning(input.leftReadouts, 2, 'leftReadouts', warnings);
     leftReads.forEach((lr, i) => {
       widgets.push({
         id: `${key}_lr_${i}`,
@@ -248,6 +432,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         tagName: lr.tagName,
         unit: lr.unit,
         precision: lr.precision,
+        ...(lr.role ? { visualRole: lr.role } : {}),
         x: 28,
         y: 374 + i * 72,
         width: 282,
@@ -255,7 +440,15 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
 
-    widgets.push({ id: `${key}_p_mid`, type: 'GROUP_PANEL', label: 'PRODUCTION KPIS & YIELD', x: 338, y: 62, width: 344, height: 466 });
+    widgets.push({
+      id: `${key}_p_mid`,
+      type: 'GROUP_PANEL',
+      label: input.panelTitles?.middle ?? 'PRODUCTION KPIS & YIELD',
+      x: 338,
+      y: 62,
+      width: 344,
+      height: 466,
+    });
     if (input.gauge) {
       widgets.push({
         id: `${key}_gauge`,
@@ -288,7 +481,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     }
 
-    const heros = (input.heroKpis ?? []).slice(0, 2);
+    const heros = takeWithWarning(input.heroKpis, 2, 'heroKpis', warnings);
     heros.forEach((hk, i) => {
       widgets.push({
         id: `${key}_hero_${i}`,
@@ -305,7 +498,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
 
-    const cycs = (input.stationCycles ?? []).slice(0, 3);
+    const cycs = takeWithWarning(input.stationCycles, 3, 'stationCycles', warnings);
     cycs.forEach((sc, i) => {
       widgets.push({
         id: `${key}_cyc_${i}`,
@@ -321,18 +514,29 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
 
-    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: 'ACTIVE ALARMS & STATION I/O', x: 696, y: 62, width: 314, height: 466 });
-    const ios = (input.ioIndicators ?? []).slice(0, 3);
+    widgets.push({
+      id: `${key}_p_right`,
+      type: 'GROUP_PANEL',
+      label: input.panelTitles?.right ?? 'ACTIVE ALARMS & STATION I/O',
+      x: 696,
+      y: 62,
+      width: 314,
+      height: 466,
+    });
+    const ios = takeWithWarning(input.ioIndicators, 3, 'ioIndicators', warnings);
     ios.forEach((io, i) => {
+      const indProps = makeIndicatorProps(io);
       widgets.push({
         id: `${key}_io_${i}`,
         type: 'BIT_LAMP',
         label: io.label,
         tagName: io.tagName,
+        ...(io.role ? { visualRole: io.role } : {}),
         x: 710,
         y: 100 + i * 40,
         width: 286,
         height: 34,
+        ...(indProps ? { props: indProps } : {}),
       });
     });
     if (input.includeAlarmTable !== false) {
@@ -347,7 +551,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     }
   } else if (input.template === 'MULTI_STATION_PROCESS_FLOW') {
-    const stations = (input.stations ?? []).slice(0, 4);
+    const stations = takeWithWarning(input.stations, 4, 'stations', warnings);
     const n = Math.max(2, stations.length);
     const gap = n <= 3 ? 136 : 76;
     const marginX = 16;
@@ -390,34 +594,45 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
           props: { nativeSymbol: st.secondaryIcon },
         });
       }
-      const stIos = (st.ioIndicators ?? []).slice(0, 2);
-      stIos.forEach((io, j) => {
-        const halfW = st.kpi ? Math.floor((stW - 28) / 2) : Math.floor((stW - 28) / Math.max(1, stIos.length));
-        widgets.push({
-          id: `${key}_st_${idx}_io_${j}`,
-          type: 'BIT_LAMP',
-          label: io.label,
-          tagName: io.tagName,
-          x: sx + 10 + j * (halfW + 8),
-          y: 306,
-          width: halfW,
-          height: 58,
+
+      // Partition bottom slot evenly across all ioIndicators + optional kpi so 2 indicators + kpi never collide
+      const stIos = takeWithWarning(st.ioIndicators, 2, `stations[${idx}].ioIndicators`, warnings);
+      const totalSlots = stIos.length + (st.kpi ? 1 : 0);
+      if (totalSlots > 0) {
+        const innerPad = 10;
+        const slotGap = 6;
+        const slotW = Math.floor((stW - innerPad * 2 - slotGap * (totalSlots - 1)) / totalSlots);
+        stIos.forEach((io, j) => {
+          const indProps = makeIndicatorProps(io);
+          widgets.push({
+            id: `${key}_st_${idx}_io_${j}`,
+            type: 'BIT_LAMP',
+            label: io.label,
+            tagName: io.tagName,
+            ...(io.role ? { visualRole: io.role } : {}),
+            x: sx + innerPad + j * (slotW + slotGap),
+            y: 306,
+            width: slotW,
+            height: 58,
+            ...(indProps ? { props: indProps } : {}),
+          });
         });
-      });
-      if (st.kpi) {
-        const halfW = Math.floor((stW - 28) / 2);
-        widgets.push({
-          id: `${key}_st_${idx}_kpi`,
-          type: 'NUMERIC_DISPLAY',
-          label: st.kpi.label,
-          tagName: st.kpi.tagName,
-          unit: st.kpi.unit,
-          precision: st.kpi.precision,
-          x: sx + 10 + halfW + 8,
-          y: 304,
-          width: halfW,
-          height: 60,
-        });
+        if (st.kpi) {
+          const kpiSlotIdx = stIos.length;
+          widgets.push({
+            id: `${key}_st_${idx}_kpi`,
+            type: 'NUMERIC_DISPLAY',
+            label: st.kpi.label,
+            tagName: st.kpi.tagName,
+            unit: st.kpi.unit,
+            precision: st.kpi.precision,
+            ...(st.kpi.role ? { visualRole: st.kpi.role } : {}),
+            x: sx + innerPad + kpiSlotIdx * (slotW + slotGap),
+            y: 304,
+            width: slotW,
+            height: 60,
+          });
+        }
       }
 
       if (idx < n - 1) {
@@ -449,9 +664,16 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       }
     });
 
-    // Bottom Interlock & Cycle Bar
-    widgets.push({ id: `${key}_bot_panel`, type: 'GROUP_PANEL', label: 'LINE INTERLOCK & QUICK CONTROL', x: 16, y: 390, width: 992, height: 138 });
-    (input.quickCommands ?? []).slice(0, 3).forEach((qc, i) => {
+    widgets.push({
+      id: `${key}_bot_panel`,
+      type: 'GROUP_PANEL',
+      label: input.panelTitles?.left ?? 'LINE INTERLOCK & QUICK CONTROL',
+      x: 16,
+      y: 390,
+      width: 992,
+      height: 138,
+    });
+    takeWithWarning(input.quickCommands, 3, 'quickCommands', warnings).forEach((qc, i) => {
       widgets.push({
         id: `${key}_qc_${i}`,
         type: 'BIT_BUTTON',
@@ -465,7 +687,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         height: 88,
       });
     });
-    const reads = (input.bottomReadouts ?? []).slice(0, 4);
+    const reads = takeWithWarning(input.bottomReadouts, 4, 'bottomReadouts', warnings);
     const readAreaX = 336;
     const readW = reads.length > 0 ? Math.floor((656 - 12 * (reads.length - 1)) / reads.length) : 150;
     reads.forEach((rd, i) => {
@@ -484,16 +706,16 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
   } else if (input.template === 'ALARMS_TRENDS_DIAGNOSTICS') {
-    widgets.push({ id: `${key}_p_alm`, type: 'GROUP_PANEL', label: 'PROCESS & SAFETY ALARMS', x: 14, y: 62, width: 490, height: 256 });
+    widgets.push({ id: `${key}_p_alm`, type: 'GROUP_PANEL', label: input.panelTitles?.left ?? 'PROCESS & SAFETY ALARMS', x: 14, y: 62, width: 490, height: 256 });
     widgets.push({ id: `${key}_alm`, type: 'ALARM_BANNER', label: 'Alarm Table', x: 24, y: 98, width: 470, height: 208 });
 
-    widgets.push({ id: `${key}_p_trd`, type: 'GROUP_PANEL', label: 'REAL-TIME CYCLE TIME TREND', x: 518, y: 62, width: 492, height: 256 });
+    widgets.push({ id: `${key}_p_trd`, type: 'GROUP_PANEL', label: input.panelTitles?.middle ?? 'REAL-TIME CYCLE TIME TREND', x: 518, y: 62, width: 492, height: 256 });
     widgets.push({ id: `${key}_trd`, type: 'TREND_CHART', label: 'Cycle Time Trend', tagName: input.trendTagName, x: 528, y: 98, width: 472, height: 208 });
 
-    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: 'HISTORICAL DATA & BATCH LOG', x: 14, y: 328, width: 644, height: 200 });
+    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: input.panelTitles?.history ?? 'HISTORICAL DATA & BATCH LOG', x: 14, y: 328, width: 644, height: 200 });
     widgets.push({ id: `${key}_hist`, type: 'DATA_TABLE', label: 'History Table', x: 24, y: 364, width: 624, height: 152 });
 
-    widgets.push({ id: `${key}_p_seq`, type: 'GROUP_PANEL', label: 'CLOUD LOGGER COUNTERS', x: 672, y: 328, width: 338, height: 200 });
+    widgets.push({ id: `${key}_p_seq`, type: 'GROUP_PANEL', label: input.panelTitles?.right ?? 'DATA LOGGER COUNTERS', x: 672, y: 328, width: 338, height: 200 });
     if (input.runIdTagName) {
       widgets.push({
         id: `${key}_run_id`,
@@ -506,7 +728,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         height: 64,
       });
     }
-    const seqs = (input.sequenceCounters ?? []).slice(0, 3);
+    const seqs = takeWithWarning(input.sequenceCounters, 3, 'sequenceCounters', warnings);
     seqs.forEach((sq, i) => {
       widgets.push({
         id: `${key}_seq_${i}`,
@@ -520,24 +742,27 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
   } else if (input.template === 'STATION_IO_DETAIL') {
-    widgets.push({ id: `${key}_p_in`, type: 'GROUP_PANEL', label: 'FIELD SENSOR INPUTS (READ ONLY)', x: 14, y: 62, width: 490, height: 466 });
-    (input.inputs ?? []).slice(0, 8).forEach((inp, i) => {
+    widgets.push({ id: `${key}_p_in`, type: 'GROUP_PANEL', label: input.panelTitles?.inputs ?? 'FIELD SENSOR INPUTS (READ ONLY)', x: 14, y: 62, width: 490, height: 466 });
+    takeWithWarning(input.inputs, 8, 'inputs', warnings).forEach((inp, i) => {
       const col = i % 2;
       const row = Math.floor(i / 2);
+      const indProps = makeIndicatorProps(inp);
       widgets.push({
         id: `${key}_in_${i}`,
         type: 'BIT_LAMP',
         label: inp.label,
         tagName: inp.tagName,
+        ...(inp.role ? { visualRole: inp.role } : {}),
         x: 28 + col * 236,
         y: 108 + row * 102,
         width: 224,
         height: 44,
+        ...(indProps ? { props: indProps } : {}),
       });
     });
 
-    widgets.push({ id: `${key}_p_out`, type: 'GROUP_PANEL', label: 'ACTUATOR OUTPUTS / MANUAL TEST', x: 518, y: 62, width: 492, height: 466 });
-    (input.outputs ?? []).slice(0, 8).forEach((outp, i) => {
+    widgets.push({ id: `${key}_p_out`, type: 'GROUP_PANEL', label: input.panelTitles?.outputs ?? 'ACTUATOR OUTPUTS / MANUAL TEST', x: 518, y: 62, width: 492, height: 466 });
+    takeWithWarning(input.outputs, 8, 'outputs', warnings).forEach((outp, i) => {
       const col = i % 4;
       const row = Math.floor(i / 4);
       widgets.push({
@@ -554,8 +779,8 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
   } else if (input.template === 'STATION_IO_MONITOR') {
-    widgets.push({ id: `${key}_p_ctrl`, type: 'GROUP_PANEL', label: 'STATION CONTROL', x: 12, y: 62, width: 196, height: 466 });
-    (input.outputs ?? []).slice(0, 3).forEach((cmd, i) => {
+    widgets.push({ id: `${key}_p_ctrl`, type: 'GROUP_PANEL', label: input.panelTitles?.left ?? 'STATION CONTROL', x: 12, y: 62, width: 196, height: 466 });
+    takeWithWarning(input.outputs, 3, 'outputs', warnings).forEach((cmd, i) => {
       widgets.push({
         id: `${key}_cmd_${i}`,
         type: 'BIT_BUTTON',
@@ -583,8 +808,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     }
 
-    widgets.push({ id: `${key}_p_in`, type: 'GROUP_PANEL', label: 'DIGITAL INPUTS (SENSORS X0-X7)', x: 218, y: 62, width: 390, height: 466 });
-    (input.inputs ?? []).slice(0, 8).forEach((inp, i) => {
+    widgets.push({ id: `${key}_p_in`, type: 'GROUP_PANEL', label: input.panelTitles?.inputs ?? 'DIGITAL INPUTS', x: 218, y: 62, width: 390, height: 466 });
+    takeWithWarning(input.inputs, 8, 'inputs', warnings).forEach((inp, i) => {
+      const indProps = makeIndicatorProps(inp);
       widgets.push({
         id: `${key}_in_${i}`,
         type: 'BIT_LAMP',
@@ -595,12 +821,13 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         y: 100 + i * 52,
         width: 366,
         height: 42,
-        ...(inp.invertDisplay ? { props: { invertDisplay: true } } : {}),
+        ...(indProps ? { props: indProps } : {}),
       });
     });
 
-    widgets.push({ id: `${key}_p_out`, type: 'GROUP_PANEL', label: 'DIGITAL OUTPUTS (COILS Y0-Y7)', x: 618, y: 62, width: 394, height: 466 });
-    (input.outputIndicators ?? []).slice(0, 8).forEach((outp, i) => {
+    widgets.push({ id: `${key}_p_out`, type: 'GROUP_PANEL', label: input.panelTitles?.outputs ?? 'DIGITAL OUTPUTS', x: 618, y: 62, width: 394, height: 466 });
+    takeWithWarning(input.outputIndicators, 8, 'outputIndicators', warnings).forEach((outp, i) => {
+      const indProps = makeIndicatorProps(outp);
       widgets.push({
         id: `${key}_out_ind_${i}`,
         type: 'BIT_LAMP',
@@ -611,10 +838,11 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         y: 100 + i * 52,
         width: 370,
         height: 42,
+        ...(indProps ? { props: indProps } : {}),
       });
     });
   } else if (input.template === 'MAIN_NAVIGATION_HUB') {
-    // White branding header with university logos + alarm pill + dark clock pill
+    // Top branding banner with optional logos, title/subtitle, alarm indicator, and clock card
     widgets.push({
       id: `${key}_brand_bg`,
       type: 'GROUP_PANEL',
@@ -623,9 +851,10 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       y: 8,
       width: 854,
       height: 68,
-      props: { theme: 'light_banner' },
+      props: { theme: 'light_banner', backgroundColor: theme.panelBg },
     });
-    (input.brandingLogos ?? []).slice(0, 3).forEach((logo, idx) => {
+    const logos = takeWithWarning(input.brandingLogos, 3, 'brandingLogos', warnings);
+    logos.forEach((logo, idx) => {
       widgets.push({
         id: `${key}_logo_${idx}`,
         type: 'LABEL',
@@ -637,26 +866,34 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         props: { customImageBase64: logo.base64 },
       });
     });
+    const rightMostLogoEdge = logos.reduce((maxRight, l) => Math.max(maxRight, l.x + l.width), 0);
+    const titleX = logos.length > 0 ? Math.min(438, Math.max(24, Math.round(rightMostLogoEdge + 16))) : 24;
+    const titleRightLimit = input.commTagName ? 730 : 850;
+    const titleW = Math.max(160, titleRightLimit - titleX);
+    const subtitleText = (input.subtitle ?? '').trim();
+
     widgets.push({
       id: `${key}_hub_title`,
       type: 'LABEL',
       label: input.title,
-      x: 438,
-      y: 17,
-      width: 288,
+      x: titleX,
+      y: subtitleText ? 17 : 28,
+      width: titleW,
       height: 24,
-      props: { color: '#0F172A', fontSize: 13, bold: true, align: 'left' },
+      props: { color: theme.textPrimary, fontSize: 13, bold: true, align: 'left' },
     });
-    widgets.push({
-      id: `${key}_hub_sub`,
-      type: 'LABEL',
-      label: input.subtitle ?? 'PETRA CHRISTIAN UNIV. - TEKNIK MESIN',
-      x: 438,
-      y: 43,
-      width: 288,
-      height: 18,
-      props: { color: '#475569', fontSize: 10, bold: false, align: 'left' },
-    });
+    if (subtitleText) {
+      widgets.push({
+        id: `${key}_hub_sub`,
+        type: 'LABEL',
+        label: subtitleText,
+        x: titleX,
+        y: 43,
+        width: titleW,
+        height: 18,
+        props: { color: theme.textSecondary, fontSize: 10, bold: false, align: 'left' },
+      });
+    }
     if (input.commTagName) {
       widgets.push({
         id: `${key}_hub_alm`,
@@ -694,9 +931,8 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
     const hasBottomNav = Boolean(input.navTabs && input.navTabs.length > 0);
     const panelH = hasBottomNav ? 444 : 500;
 
-    // Left Card: Line Control & PLC Status (widened for larger START/STOP/RESET buttons & lamps)
-    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: 'LINE CONTROL & PLC STATUS', x: 12, y: 84, width: 298, height: panelH });
-    (input.commands ?? []).slice(0, 3).forEach((cmd, i) => {
+    widgets.push({ id: `${key}_p_left`, type: 'GROUP_PANEL', label: input.panelTitles?.left ?? 'LINE CONTROL & PLC STATUS', x: 12, y: 84, width: 298, height: panelH });
+    takeWithWarning(input.commands, 3, 'commands', warnings).forEach((cmd, i) => {
       widgets.push({
         id: `${key}_cmd_${i}`,
         type: 'BIT_BUTTON',
@@ -710,7 +946,8 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         height: hasBottomNav ? 98 : 108,
       });
     });
-    (input.commIndicators ?? []).slice(0, 3).forEach((ci, i) => {
+    takeWithWarning(input.commIndicators, 3, 'commIndicators', warnings).forEach((ci, i) => {
+      const indProps = makeIndicatorProps(ci);
       widgets.push({
         id: `${key}_comm_${i}`,
         type: 'BIT_LAMP',
@@ -721,19 +958,23 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
         y: (hasBottomNav ? 226 : 244) + i * (hasBottomNav ? 48 : 54),
         width: 274,
         height: 42,
+        ...(indProps ? { props: indProps } : {}),
       });
     });
     if (input.ioIndicators?.[0]) {
+      const io0 = input.ioIndicators[0];
+      const indProps = makeIndicatorProps(io0);
       widgets.push({
         id: `${key}_cloud_ok`,
         type: 'BIT_LAMP',
-        label: input.ioIndicators[0].label,
-        tagName: input.ioIndicators[0].tagName,
-        visualRole: input.ioIndicators[0].role ?? 'PRIMARY_ACTION',
+        label: io0.label,
+        tagName: io0.tagName,
+        visualRole: io0.role ?? 'PRIMARY_ACTION',
         x: 24,
         y: hasBottomNav ? 376 : 408,
         width: 274,
         height: 42,
+        ...(indProps ? { props: indProps } : {}),
       });
     }
     if (input.stationCounter) {
@@ -750,9 +991,8 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     }
 
-    // Center Card: 5 Large Touch Navigation Cards
-    widgets.push({ id: `${key}_p_center`, type: 'GROUP_PANEL', label: 'SYSTEM NAVIGATION', x: 320, y: 84, width: 416, height: panelH });
-    (input.hubNavCards ?? []).slice(0, 5).forEach((card, i) => {
+    widgets.push({ id: `${key}_p_center`, type: 'GROUP_PANEL', label: input.panelTitles?.middle ?? 'SYSTEM NAVIGATION', x: 320, y: 84, width: 416, height: panelH });
+    takeWithWarning(input.hubNavCards, 5, 'hubNavCards', warnings).forEach((card, i) => {
       const isFifth = i === 4;
       const col = i % 2;
       const row = Math.floor(i / 2);
@@ -775,9 +1015,8 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
 
-    // Right Card: Live Production Summary
-    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: 'LIVE PRODUCTION COUNTERS', x: 746, y: 84, width: 266, height: panelH });
-    (input.heroKpis ?? []).slice(0, 4).forEach((kpi, i) => {
+    widgets.push({ id: `${key}_p_right`, type: 'GROUP_PANEL', label: input.panelTitles?.right ?? 'LIVE PRODUCTION COUNTERS', x: 746, y: 84, width: 266, height: panelH });
+    takeWithWarning(input.heroKpis, 4, 'heroKpis', warnings).forEach((kpi, i) => {
       widgets.push({
         id: `${key}_kpi_${i}`,
         type: 'NUMERIC_DISPLAY',
@@ -793,7 +1032,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     });
   } else if (input.template === 'STATION_ALARMS_SIMPLE') {
-    const faults = (input.inputs ?? []).slice(0, 12);
+    const faults = takeWithWarning(input.inputs, 12, 'inputs', warnings);
     const twoCol = faults.length > 6;
     const leftW = twoCol ? 560 : 486;
     const rightX = 14 + leftW + 12;
@@ -802,13 +1041,14 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
     widgets.push({
       id: `${key}_p_faults`,
       type: 'GROUP_PANEL',
-      label: twoCol ? 'SYSTEM & STATION ALARMS (ST1 / ST2 / ST3)' : 'ACTIVE FAULTS',
+      label: input.panelTitles?.faults ?? input.panelTitles?.alarms ?? (twoCol ? 'SYSTEM & STATION ALARMS' : 'ACTIVE FAULTS'),
       x: 14,
       y: 62,
       width: leftW,
       height: 466,
     });
     faults.forEach((flt, i) => {
+      const indProps = makeIndicatorProps(flt);
       if (twoCol) {
         const col = Math.floor(i / 6);
         const row = i % 6;
@@ -822,6 +1062,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
           y: 108 + row * 66,
           width: 262,
           height: 44,
+          ...(indProps ? { props: indProps } : {}),
         });
       } else {
         widgets.push({
@@ -834,13 +1075,14 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
           y: 108 + i * 66,
           width: 454,
           height: 46,
+          ...(indProps ? { props: indProps } : {}),
         });
       }
     });
 
-    const readouts = (input.leftReadouts ?? []).slice(0, 4);
+    const readouts = takeWithWarning(input.leftReadouts, 4, 'leftReadouts', warnings);
     const compactMode = readouts.length <= 2;
-    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: 'ALARM CONTROL', x: rightX, y: 62, width: rightW, height: 466 });
+    widgets.push({ id: `${key}_p_hist`, type: 'GROUP_PANEL', label: input.panelTitles?.right ?? 'ALARM CONTROL', x: rightX, y: 62, width: rightW, height: 466 });
     if (input.stationCounter) {
       widgets.push({
         id: `${key}_alm_total`,
@@ -908,11 +1150,11 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     }
   } else if (input.template === 'EDGE_LOGGER_CONSOLE') {
-    const qKpis = (input.heroKpis ?? []).slice(0, 3);
-    const lReads = (input.leftReadouts ?? []).slice(0, 2);
+    const qKpis = takeWithWarning(input.heroKpis, 3, 'heroKpis', warnings);
+    const lReads = takeWithWarning(input.leftReadouts, 2, 'leftReadouts', warnings);
     const simpleLeft = qKpis.length <= 2 && lReads.length <= 1;
 
-    widgets.push({ id: `${key}_p_log`, type: 'GROUP_PANEL', label: 'CLOUD LOGGER', x: 14, y: 62, width: 486, height: 466 });
+    widgets.push({ id: `${key}_p_log`, type: 'GROUP_PANEL', label: input.panelTitles?.left ?? 'DATA LOGGER', x: 14, y: 62, width: 486, height: 466 });
     if (input.runIdTagName) {
       widgets.push({
         id: `${key}_run_id`,
@@ -941,16 +1183,19 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     }
     if (input.commIndicators?.[0]) {
+      const ci0 = input.commIndicators[0];
+      const indProps = makeIndicatorProps(ci0);
       widgets.push({
         id: `${key}_cloud_lamp`,
         type: 'BIT_LAMP',
-        label: input.commIndicators[0].label,
-        tagName: input.commIndicators[0].tagName,
-        visualRole: input.commIndicators[0].role ?? 'PRIMARY_ACTION',
+        label: ci0.label,
+        tagName: ci0.tagName,
+        visualRole: ci0.role ?? 'PRIMARY_ACTION',
         x: 30,
         y: simpleLeft ? 216 : 184,
         width: simpleLeft ? 452 : 310,
         height: 40,
+        ...(indProps ? { props: indProps } : {}),
       });
     }
     if (simpleLeft) {
@@ -1010,9 +1255,9 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
       });
     }
 
-    const seqs = (input.sequenceCounters ?? []).slice(0, 9);
+    const seqs = takeWithWarning(input.sequenceCounters, 9, 'sequenceCounters', warnings);
     const simpleRight = seqs.length <= 4;
-    widgets.push({ id: `${key}_p_tel`, type: 'GROUP_PANEL', label: simpleRight ? 'STATION CYCLE TELEMETRY' : 'LIVE STATION CYCLE TELEMETRY', x: 512, y: 62, width: 498, height: 466 });
+    widgets.push({ id: `${key}_p_tel`, type: 'GROUP_PANEL', label: input.panelTitles?.right ?? 'CYCLE TELEMETRY', x: 512, y: 62, width: 498, height: 466 });
     if (simpleRight) {
       seqs.forEach((sc, i) => {
         const col = i % 2;
@@ -1050,7 +1295,7 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
     }
   }
 
-  widgets.push(...makeNavBar(key, input.navTabs));
+  widgets.push(...makeNavBar(key, input.navTabs, warnings));
 
   const baseScreen: HmiScreen = {
     id: input.screenId,
@@ -1058,7 +1303,8 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
     width: 1024,
     height: 600,
     layoutStandard: 'ISA_101_HIGH_PERFORMANCE',
-    backgroundColor: '#F1F5F9',
+    ...(input.themeId ? { themeId: input.themeId } : {}),
+    backgroundColor: theme.canvasBg,
     autoScaleMobile: true,
     autoScaleWeb: true,
     widgets,
@@ -1066,5 +1312,15 @@ export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScre
     createdAt: now,
   };
 
-  return scaleScreen(baseScreen, targetW, targetH);
+  return {
+    screen: scaleScreen(baseScreen, targetW, targetH),
+    warnings,
+  };
+}
+
+/**
+ * Instantiates a pixel-aligned HMI screen template using only semantic bindings.
+ */
+export function instantiateHmiTemplate(input: InstantiateTemplateInput): HmiScreen {
+  return instantiateHmiTemplateDetailed(input).screen;
 }
